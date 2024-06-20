@@ -52,30 +52,22 @@ class gamer2_output_plugin : public output_plugin
     real_t music_unit_mass_;
     real_t music_unit_velocity_;
 
-    unsigned write2tempfile(std::string fname, const grid_hierarchy &gh, unsigned ilevel, real_t fac = 1.0,
-                            real_t shift = 0.0, bool bdisp = false, int coord = 0)
+    size_t write2tempfile(std::string fname, const grid_hierarchy &gh, unsigned ilevel, real_t fac = 1.0,
+                          real_t shift = 0.0)
     {
         const MeshvarBnd<real_t> *data = gh.get_grid(ilevel);
-        unsigned count                 = 0;
 
         int n0 = data->size(0), n1 = data->size(1), n2 = data->size(2);
         std::vector<real_t> vdata;
         vdata.reserve((unsigned)(n0) * (n1) * (n2));
+
+        size_t count = 0;
         for (int i = 0; i < n0; ++i)
             for (int j = 0; j < n1; ++j)
                 for (int k = 0; k < n2; ++k)
                     if (gh.is_in_mask(ilevel, i, j, k) && !gh.is_refined(ilevel, i, j, k))
                     {
-                        if (bdisp)
-                        {
-                            /* convert displacement to particle position */
-                            double xx[3];
-                            gh.cell_pos(ilevel, i, j, k, xx);
-                            real_t pos = (xx[coord] + (*data)(i, j, k)) * boxlength_;
-                            vdata.push_back(pos * fac + shift);
-                        }
-                        else
-                            vdata.push_back((*data)(i, j, k) * fac + shift);
+                        vdata.push_back((*data)(i, j, k) * fac + shift);
 
                         count++;
                     }
@@ -83,10 +75,13 @@ class gamer2_output_plugin : public output_plugin
         std::ofstream ofs_temp(fname, std::ios::binary | std::ios::trunc);
         ofs_temp.write((char *)&vdata[0], vdata.size() * sizeof(real_t));
 
+        ofs_temp.flush();
+        ofs_temp.close();
+
         return count;
     }
 
-    void copy2outputfile(std::ofstream &ofs, std::string temp_fname)
+    size_t copy2outputfile(std::ofstream &ofs, std::string temp_fname)
     {
         std::ifstream ifs(temp_fname, std::ios::binary);
         if (!ifs)
@@ -96,22 +91,37 @@ class gamer2_output_plugin : public output_plugin
         }
 
         ofs << ifs.rdbuf();
+
+        /* count elements */
+        ifs.seekg(0, std::ios::end);
+        size_t count = ifs.tellg() / sizeof(real_t);
+
+        ifs.close();
+        return count;
     }
 
     void assemble_gamer2_file()
     {
         /* ----- write particle file ----- */
         std::ofstream ofs_par(par_ic_.c_str(), std::ios::binary | std::ios::trunc);
+        std::cout << "=============================================================\n";
+        LOGINFO("GAMER-2 plugin: writing %s", par_ic_.c_str());
 
         /* output mass */
+        size_t npart = 0;
         for (unsigned ilevel = levelmax_; ilevel >= levelmin_; --ilevel)
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_mass + ilevel) + ".bin";
 
-            copy2outputfile(ofs_par, temp_fname);
+            size_t npart_ilevel = copy2outputfile(ofs_par, temp_fname);
+
+            LOGINFO("Level %2d: %12llu particles", ilevel, npart_ilevel);
+            npart += npart_ilevel;
 
             remove(temp_fname.c_str());
         }
+
+        LOGINFO("Total: %12llu particles", npart);
 
         /* output position */
         for (unsigned coord = 0; coord < 3; ++coord)
@@ -247,10 +257,7 @@ class gamer2_output_plugin : public output_plugin
 
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_mass + ilevel) + ".bin";
 
-            unsigned npar  = write2tempfile(temp_fname, gh, ilevel, 0, cmass);
-            size_t nparexp = gh.count_leaf_cells(ilevel, ilevel);
-            std::cout << "Level " << ilevel << " Number of particles: " << npar << " Expected: " << nparexp
-                      << std::endl;
+            write2tempfile(temp_fname, gh, ilevel, 0, cmass);
         }
 
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
@@ -266,10 +273,42 @@ class gamer2_output_plugin : public output_plugin
     {
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
+            const MeshvarBnd<real_t> *data = gh.get_grid(ilevel);
+
+            int n0 = data->size(0), n1 = data->size(1), n2 = data->size(2);
+            std::vector<real_t> vdata;
+            vdata.reserve((unsigned)(n0) * (n1) * (n2));
+
+            size_t count = 0;
+            real_t fac   = music_unit_length_ / gamer_unit_length_;
+            for (int i = 0; i < n0; ++i)
+                for (int j = 0; j < n1; ++j)
+                    for (int k = 0; k < n2; ++k)
+                        if (gh.is_in_mask(ilevel, i, j, k) && !gh.is_refined(ilevel, i, j, k))
+                        {
+                            /* convert displacement to particle position */
+                            double xx[3];
+                            gh.cell_pos(ilevel, i, j, k, xx);
+                            real_t pos = (xx[coord] + (*data)(i, j, k)) * boxlength_;
+
+                            /* apply periodic boundary condition */
+                            while (pos < 0)
+                                pos += boxlength_;
+                            while (pos >= boxlength_)
+                                pos -= boxlength_;
+
+                            vdata.push_back(pos * fac);
+
+                            count++;
+                        }
+
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_pos + 100 * coord + ilevel) + ".bin";
 
-            real_t fac = music_unit_length_ / gamer_unit_length_;
-            write2tempfile(temp_fname, gh, ilevel, fac, 0, true, coord);
+            std::ofstream ofs_temp(temp_fname, std::ios::binary | std::ios::trunc);
+            ofs_temp.write((char *)&vdata[0], vdata.size() * sizeof(real_t));
+
+            ofs_temp.flush();
+            ofs_temp.close();
         }
     }
 

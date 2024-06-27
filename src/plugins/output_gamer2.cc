@@ -52,8 +52,7 @@ class gamer2_output_plugin : public output_plugin
     real_t music_unit_mass_;
     real_t music_unit_velocity_;
 
-    size_t write2tempfile(std::string fname, const grid_hierarchy &gh, unsigned ilevel, real_t fac = 1.0,
-                          real_t shift = 0.0)
+    size_t write2tempfile(std::string fname, const grid_hierarchy &gh, unsigned ilevel, real_t fac = 1.0, real_t shift = 0.0)
     {
         const MeshvarBnd<real_t> *data = gh.get_grid(ilevel);
 
@@ -128,8 +127,7 @@ class gamer2_output_plugin : public output_plugin
         {
             for (unsigned ilevel = levelmax_; ilevel >= levelmin_; --ilevel)
             {
-                std::string temp_fname =
-                    "___ic_temp_" + std::to_string(1000 * id_dm_pos + 100 * coord + ilevel) + ".bin";
+                std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_pos + 100 * coord + ilevel) + ".bin";
 
                 copy2outputfile(ofs_par, temp_fname);
 
@@ -142,8 +140,7 @@ class gamer2_output_plugin : public output_plugin
         {
             for (unsigned ilevel = levelmax_; ilevel >= levelmin_; --ilevel)
             {
-                std::string temp_fname =
-                    "___ic_temp_" + std::to_string(1000 * id_dm_vel + 100 * coord + ilevel) + ".bin";
+                std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_vel + 100 * coord + ilevel) + ".bin";
 
                 copy2outputfile(ofs_par, temp_fname);
 
@@ -166,6 +163,7 @@ class gamer2_output_plugin : public output_plugin
 
         /* ----- write mesh file ----- */
         std::ofstream ofs_um(um_ic_.c_str(), std::ios::binary | std::ios::trunc);
+        LOGINFO("GAMER-2 plugin: writing %s", um_ic_.c_str());
 
         /* output density */
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
@@ -180,8 +178,7 @@ class gamer2_output_plugin : public output_plugin
         {
             for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
             {
-                std::string temp_fname =
-                    "___ic_temp_" + std::to_string(1000 * id_gas_vel + 100 * coord + ilevel) + ".bin";
+                std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_gas_vel + 100 * coord + ilevel) + ".bin";
 
                 remove(temp_fname.c_str());
             }
@@ -318,7 +315,9 @@ class gamer2_output_plugin : public output_plugin
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_vel + 100 * coord + ilevel) + ".bin";
 
-            real_t fac = music_unit_velocity_ / gamer_unit_velocity_;
+            // Code velocity v_code is a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
+            real_t a_start = 1.0 / (1.0 + zstart_);
+            real_t fac = a_start * music_unit_velocity_ / gamer_unit_velocity_;
             write2tempfile(temp_fname, gh, ilevel, fac, 0);
         }
     }
@@ -352,7 +351,9 @@ class gamer2_output_plugin : public output_plugin
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_gas_vel + 100 * coord + ilevel) + ".bin";
 
-            real_t fac = music_unit_velocity_ / gamer_unit_velocity_;
+            // Code velocity v_code is a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
+            real_t a_start = 1.0 / (1.0 + zstart_);
+            real_t fac = a_start * music_unit_velocity_ / gamer_unit_velocity_;
             write2tempfile(temp_fname, gh, ilevel, fac, 0);
         }
     }

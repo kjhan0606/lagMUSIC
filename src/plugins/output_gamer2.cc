@@ -23,10 +23,23 @@ class gamer2_output_plugin : public output_plugin
         id_dm_type,
         id_gas_rho,
         id_gas_vel,
-        id_gas_temp
+        id_gas_pres
     };
 
     const float GAMER_DARK_MATTER_TYPE = 1;
+    const int PATCH_SIZE               = 8;
+    const int PS2                      = 2 * PATCH_SIZE;
+    std::vector<int> refine_offset; // offset from left or right edge of simulation volume (the number of patch in parent level)
+    std::vector<int> refine_size;   // the size of refinement region (the number of cell on the level)
+
+    // round up to the nearest multiple of b
+    int updiv(int a, int b)
+    {
+        if (a % b == 0)
+            return a / b;
+        else
+            return a / b + 1;
+    }
 
     std::string par_ic_;
     std::string um_ic_;
@@ -202,8 +215,7 @@ class gamer2_output_plugin : public output_plugin
         omegab_    = cf.getValue<double>("cosmology", "Omega_b");
         hubble_    = cf.getValue<double>("cosmology", "H0") / 100.0;
 
-        // "GAMER" physical constants (/include/PhysicalConstant.h), input
-        // parameters (Input__Parameter), and COMOVING units
+        // "GAMER" physical constants (/include/PhysicalConstant.h), input parameters (Input__Parameter), and COMOVING units
         // (src/Init/Init_Unit.cpp)
         double const_cm   = 1.0;
         double const_km   = 1.0e5 * const_cm;
@@ -213,8 +225,7 @@ class gamer2_output_plugin : public output_plugin
         double const_Msun = 1.9885e33;                                          // solar mass
         double const_G    = 6.6738e-8;                                          // gravitational constant in cgs
         double H0         = 100.0 * hubble_ * const_km / (const_s * const_Mpc); // H0 = 100*h*km/(s*Mpc)
-        // see
-        // https://github.com/gamer-project/gamer/wiki/Runtime-Parameters%3A-Units#units-in-cosmological-simulations
+        // see https://github.com/gamer-project/gamer/wiki/Runtime-Parameters%3A-Units#units-in-cosmological-simulations
         gamer_unit_length_   = const_Mpc / hubble_;
         gamer_unit_time_     = 1.0 / H0;
         gamer_unit_density_  = 3.0 * omegam_ * H0 * H0 / (8.0 * M_PI * const_G);
@@ -234,11 +245,86 @@ class gamer2_output_plugin : public output_plugin
 
     void write_dm_density(const grid_hierarchy &gh)
     {
-        // TODO: write refinement mask
+        /* write refinement mask */
+        LOGINFO("writing refinement mask Input__UM_IC_RefineRegion");
+        refine_offset = {0, 0, 0, 0, 0, 0};
+        refine_size   = {(1 << levelmin_), (1 << levelmin_), (1 << levelmin_)};
+
+        for (unsigned ilevel = levelmin_ + 1; ilevel <= levelmax_; ++ilevel)
+        {
+            unsigned dlv = ilevel - levelmin_;
+            for (int dim = 0; dim < 3; dim++)
+            {
+                // left edge
+                int left = updiv(gh.offset_abs(ilevel, dim), PS2);
+
+                // right edge
+                int right = updiv((1 << ilevel) - gh.offset_abs(ilevel, dim) - gh.size(ilevel, dim), PS2);
+
+                // mesh resolution of neighbouring patchs must be within factor of two
+                if (left != 0 || right != 0)
+                {
+                    int left_coarse = refine_offset[6 * (dlv - 1) + 2 * dim];
+                    if (left <= 2 * left_coarse)
+                        left = 2 * left_coarse + 1;
+
+                    int right_course = refine_offset[6 * (dlv - 1) + 2 * dim + 1];
+                    if (right <= 2 * right_course)
+                        right = 2 * right_course + 1;
+                }
+
+                int size = (1 << ilevel) - (left + right) * PS2;
+
+                if (size <= 0)
+                    LOGERR("zero size refinement level %d", ilevel);
+
+                refine_offset.push_back(left);
+                refine_offset.push_back(right);
+
+                refine_size.push_back(size);
+            }
+        }
+
+        // print refine_offset
+        for (unsigned ilevel = levelmin_ + 1; ilevel <= levelmax_; ++ilevel)
+        {
+            unsigned dlv = ilevel - levelmin_;
+            std::cout << "     Level " << std::setw(3) << ilevel << " :  desired absolute offset = (" << std::setw(5)
+                      << gh.offset_abs(ilevel, 0) << ", " << std::setw(5) << gh.offset_abs(ilevel, 1) << ", " << std::setw(5)
+                      << gh.offset_abs(ilevel, 2) << ")\n";
+            std::cout << "                   output absolute offset = (" << std::setw(5) << refine_offset[6 * dlv] * PS2 << ", "
+                      << std::setw(5) << refine_offset[6 * dlv + 2] * PS2 << ", " << std::setw(5) << refine_offset[6 * dlv + 4] * PS2
+                      << ")\n";
+
+            std::cout << "                             desired size = (" << std::setw(5) << gh.size(ilevel, 0) << ", " << std::setw(5)
+                      << gh.size(ilevel, 1) << ", " << std::setw(5) << gh.size(ilevel, 2) << ")\n";
+            std::cout << "                              output size = (" << std::setw(5) << refine_size[3 * dlv + 0] << ", " << std::setw(5)
+                      << refine_size[3 * dlv + 1] << ", " << std::setw(5) << refine_size[3 * dlv + 2] << ")\n";
+        }
+
+        // output refinement mask
+        std::string fname = "Input__UM_IC_RefineRegion";
+        std::ofstream ofs(fname, std::ios::trunc);
+        ofs << "# RefineRegion\n";
+        ofs << "# offset number of patches in parent level\n";
+        for (unsigned ilevel = levelmin_ + 1; ilevel <= levelmax_; ++ilevel)
+        {
+            unsigned dlv = ilevel - levelmin_;
+            ofs << refine_offset[6 * dlv + 0] - 2 * refine_offset[6 * (dlv - 1) + 0] << " \t";
+            ofs << refine_offset[6 * dlv + 1] - 2 * refine_offset[6 * (dlv - 1) + 1] << " \t";
+            ofs << refine_offset[6 * dlv + 2] - 2 * refine_offset[6 * (dlv - 1) + 2] << " \t";
+            ofs << refine_offset[6 * dlv + 3] - 2 * refine_offset[6 * (dlv - 1) + 3] << " \t";
+            ofs << refine_offset[6 * dlv + 4] - 2 * refine_offset[6 * (dlv - 1) + 4] << " \t";
+            ofs << refine_offset[6 * dlv + 5] - 2 * refine_offset[6 * (dlv - 1) + 5] << " \t";
+            ofs << "\n";
+        }
+        ofs.flush();
+        ofs.close();
     }
 
     void write_dm_mass(const grid_hierarchy &gh)
     {
+        // write particle mass
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
             /* uniform particle mass for each level */
@@ -257,6 +343,7 @@ class gamer2_output_plugin : public output_plugin
             write2tempfile(temp_fname, gh, ilevel, 0, cmass);
         }
 
+        // write particle type
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_type + ilevel) + ".bin";
@@ -317,7 +404,7 @@ class gamer2_output_plugin : public output_plugin
 
             // Code velocity v_code is a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
             real_t a_start = 1.0 / (1.0 + zstart_);
-            real_t fac = a_start * music_unit_velocity_ / gamer_unit_velocity_;
+            real_t fac     = a_start * music_unit_velocity_ / gamer_unit_velocity_;
             write2tempfile(temp_fname, gh, ilevel, fac, 0);
         }
     }
@@ -353,7 +440,7 @@ class gamer2_output_plugin : public output_plugin
 
             // Code velocity v_code is a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
             real_t a_start = 1.0 / (1.0 + zstart_);
-            real_t fac = a_start * music_unit_velocity_ / gamer_unit_velocity_;
+            real_t fac     = a_start * music_unit_velocity_ / gamer_unit_velocity_;
             write2tempfile(temp_fname, gh, ilevel, fac, 0);
         }
     }

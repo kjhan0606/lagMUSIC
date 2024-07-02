@@ -261,7 +261,7 @@ class gamer2_output_plugin : public output_plugin
         ofs << "\n# initialization\n";
         ofs << "OPT__INIT               " << std::setw(12) << 3 << "   # initialization option: (1=FUNCTION, 2=RESTART, 3=FILE->'UM_IC')\n";
         ofs << "OPT__UM_IC_LEVEL        " << std::setw(12) << 0 << "   # AMR level corresponding to UM_IC (must >= 0) [0]\n";
-        ofs << "OPT__UM_IC_NLEVEL       " << std::setw(12) << (levelmax_ - levelmin_) << "   # number of AMR refinement levels in UM_IC \n";
+        ofs << "OPT__UM_IC_NLEVEL       " << std::setw(12) << (levelmax_ - levelmin_ + 1) << "   # number of AMR refinement levels in UM_IC \n";
         ofs << "OPT__UM_IC_NVAR         " << std::setw(12) << 4 << "   # number of variables in UM_IC: (0:Dens, 1:VelX, 2:VelY, 3:VelZ)\n";
         ofs << "OPT__UM_IC_FORMAT       " << std::setw(12) << 1 << "   # data format of UM_IC: (1=vzyx, 2=zyxv; row-major and v=field) [1]\n";
         ofs << "OPT__UM_IC_FLOAT8       " << std::setw(12) << ((sizeof(real_t) == 8) ? 1 : 0) << "   # floating-point precision for PAR_IC (<0: default, 0: single, 1: double) [default: same as FLOAT8_PAR]\n";

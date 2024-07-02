@@ -1485,6 +1485,18 @@ public:
 	    il -= il%2; jl -= jl%2; kl -= kl%2;
 	    ir += ir%2; jr += jr%2; kr += kr%2; 
 	  }
+
+		// require alighment with coarser block
+		if (blocking_factor_)
+		{
+			unsigned coarse_block = 2 * blocking_factor_;
+			il -= il % coarse_block;
+			jl -= jl % coarse_block;
+			kl -= kl % coarse_block;
+			ir += (nresmax - ir) % coarse_block;
+			jr += (nresmax - jr) % coarse_block;
+			kr += (nresmax - kr) % coarse_block;
+		}
 	  
 	  // if doing unigrid, set region to whole box
 	  if( levelmin_ == levelmax_ )
@@ -1586,6 +1598,19 @@ public:
 		  ir += ir%2; jr += jr%2; kr += kr%2; 
 		}
 
+		// require alighment with coarser block
+		if (blocking_factor_)
+		{
+			unsigned coarse_block = 2 * blocking_factor_;
+			int nres = 1 << ilevel;
+			il -= il % coarse_block;
+			jl -= jl % coarse_block;
+			kl -= kl % coarse_block;
+			ir += (nres - ir) % coarse_block;
+			jr += (nres - jr) % coarse_block;
+			kr += (nres - kr) % coarse_block;
+		}
+
 			
 	      if( il>=ir || jl>=jr || kl>=kr || il < 0 || jl < 0 || kl < 0)
 		{
@@ -1599,12 +1624,13 @@ public:
 	      ny_[ilevel]  = jr-jl;
 	      nz_[ilevel]  = kr-kl;
 	      
-	      if (blocking_factor_)
-		{
-		  nx_[ilevel] += nx_[ilevel] % blocking_factor_;
-		  ny_[ilevel] += ny_[ilevel] % blocking_factor_;
-		  nz_[ilevel] += nz_[ilevel] % blocking_factor_;
-		}
+		// should be achieved by the alignment
+	  //     if (blocking_factor_)
+		// {
+		//   nx_[ilevel] += nx_[ilevel] % blocking_factor_;
+		//   ny_[ilevel] += ny_[ilevel] % blocking_factor_;
+		//   nz_[ilevel] += nz_[ilevel] % blocking_factor_;
+		// }
 	      
 	      if( equal_extent_ )
 		{

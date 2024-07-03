@@ -20,12 +20,10 @@ class gamer2_output_plugin : public output_plugin
         id_dm_mass,
         id_dm_pos,
         id_dm_vel,
-        id_dm_type,
         id_gas_rho,
         id_gas_vel,
     };
 
-    const float GAMER_DARK_MATTER_TYPE = 1;
     int PATCH_SIZE, PS2;
     std::vector<int> refine_offset; // offset from left or right edge of simulation volume (the number of patch in parent level)
     std::vector<int> refine_size;   // the size of refinement region (the number of cell on the level)
@@ -194,14 +192,6 @@ class gamer2_output_plugin : public output_plugin
             }
         }
 
-        /* write particle type */
-        for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
-        {
-            std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_type + ilevel) + ".bin";
-            copy2outputfile(ofs_par, temp_fname);
-            remove(temp_fname.c_str());
-        }
-
         ofs_par.flush();
         ofs_par.close();
 
@@ -257,7 +247,7 @@ class gamer2_output_plugin : public output_plugin
         ofs << "PAR_IC_FORMAT           " << std::setw(12) << 1       <<"   # data format of PAR_IC: (1=[attribute][id], 2=[id][attribute]; row-major) [1]\n";
         ofs << "PAR_IC_FLOAT8           " << std::setw(12) << ((sizeof(real_t) == 8) ? 1 : 0) <<"   # floating-point precision for PAR_IC (<0: default, 0: single, 1: double) [default: same as FLOAT8_PAR]\n";
         ofs << "PAR_IC_MASS             " << std::setw(12) << -1.0     <<"   # mass of all particles for PAR_INIT==3 (<0=off) [-1.0]\n";
-        ofs << "PAR_IC_TYPE             " << std::setw(12) << -1       <<"   # type of all particles for PAR_INIT==3 (<0=off) [-1]\n";
+        ofs << "PAR_IC_TYPE             " << std::setw(12) << 2       <<"   # type of all particles for PAR_INIT==3 (<0=off, 2=dark matter) [-1]\n";
         ofs << "\n# initialization\n";
         ofs << "OPT__INIT               " << std::setw(12) << 3 << "   # initialization option: (1=FUNCTION, 2=RESTART, 3=FILE->'UM_IC')\n";
         ofs << "OPT__UM_IC_LEVEL        " << std::setw(12) << 0 << "   # AMR level corresponding to UM_IC (must >= 0) [0]\n";
@@ -445,15 +435,6 @@ class gamer2_output_plugin : public output_plugin
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_mass + ilevel) + ".bin";
 
             write2tempfile_par(temp_fname, gh, ilevel, 0, cmass);
-        }
-
-        // write particle type
-        for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
-        {
-            std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_type + ilevel) + ".bin";
-
-            /* generate uniform array of GAMER_DARK_MATTER_TYPE */
-            write2tempfile_par(temp_fname, gh, ilevel, 0, GAMER_DARK_MATTER_TYPE);
         }
     }
 

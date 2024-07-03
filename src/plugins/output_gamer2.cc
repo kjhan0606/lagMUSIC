@@ -72,6 +72,7 @@ class gamer2_output_plugin : public output_plugin
                 for (int k = 0; k < n2; ++k)
                     if (gh.is_in_mask(ilevel, i, j, k) && !gh.is_refined(ilevel, i, j, k))
                     {
+                        /* store particles at ilevel */
                         vdata.push_back((*data)(i, j, k) * fac + shift);
 
                         count++;
@@ -88,13 +89,13 @@ class gamer2_output_plugin : public output_plugin
 
     size_t write2tempfile_grid(std::string fname, const grid_hierarchy &gh, unsigned ilevel, real_t fac = 1.0, real_t shift = 0.0)
     {
-        double left[3], right[3];
-        for (int dim = 0; dim < 3; dim++)
-        {
-            double h   = 1.0 / (1 << ilevel);
-            left[dim]  = h * refine_offset[6 * (ilevel - levelmin_) + 2 * dim] * PS2;
-            right[dim] = 1.0 - h * refine_offset[6 * (ilevel - levelmin_) + 2 * dim + 1] * PS2;
-        }
+        // double left[3], right[3];
+        // for (int dim = 0; dim < 3; dim++)
+        // {
+        //     double h   = 1.0 / (1 << ilevel);
+        //     left[dim]  = h * refine_offset[6 * (ilevel - levelmin_) + 2 * dim] * PS2;
+        //     right[dim] = 1.0 - h * refine_offset[6 * (ilevel - levelmin_) + 2 * dim + 1] * PS2;
+        // }
 
         const MeshvarBnd<real_t> *data = gh.get_grid(ilevel);
 
@@ -103,16 +104,17 @@ class gamer2_output_plugin : public output_plugin
         vdata.reserve((unsigned)(n0) * (n1) * (n2));
 
         size_t count = 0;
-        double pos[3];
+        // double pos[3];
         for (int k = 0; k < n2; ++k)
             for (int j = 0; j < n1; ++j)
                 for (int i = 0; i < n0; ++i)
                 {
-                    gh.cell_pos(ilevel, i, j, k, pos);
+                    // gh.cell_pos(ilevel, i, j, k, pos);
 
-                    if (pos[0] >= left[0] && pos[0] < right[0] && pos[1] >= left[1] && pos[1] < right[1] && pos[2] >= left[2] &&
-                        pos[2] < right[2])
+                    // if (pos[0] >= left[0] && pos[0] < right[0] && pos[1] >= left[1] && pos[1] < right[1] && pos[2] >= left[2] &&
+                    //     pos[2] < right[2])
                     {
+                        /* store cells in GAMER2 refinement mask on ilevel */
                         vdata.push_back((*data)(i, j, k) * fac + shift);
 
                         count++;
@@ -227,34 +229,42 @@ class gamer2_output_plugin : public output_plugin
         ofs_um.flush();
         ofs_um.close();
 
-
         LOGINFO("GAMER-2 plugin: writing recommended parameters for this initial condition in Input__Parameter_MUSIC_IC");
         std::string fname = "Input__Parameter_MUSIC_IC";
         std::ofstream ofs(fname, std::ios::trunc);
         ofs << "# Recommended parameters\n";
         ofs << "\n# simulation scale\n";
         ofs << "BOX_SIZE                " << std::setw(12) << boxlength_ << "   # box size along the longest side (in Mpc/h)\n";
-        ofs << "NX0_TOT_X               " << std::setw(12) << (1 << levelmin_) <<"   # number of base-level cells along x\n";
-        ofs << "NX0_TOT_Y               " << std::setw(12) << (1 << levelmin_) <<"   # number of base-level cells along y\n";
-        ofs << "NX0_TOT_Z               " << std::setw(12) << (1 << levelmin_) <<"   # number of base-level cells along z\n";
+        ofs << "NX0_TOT_X               " << std::setw(12) << (1 << levelmin_) << "   # number of base-level cells along x\n";
+        ofs << "NX0_TOT_Y               " << std::setw(12) << (1 << levelmin_) << "   # number of base-level cells along y\n";
+        ofs << "NX0_TOT_Z               " << std::setw(12) << (1 << levelmin_) << "   # number of base-level cells along z\n";
         ofs << "\n# cosmology (COMOVING only)\n";
         ofs << "A_INIT                  " << std::setw(12) << (1.0 / (zstart_ + 1)) << "   # initial scale factor\n";
         ofs << "OMEGA_M0                " << std::setw(12) << omegam_ << "   # omega matter at the present time\n";
-        ofs << "HUBBLE0                 " << std::setw(12) << hubble_ << "   # dimensionless Hubble parameter (currently only for converting ELBDM_MASS to code units)\n";
+        ofs << "HUBBLE0                 " << std::setw(12) << hubble_
+            << "   # dimensionless Hubble parameter (currently only for converting ELBDM_MASS to code units)\n";
         ofs << "\n# particle\n";
-        ofs << "PAR_NPAR                " << std::setw(12) << npart <<"   # total number of particles (must be set for PAR_INIT==1/3; must be an integer)\n";
-        ofs << "PAR_INIT                " << std::setw(12) << 3       <<"   # initialization option for particles: (1=FUNCTION, 2=RESTART, 3=FILE->'PAR_IC')\n";
-        ofs << "PAR_IC_FORMAT           " << std::setw(12) << 1       <<"   # data format of PAR_IC: (1=[attribute][id], 2=[id][attribute]; row-major) [1]\n";
-        ofs << "PAR_IC_FLOAT8           " << std::setw(12) << ((sizeof(real_t) == 8) ? 1 : 0) <<"   # floating-point precision for PAR_IC (<0: default, 0: single, 1: double) [default: same as FLOAT8_PAR]\n";
-        ofs << "PAR_IC_MASS             " << std::setw(12) << -1.0     <<"   # mass of all particles for PAR_INIT==3 (<0=off) [-1.0]\n";
-        ofs << "PAR_IC_TYPE             " << std::setw(12) << 2       <<"   # type of all particles for PAR_INIT==3 (<0=off, 2=dark matter) [-1]\n";
+        ofs << "PAR_NPAR                " << std::setw(12) << npart
+            << "   # total number of particles (must be set for PAR_INIT==1/3; must be an integer)\n";
+        ofs << "PAR_INIT                " << std::setw(12) << 3
+            << "   # initialization option for particles: (1=FUNCTION, 2=RESTART, 3=FILE->'PAR_IC')\n";
+        ofs << "PAR_IC_FORMAT           " << std::setw(12) << 1
+            << "   # data format of PAR_IC: (1=[attribute][id], 2=[id][attribute]; row-major) [1]\n";
+        ofs << "PAR_IC_FLOAT8           " << std::setw(12) << ((sizeof(real_t) == 8) ? 1 : 0)
+            << "   # floating-point precision for PAR_IC (<0: default, 0: single, 1: double) [default: same as FLOAT8_PAR]\n";
+        ofs << "PAR_IC_MASS             " << std::setw(12) << -1.0 << "   # mass of all particles for PAR_INIT==3 (<0=off) [-1.0]\n";
+        ofs << "PAR_IC_TYPE             " << std::setw(12) << 2
+            << "   # type of all particles for PAR_INIT==3 (<0=off, 2=dark matter) [-1]\n";
         ofs << "\n# initialization\n";
         ofs << "OPT__INIT               " << std::setw(12) << 3 << "   # initialization option: (1=FUNCTION, 2=RESTART, 3=FILE->'UM_IC')\n";
         ofs << "OPT__UM_IC_LEVEL        " << std::setw(12) << 0 << "   # AMR level corresponding to UM_IC (must >= 0) [0]\n";
-        ofs << "OPT__UM_IC_NLEVEL       " << std::setw(12) << (levelmax_ - levelmin_ + 1) << "   # number of AMR refinement levels in UM_IC \n";
+        ofs << "OPT__UM_IC_NLEVEL       " << std::setw(12) << (levelmax_ - levelmin_ + 1)
+            << "   # number of AMR refinement levels in UM_IC \n";
         ofs << "OPT__UM_IC_NVAR         " << std::setw(12) << 4 << "   # number of variables in UM_IC: (0:Dens, 1:VelX, 2:VelY, 3:VelZ)\n";
-        ofs << "OPT__UM_IC_FORMAT       " << std::setw(12) << 1 << "   # data format of UM_IC: (1=vzyx, 2=zyxv; row-major and v=field) [1]\n";
-        ofs << "OPT__UM_IC_FLOAT8       " << std::setw(12) << ((sizeof(real_t) == 8) ? 1 : 0) << "   # floating-point precision for PAR_IC (<0: default, 0: single, 1: double) [default: same as FLOAT8_PAR]\n";
+        ofs << "OPT__UM_IC_FORMAT       " << std::setw(12) << 1
+            << "   # data format of UM_IC: (1=vzyx, 2=zyxv; row-major and v=field) [1]\n";
+        ofs << "OPT__UM_IC_FLOAT8       " << std::setw(12) << ((sizeof(real_t) == 8) ? 1 : 0)
+            << "   # floating-point precision for PAR_IC (<0: default, 0: single, 1: double) [default: same as FLOAT8_PAR]\n";
     }
 
   public:
@@ -275,9 +285,17 @@ class gamer2_output_plugin : public output_plugin
         int blocking_factor = cf.getValueSafe<int>("setup", "blocking_factor", -1);
         if (blocking_factor == -1)
         {
-            LOGERR("GAMER-2 plugin: require setup/blocking_factor to set the patch size (default = 8)");
+            LOGERR("GAMER-2 plugin: require [setup]/blocking_factor to set the patch size (default = 8)");
             throw std::runtime_error("GAMER-2 plugin: require blocking_factor");
         }
+        // necessary for the mesh resolution of neighbouring patchs to be within factor of two
+        int padding = cf.getValueSafe<int>("setup", "padding", 0);
+        if (padding <= 0)
+        {
+            LOGERR("GAMER-2 plugin: require [setup]/padding > 0 for the mesh resolution of neighbouring patchs to be within factor of two");
+            throw std::runtime_error("GAMER-2 plugin: require padding > 0");
+        }
+
         PATCH_SIZE = blocking_factor;
         PS2        = 2 * PATCH_SIZE;
 
@@ -311,14 +329,12 @@ class gamer2_output_plugin : public output_plugin
 
     void write_dm_density(const grid_hierarchy &gh)
     {
-        std::cout << "-------------------------------------------------------------" << std::endl;
-        std::cout << "GAMER-2 plugin: determining refinement mask" << std::endl;
-
-        /* determine refinement mask with ensuring the masked region is covered by MUSIC hierarchical grid */
+        // write refinement mask. the AMR grid should satisfy the following requirements.
         // REQUIREMENT: 1. the size of refinement region must be multiple of patch size
         //              2. the refinement region must be aligned with the patch in parent level
         //              3. the mesh resolution of neighbouring patchs must be within factor of two
-        // NOTE: the MUSIC hierarchical grid should satisfy the above requirements, but here we check it again
+        // the MUSIC hierarchical grid should satisfy the above requirements (when blocking_factor and padding are set), but here we
+        // check it again
         refine_offset = {0, 0, 0, 0, 0, 0};
         refine_size   = {(1 << levelmin_), (1 << levelmin_), (1 << levelmin_)};
 
@@ -353,6 +369,14 @@ class gamer2_output_plugin : public output_plugin
                     throw std::runtime_error("Fatal: zero size refinement region");
                 }
 
+                int left_music = gh.offset_abs(ilevel, dim);
+                int right_music = (1 << ilevel) - gh.offset_abs(ilevel, dim) - gh.size(ilevel, dim);
+                if (left_music != left * PS2 || right_music != right * PS2)
+                {
+                    LOGERR("MUSIC hierarchical grid does not satisfy GAMER-2 AMR requirement on level %d", ilevel);
+                    throw std::runtime_error("Fatal: MUSIC hierarchical grid does not satisfy GAMER-2 AMR requirement");
+                }
+
                 refine_offset.push_back(left);
                 refine_offset.push_back(right);
 
@@ -361,24 +385,24 @@ class gamer2_output_plugin : public output_plugin
         }
 
         // print refine_offset
-        for (unsigned ilevel = levelmin_ + 1; ilevel <= levelmax_; ++ilevel)
-        {
-            unsigned dlv = ilevel - levelmin_;
-            // std::cout << "     Level " << std::setw(3) << ilevel << " :  desired absolute offset = (" << std::setw(5)
-            //           << gh.offset_abs(ilevel, 0) << ", " << std::setw(5) << gh.offset_abs(ilevel, 1) << ", " << std::setw(5)
-            //           << gh.offset_abs(ilevel, 2) << ")\n";
-            std::cout << "     Level " << std::setw(3) << ilevel << " :   output absolute offset = (" << std::setw(5)
-                      << refine_offset[6 * dlv] * PS2 << ", " << std::setw(5) << refine_offset[6 * dlv + 2] * PS2 << ", " << std::setw(5)
-                      << refine_offset[6 * dlv + 4] * PS2 << ")\n";
+        // for (unsigned ilevel = levelmin_ + 1; ilevel <= levelmax_; ++ilevel)
+        // {
+        //     unsigned dlv = ilevel - levelmin_;
+        //     std::cout << "     Level " << std::setw(3) << ilevel << " :  desired absolute offset = (" << std::setw(5)
+        //               << gh.offset_abs(ilevel, 0) << ", " << std::setw(5) << gh.offset_abs(ilevel, 1) << ", " << std::setw(5)
+        //               << gh.offset_abs(ilevel, 2) << ")\n";
+        //     std::cout << "     Level " << std::setw(3) << ilevel << " :   output absolute offset = (" << std::setw(5)
+        //               << refine_offset[6 * dlv] * PS2 << ", " << std::setw(5) << refine_offset[6 * dlv + 2] * PS2 << ", " << std::setw(5)
+        //               << refine_offset[6 * dlv + 4] * PS2 << ")\n";
 
-            // std::cout << "                             desired size = (" << std::setw(5) << gh.size(ilevel, 0) << ", " << std::setw(5)
-            //           << gh.size(ilevel, 1) << ", " << std::setw(5) << gh.size(ilevel, 2) << ")\n";
-            std::cout << "                              output size = (" << std::setw(5) << refine_size[3 * dlv + 0] << ", " << std::setw(5)
-                      << refine_size[3 * dlv + 1] << ", " << std::setw(5) << refine_size[3 * dlv + 2] << ")\n";
-        }
+        //     std::cout << "                             desired size = (" << std::setw(5) << gh.size(ilevel, 0) << ", " << std::setw(5)
+        //               << gh.size(ilevel, 1) << ", " << std::setw(5) << gh.size(ilevel, 2) << ")\n";
+        //     std::cout << "                              output size = (" << std::setw(5) << refine_size[3 * dlv + 0] << ", " << std::setw(5)
+        //               << refine_size[3 * dlv + 1] << ", " << std::setw(5) << refine_size[3 * dlv + 2] << ")\n";
+        // }
 
         /* write refinement mask */
-        LOGINFO("writing refinement mask Input__UM_IC_RefineRegion");
+        LOGINFO("GAMER-2 plugin: writing refinement mask Input__UM_IC_RefineRegion");
         std::string fname = "Input__UM_IC_RefineRegion";
         std::ofstream ofs(fname, std::ios::trunc);
         ofs << "# RefineRegion\n";
@@ -401,6 +425,7 @@ class gamer2_output_plugin : public output_plugin
 
         if (!bbaryons_)
         {
+            LOGINFO("GAMER-2 plugin: writing vacuum mesh to temporary files");
             // write vacuum mesh (floor will be applied in GAMER)
             for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
             {
@@ -418,6 +443,8 @@ class gamer2_output_plugin : public output_plugin
 
     void write_dm_mass(const grid_hierarchy &gh)
     {
+        LOGINFO("GAMER-2 plugin: writing particle mass to temporary files");
+
         // write particle mass
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
@@ -440,6 +467,8 @@ class gamer2_output_plugin : public output_plugin
 
     void write_dm_position(int coord, const grid_hierarchy &gh)
     {
+        LOGINFO("GAMER-2 plugin: writing particle position to temporary files");
+
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
             const MeshvarBnd<real_t> *data = gh.get_grid(ilevel);
@@ -483,6 +512,8 @@ class gamer2_output_plugin : public output_plugin
 
     void write_dm_velocity(int coord, const grid_hierarchy &gh)
     {
+        LOGINFO("GAMER-2 plugin: writing particle velocity to temporary files");
+
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_vel + 100 * coord + ilevel) + ".bin";
@@ -508,6 +539,8 @@ class gamer2_output_plugin : public output_plugin
 
     void write_gas_density(const grid_hierarchy &gh)
     {
+        LOGINFO("GAMER-2 plugin: writing gas density to temporary files");
+
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_gas_rho + ilevel) + ".bin";
@@ -519,6 +552,8 @@ class gamer2_output_plugin : public output_plugin
 
     void write_gas_velocity(int coord, const grid_hierarchy &gh)
     {
+        LOGINFO("GAMER-2 plugin: writing gas velocity to temporary files");
+
         for (unsigned ilevel = levelmin_; ilevel <= levelmax_; ++ilevel)
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_gas_vel + 100 * coord + ilevel) + ".bin";

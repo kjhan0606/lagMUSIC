@@ -1,3 +1,5 @@
+This is the original version of MUSIC, for v2, please go to [this bitbucket repo](https://github.com/cosmo-sims/MUSIC)
+
 MUSIC - multi-scale cosmological initial conditions
 ===================================================
 

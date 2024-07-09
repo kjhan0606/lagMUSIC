@@ -72,7 +72,6 @@ class gamer2_output_plugin : public output_plugin
                 for (int k = 0; k < n2; ++k)
                     if (gh.is_in_mask(ilevel, i, j, k) && !gh.is_refined(ilevel, i, j, k))
                     {
-                        /* store particles at ilevel */
                         vdata.push_back((*data)(i, j, k) * fac + shift);
 
                         count++;
@@ -89,14 +88,6 @@ class gamer2_output_plugin : public output_plugin
 
     size_t write2tempfile_grid(std::string fname, const grid_hierarchy &gh, unsigned ilevel, real_t fac = 1.0, real_t shift = 0.0)
     {
-        // double left[3], right[3];
-        // for (int dim = 0; dim < 3; dim++)
-        // {
-        //     double h   = 1.0 / (1 << ilevel);
-        //     left[dim]  = h * refine_offset[6 * (ilevel - levelmin_) + 2 * dim] * PS2;
-        //     right[dim] = 1.0 - h * refine_offset[6 * (ilevel - levelmin_) + 2 * dim + 1] * PS2;
-        // }
-
         const MeshvarBnd<real_t> *data = gh.get_grid(ilevel);
 
         int n0 = data->size(0), n1 = data->size(1), n2 = data->size(2);
@@ -104,21 +95,13 @@ class gamer2_output_plugin : public output_plugin
         vdata.reserve((unsigned)(n0) * (n1) * (n2));
 
         size_t count = 0;
-        // double pos[3];
         for (int k = 0; k < n2; ++k)
             for (int j = 0; j < n1; ++j)
                 for (int i = 0; i < n0; ++i)
                 {
-                    // gh.cell_pos(ilevel, i, j, k, pos);
+                    vdata.push_back((*data)(i, j, k) * fac + shift);
 
-                    // if (pos[0] >= left[0] && pos[0] < right[0] && pos[1] >= left[1] && pos[1] < right[1] && pos[2] >= left[2] &&
-                    //     pos[2] < right[2])
-                    {
-                        /* store cells in GAMER2 refinement mask on ilevel */
-                        vdata.push_back((*data)(i, j, k) * fac + shift);
-
-                        count++;
-                    }
+                    count++;
                 }
 
         std::ofstream ofs_temp(fname, std::ios::binary | std::ios::trunc);
@@ -369,7 +352,7 @@ class gamer2_output_plugin : public output_plugin
                     throw std::runtime_error("Fatal: zero size refinement region");
                 }
 
-                int left_music = gh.offset_abs(ilevel, dim);
+                int left_music  = gh.offset_abs(ilevel, dim);
                 int right_music = (1 << ilevel) - gh.offset_abs(ilevel, dim) - gh.size(ilevel, dim);
                 if (left_music != left * PS2 || right_music != right * PS2)
                 {
@@ -383,23 +366,6 @@ class gamer2_output_plugin : public output_plugin
                 refine_size.push_back(size);
             }
         }
-
-        // print refine_offset
-        // for (unsigned ilevel = levelmin_ + 1; ilevel <= levelmax_; ++ilevel)
-        // {
-        //     unsigned dlv = ilevel - levelmin_;
-        //     std::cout << "     Level " << std::setw(3) << ilevel << " :  desired absolute offset = (" << std::setw(5)
-        //               << gh.offset_abs(ilevel, 0) << ", " << std::setw(5) << gh.offset_abs(ilevel, 1) << ", " << std::setw(5)
-        //               << gh.offset_abs(ilevel, 2) << ")\n";
-        //     std::cout << "     Level " << std::setw(3) << ilevel << " :   output absolute offset = (" << std::setw(5)
-        //               << refine_offset[6 * dlv] * PS2 << ", " << std::setw(5) << refine_offset[6 * dlv + 2] * PS2 << ", " << std::setw(5)
-        //               << refine_offset[6 * dlv + 4] * PS2 << ")\n";
-
-        //     std::cout << "                             desired size = (" << std::setw(5) << gh.size(ilevel, 0) << ", " << std::setw(5)
-        //               << gh.size(ilevel, 1) << ", " << std::setw(5) << gh.size(ilevel, 2) << ")\n";
-        //     std::cout << "                              output size = (" << std::setw(5) << refine_size[3 * dlv + 0] << ", " << std::setw(5)
-        //               << refine_size[3 * dlv + 1] << ", " << std::setw(5) << refine_size[3 * dlv + 2] << ")\n";
-        // }
 
         /* write refinement mask */
         LOGINFO("GAMER-2 plugin: writing refinement mask Input__UM_IC_RefineRegion");
@@ -518,7 +484,7 @@ class gamer2_output_plugin : public output_plugin
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_dm_vel + 100 * coord + ilevel) + ".bin";
 
-            // Code velocity v_code is a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
+            // Code velocity is v_code = a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
             real_t a_start = 1.0 / (1.0 + zstart_);
             real_t fac     = a_start * music_unit_velocity_ / gamer_unit_velocity_;
             write2tempfile_par(temp_fname, gh, ilevel, fac, 0);
@@ -558,7 +524,7 @@ class gamer2_output_plugin : public output_plugin
         {
             std::string temp_fname = "___ic_temp_" + std::to_string(1000 * id_gas_vel + 100 * coord + ilevel) + ".bin";
 
-            // Code velocity v_code is a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
+            // Code velocity is v_code = a * v_peculiar. See Eq. (16) of SCHIVE, TSAI, & CHIUEH (2010)
             real_t a_start = 1.0 / (1.0 + zstart_);
             real_t fac     = a_start * music_unit_velocity_ / gamer_unit_velocity_;
             write2tempfile_grid(temp_fname, gh, ilevel, fac, 0);

@@ -16,6 +16,7 @@
 #include "mpi_fft.hh"
 #include "mesh_distributed.hh"
 #include <vector>
+#include <cstring>
 
 #if defined(FFTW3) && defined(SINGLE_PRECISION)
 //#define fftw_complex fftwf_complex
@@ -509,6 +510,72 @@ void perform_dist(kernel *pk, real_t *root_data, size_t gnx, size_t gny, size_t 
 template void perform_dist<float >(kernel *pk, float  *root_data, size_t gnx, size_t gny, size_t gnz, bool shift, bool fix, bool flip);
 #else
 template void perform_dist<double>(kernel *pk, double *root_data, size_t gnx, size_t gny, size_t gnz, bool shift, bool fix, bool flip);
+#endif
+
+/*****************************************************************************************/
+/***    PERFORM_MPI / GATHER WRAPPER AROUND A PRE-DISTRIBUTED SLAB                      ***/
+/*****************************************************************************************/
+//
+// Use this when the per-rank slab is already populated (e.g. each rank loaded
+// its own noise slab via random_number_generator::load_slab). Skips the
+// scatter, runs perform_mpi() in place, then gathers the convolved slabs back
+// to root_data on rank 0. Workers may pass root_data = NULL.
+//
+// Falls back to plain perform() on slab->m_pdata when USE_MPI is undefined or
+// MPI size == 1 (and copies the result into root_data when different).
+
+template <typename real_t>
+void perform_dist_slab(kernel *pk, Meshvar<real_t> *slab, real_t *root_data,
+                       size_t gnx, size_t gny, size_t gnz,
+                       bool shift, bool fix, bool flip)
+{
+	if( slab == NULL ){
+		LOGERR("convolution::perform_dist_slab: slab is NULL.");
+		throw std::runtime_error("perform_dist_slab: slab is NULL");
+	}
+#ifndef USE_MPI
+	(void)gnx; (void)gny; (void)gnz;
+	convolution::perform<real_t>(pk, reinterpret_cast<void*>(slab->m_pdata), shift, fix, flip);
+	if( root_data && root_data != slab->m_pdata ){
+		const size_t nz_padded = 2*(gnz/2+1);
+		std::memcpy(root_data, slab->m_pdata, gnx*gny*nz_padded*sizeof(real_t));
+	}
+#else
+	if( MUSIC::mpi::size() == 1 ){
+		convolution::perform<real_t>(pk, reinterpret_cast<void*>(slab->m_pdata), shift, fix, flip);
+		if( root_data && root_data != slab->m_pdata ){
+			const size_t nz_padded = 2*(gnz/2+1);
+			std::memcpy(root_data, slab->m_pdata, gnx*gny*nz_padded*sizeof(real_t));
+		}
+		return;
+	}
+
+	const int rk = MUSIC::mpi::rank();
+	const int sz = MUSIC::mpi::size();
+	const size_t local_nx    = slab->local_nx();
+	const size_t nz_padded   = 2*(gnz/2+1);
+	const size_t local_count = local_nx * gny * nz_padded;
+
+	std::vector<int> counts(sz), displs(sz);
+	int my_count = (int)local_count;
+	MPI_Allgather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MUSIC::mpi::world());
+	displs[0] = 0;
+	for( int i=1; i<sz; ++i ) displs[i] = displs[i-1] + counts[i-1];
+
+	MPI_Datatype dtype = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	convolution::perform_mpi<real_t>(pk, slab, shift, fix, flip);
+
+	MPI_Gatherv( slab->m_pdata, my_count, dtype,
+	             (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype,
+	             0, MUSIC::mpi::world() );
+#endif
+}
+
+#ifdef SINGLE_PRECISION
+template void perform_dist_slab<float >(kernel *pk, Meshvar<float > *slab, float  *root_data, size_t gnx, size_t gny, size_t gnz, bool shift, bool fix, bool flip);
+#else
+template void perform_dist_slab<double>(kernel *pk, Meshvar<double> *slab, double *root_data, size_t gnx, size_t gny, size_t gnz, bool shift, bool fix, bool flip);
 #endif
 
 /*****************************************************************************************/

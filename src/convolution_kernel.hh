@@ -136,6 +136,17 @@ template <typename real_t>
 void perform_dist(kernel *pk, real_t *root_data, size_t gnx, size_t gny, size_t gnz,
                   bool shift, bool fix, bool flip);
 
+//! Variant of perform_dist for when the caller has already populated the
+//! per-rank slab (e.g. via random_number_generator::load_slab). Skips the
+//! scatter, runs perform_mpi(), then gathers the convolved slabs back to
+//! `root_data` on rank 0 (workers may pass NULL). Caller owns `slab`.
+//! Falls back to plain perform() on slab->m_pdata when USE_MPI is undefined
+//! or MPI size == 1 (and copies the result into root_data when different).
+template <typename real_t>
+void perform_dist_slab(kernel *pk, class Meshvar<real_t> *slab, real_t *root_data,
+                       size_t gnx, size_t gny, size_t gnz,
+                       bool shift, bool fix, bool flip);
+
 } //namespace convolution
 
 #endif //__CONVOLUTION_KERNELS_HH

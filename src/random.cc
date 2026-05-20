@@ -1328,12 +1328,25 @@ random_number_generator<rng, T>::random_number_generator(config_file &cf, refine
 	if (!restart_)
 	{
 		// SPMD-light: only root computes & disk-caches white noise.
-		// Workers consume noise only via collective scatter inside
-		// perform_dist, so they neither need mem_cache_ nor should
-		// race on the shared wnoise_*.bin files (std::ios::trunc
+		// Workers consume noise either via collective scatter inside
+		// perform_dist (legacy load-into-rank-0-grid path) or via
+		// load_slab() (per-rank slab read from wnoise_NNNN.bin). They
+		// must not race on the shared wnoise_*.bin files (std::ios::trunc
 		// otherwise corrupts the file root reads back).
 		if (MUSIC::mpi::is_root())
 			compute_random_numbers();
+#ifdef USE_MPI
+		if (MUSIC::mpi::size() > 1) {
+			if (!disk_cached_) {
+				LOGERR("MPI multi-rank requires random/disk_cached=yes "
+				       "(workers cannot share rank-0 mem_cache_).");
+				throw std::runtime_error("MPI requires disk-cached white noise");
+			}
+			// Ensure rank-0 has flushed wnoise_*.bin before any worker
+			// calls rand.load_slab() in the unigrid SPMD path.
+			MPI_Barrier(MUSIC::mpi::world());
+		}
+#endif
 	}
 }
 

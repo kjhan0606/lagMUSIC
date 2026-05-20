@@ -20,7 +20,12 @@
 
 #include <fstream>
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <map>
+#include <stdexcept>
+#include <vector>
+#include <sys/types.h>
 #include <omp.h>
 
 #include <gsl/gsl_rng.h>
@@ -425,7 +430,85 @@ public:
 
 		}
 
-		
+
+	}
+
+	//! Distributed-load: each rank fills only its own x-slab from the disk-cached
+	//! wnoise file. Writes into a buffer laid out as (local_nx, gny, gnz_padded)
+	//! with row-major indexing — same layout as DensityGrid / make_slab_meshvar
+	//! (fftw_inplace_pad=true). Padding cells in the inner dim are not touched.
+	//! Pre: random/disk_cached must be true (workers cannot share mem_cache_).
+	//! Pre: rank 0's compute_random_numbers() must have completed (the constructor
+	//! barriers on this when USE_MPI is defined).
+	template< typename real_t >
+	void load_slab( real_t* slab_data, std::size_t local_x_start, std::size_t local_nx,
+	                std::size_t gny, std::size_t gnz, std::size_t gnz_padded, int ilevel )
+	{
+		if( local_nx == 0 ) return;
+
+		if( !disk_cached_ ){
+			LOGERR("random_number_generator::load_slab requires random/disk_cached=yes (workers cannot share mem cache).");
+			throw std::runtime_error("load_slab requires disk_cached white noise");
+		}
+
+		char fname[128];
+		std::sprintf(fname, "wnoise_%04d.bin", ilevel);
+		std::FILE* fp = std::fopen(fname, "rb");
+		if( !fp ){
+			LOGERR("load_slab: cannot open '%s'", fname);
+			throw std::runtime_error("load_slab: cannot open wnoise file");
+		}
+
+		unsigned hnx = 0, hny = 0, hnz = 0;
+		if( std::fread(&hnx, sizeof(unsigned), 1, fp) != 1
+		 || std::fread(&hny, sizeof(unsigned), 1, fp) != 1
+		 || std::fread(&hnz, sizeof(unsigned), 1, fp) != 1 ){
+			std::fclose(fp);
+			LOGERR("load_slab: failed to read header from '%s'", fname);
+			throw std::runtime_error("load_slab: header read failed");
+		}
+		if( hny != (unsigned)gny || hnz != (unsigned)gnz ){
+			std::fclose(fp);
+			LOGERR("load_slab: wnoise file dim mismatch (file=%u,%u,%u vs slab y,z=%zu,%zu)",
+			       hnx, hny, hnz, gny, gnz);
+			throw std::runtime_error("load_slab: wnoise dim mismatch");
+		}
+		if( local_x_start + local_nx > (std::size_t)hnx ){
+			std::fclose(fp);
+			LOGERR("load_slab: slab x-range [%zu,%zu) exceeds file nx=%u",
+			       local_x_start, local_x_start + local_nx, hnx);
+			throw std::runtime_error("load_slab: slab out of range");
+		}
+
+		const off_t header_bytes = (off_t)(3 * sizeof(unsigned));
+		const off_t plane_bytes  = (off_t)((std::size_t)gny * (std::size_t)gnz * sizeof(real_t));
+		if( fseeko(fp, header_bytes + (off_t)local_x_start * plane_bytes, SEEK_SET) != 0 ){
+			std::fclose(fp);
+			LOGERR("load_slab: fseeko failed on '%s'", fname);
+			throw std::runtime_error("load_slab: fseeko failed");
+		}
+
+		std::vector<real_t> plane((std::size_t)gny * (std::size_t)gnz);
+		for( std::size_t i = 0; i < local_nx; ++i ){
+			const std::size_t want = (std::size_t)gny * (std::size_t)gnz;
+			const std::size_t got  = std::fread(&plane[0], sizeof(real_t), want, fp);
+			if( got != want ){
+				std::fclose(fp);
+				LOGERR("load_slab: short read on plane %zu (got %zu of %zu)", i, got, want);
+				throw std::runtime_error("load_slab: short read");
+			}
+			if( gnz_padded == gnz ){
+				std::memcpy(&slab_data[i * gny * gnz_padded], &plane[0],
+				            want * sizeof(real_t));
+			} else {
+				#pragma omp parallel for
+				for( std::size_t j = 0; j < gny; ++j )
+					for( std::size_t k = 0; k < gnz; ++k )
+						slab_data[(i * gny + j) * gnz_padded + k] = plane[j * gnz + k];
+			}
+		}
+
+		std::fclose(fp);
 	}
 };
 

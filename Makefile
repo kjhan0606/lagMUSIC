@@ -29,9 +29,9 @@ ifeq ($(strip $(MULTITHREADFFTW)), yes)
   endif
   ifeq ($(strip $(FFTW3)),yes)
 	ifeq ($(strip $(SINGLEPRECISION)), yes)
-		LFLAGS  +=  -lfftw3f_threads
+		LFLAGS  +=  -lfftw3f_omp
 	else
-		LFLAGS  +=  -lfftw3_threads
+		LFLAGS  +=  -lfftw3_omp
 	endif
   else
     ifeq ($(strip $(SINGLEPRECISION)), yes)

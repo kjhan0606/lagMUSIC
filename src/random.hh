@@ -401,28 +401,28 @@ public:
 		else
 		{
 			LOGUSER("Copying white noise from memory cache...");
-			
+
 			if( mem_cache_[ilevel-levelmin_] == NULL )
 				LOGERR("Tried to access mem-cached random numbers for level %d. But these are not available!\n",ilevel);
-			
+
 			int nx( A.size(0) ), ny( A.size(1) ), nz( A.size(2) );
-			
+
 			if ( (size_t)nx*(size_t)ny*(size_t)nz != mem_cache_[ilevel-levelmin_]->size() )
 			{
 				LOGERR("White noise file is not aligned with array. File: [%d,%d,%d]. Mem: [%d,%d,%d].",nx,ny,nz,A.size(0),A.size(1),A.size(2));
 				throw std::runtime_error("White noise file is not aligned with array. This is an internal inconsistency and bad");
 			}
-			
+
 			#pragma omp parallel for
 			for( int i=0; i<nx; ++i )
 				for( int j=0; j<ny; ++j )
 					for( int k=0; k<nz; ++k )
 						A(i,j,k) = (*mem_cache_[ilevel-levelmin_])[((size_t)i*ny+(size_t)j)*nz+(size_t)k];
-			
+
 			std::vector<T>().swap( *mem_cache_[ilevel-levelmin_] );
 			delete mem_cache_[ilevel-levelmin_];
 			mem_cache_[ilevel-levelmin_] = NULL;
-			
+
 		}
 
 		

@@ -8,6 +8,7 @@ find_package(PkgConfig REQUIRED)
 set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${PROJECT_SOURCE_DIR}")
 
 option(MUSIC_ENABLE_SINGLE_PRECISION "Enable Single Precision Mode" OFF)
+option(MUSIC_ENABLE_MPI "Enable MPI parallelisation" ON)
 
 ########################################################################################################################
 # OpenMP
@@ -23,11 +24,21 @@ endif()
 find_package(Threads REQUIRED)
 
 ########################################################################################################################
+# MPI
+if(MUSIC_ENABLE_MPI)
+  find_package(MPI REQUIRED COMPONENTS CXX)
+endif()
+
+########################################################################################################################
 # FFTW
 if(POLICY CMP0074)
     cmake_policy(SET CMP0074 NEW)
 endif()
-find_package(FFTW3 COMPONENTS SINGLE DOUBLE THREADS)
+if(MUSIC_ENABLE_MPI)
+  find_package(FFTW3 COMPONENTS SINGLE DOUBLE OPENMP MPI)
+else()
+  find_package(FFTW3 COMPONENTS SINGLE DOUBLE OPENMP)
+endif()
 
 ########################################################################################################################
 # TIRPC, needed only for Tipsy format
@@ -80,27 +91,38 @@ if(FFTW3_FOUND)
 
   if( MUSIC_ENABLE_SINGLE_PRECISION )
     target_compile_options(${PRGNAME} PRIVATE "-DSINGLE_PRECISION")
-    if (FFTW3_SINGLE_THREADS_FOUND)
-      target_link_libraries(${PRGNAME} ${FFTW3_SINGLE_THREADS_LIBRARY})
+    if (FFTW3_SINGLE_OPENMP_FOUND)
+      target_link_libraries(${PRGNAME} ${FFTW3_SINGLE_OPENMP_LIBRARY})
       target_compile_options(${PRGNAME} PRIVATE "-DUSE_FFTW_THREADS")
     elseif(FFTW3_SINGLE_SERIAL_FOUND)
       target_link_libraries(${PRGNAME} ${FFTW3_SINGLE_SERIAL_LIBRARY})
-      message( WARNING "using serial version of FFTW3 -- this will most likely cause a very slow version of MUSIC. Rec: install FFTW3 with thread support")
-    else()  
+      message( WARNING "using serial version of FFTW3 -- this will most likely cause a very slow version of MUSIC. Rec: install FFTW3 with OpenMP support (libfftw3f_omp)")
+    else()
       message( FATAL "chose compilation in single precision, but FFTW3 not found for single precision")
     endif()
+    if(MUSIC_ENABLE_MPI AND FFTW3_SINGLE_MPI_FOUND)
+      target_link_libraries(${PRGNAME} ${FFTW3_SINGLE_MPI_LIBRARY})
+    endif()
   else(MUSIC_ENABLE_SINGLE_PRECISION)
-    if (FFTW3_DOUBLE_THREADS_FOUND)
-      target_link_libraries(${PRGNAME} ${FFTW3_DOUBLE_THREADS_LIBRARY})
+    if (FFTW3_DOUBLE_OPENMP_FOUND)
+      target_link_libraries(${PRGNAME} ${FFTW3_DOUBLE_OPENMP_LIBRARY})
       target_compile_options(${PRGNAME} PRIVATE "-DUSE_FFTW_THREADS")
     elseif(FFTW3_DOUBLE_SERIAL_FOUND)
       target_link_libraries(${PRGNAME} ${FFTW3_DOUBLE_SERIAL_LIBRARY})
-      message( WARNING "using serial version of FFTW3 -- this will most likely cause a very slow version of MUSIC. Rec: install FFTW3 with thread support")
-    else()  
+      message( WARNING "using serial version of FFTW3 -- this will most likely cause a very slow version of MUSIC. Rec: install FFTW3 with OpenMP support (libfftw3_omp)")
+    else()
       message( FATAL "chose compilation in double precision, but FFTW3 not found for double precision")
+    endif()
+    if(MUSIC_ENABLE_MPI AND FFTW3_DOUBLE_MPI_FOUND)
+      target_link_libraries(${PRGNAME} ${FFTW3_DOUBLE_MPI_LIBRARY})
     endif()
   endif(MUSIC_ENABLE_SINGLE_PRECISION)
 endif(FFTW3_FOUND)
+
+if(MUSIC_ENABLE_MPI)
+  target_link_libraries(${PRGNAME} MPI::MPI_CXX)
+  target_compile_options(${PRGNAME} PRIVATE "-DUSE_MPI")
+endif()
 
 if(HDF5_FOUND)
   # target_link_libraries(${PRGNAME} ${HDF5_C_LIBRARY_DIRS})

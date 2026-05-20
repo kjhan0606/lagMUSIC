@@ -12,6 +12,7 @@
 
 #include "densities.hh"
 #include "convolution_kernel.hh"
+#include "mpi_helper.hh"
 
 //TODO: this should be a larger number by default, just to maintain consistency with old default
 #define DEF_RAN_CUBE_SIZE 32
@@ -613,11 +614,25 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 		PaddedDensitySubGrid<real_t> *coarse(NULL), *fine(NULL);
 		int nlevels = (int)levelmax - (int)levelmin + 1;
 
-		// do coarse level
-		top = new DensityGrid<real_t>(nbase, nbase, nbase);
-		LOGINFO("Performing noise convolution on level %3d", levelmin);
-		rand.load(*top, levelmin);
-		convolution::perform<real_t>(the_tf_kernel->fetch_kernel(levelmin, false), reinterpret_cast<void *>(top->get_data_ptr()), shift, fix, flip);
+		// do coarse level — collective across all ranks via perform_dist.
+		// Only root holds the data buffer; workers participate in the
+		// scatter/FFT/gather but do not allocate the full top-level grid.
+		const bool is_root = MUSIC::mpi::is_root();
+		if (is_root) {
+			top = new DensityGrid<real_t>(nbase, nbase, nbase);
+			LOGINFO("Performing noise convolution on level %3d", levelmin);
+			rand.load(*top, levelmin);
+		}
+		convolution::perform_dist<real_t>(
+			the_tf_kernel->fetch_kernel(levelmin, false),
+			is_root ? top->get_data_ptr() : (real_t*)NULL,
+			(size_t)nbase, (size_t)nbase, (size_t)nbase,
+			shift, fix, flip);
+
+		if (!is_root) {
+			delete the_tf_kernel;
+			return;
+		}
 
 		delta.create_base_hierarchy(levelmin);
 		top->copy(*delta.get_grid(levelmin));
@@ -673,29 +688,44 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 	}
 	else
 	{
-
 		//... create and initialize density grids with white noise
 		PaddedDensitySubGrid<real_t> *coarse(NULL), *fine(NULL);
 		DensityGrid<real_t> *top(NULL);
+		const bool is_root = MUSIC::mpi::is_root();
 
 		if (levelmax == levelmin)
 		{
-			std::cout << " - Performing noise convolution on level "
-					  << std::setw(2) << levelmax << " ..." << std::endl;
-			LOGUSER("Performing noise convolution on level %3d...", levelmax);
+			if (is_root) {
+				std::cout << " - Performing noise convolution on level "
+						  << std::setw(2) << levelmax << " ..." << std::endl;
+				LOGUSER("Performing noise convolution on level %3d...", levelmax);
 
-			top = new DensityGrid<real_t>(nbase, nbase, nbase);
-			//rand_gen.load( *top, levelmin );
-			rand.load(*top, levelmin);
+				top = new DensityGrid<real_t>(nbase, nbase, nbase);
+				rand.load(*top, levelmin);
+			}
 
-			convolution::perform<real_t>(the_tf_kernel->fetch_kernel(levelmax),
-										 reinterpret_cast<void *>(top->get_data_ptr()),
-										 shift, fix, flip);
+			// Collective: every rank participates in the slab-distributed
+			// kernel load + FFT + multiply + inverse FFT. Workers pass a
+			// NULL data pointer; only root owns the full padded grid.
+			convolution::perform_dist<real_t>(
+				the_tf_kernel->fetch_kernel(levelmax, /*isolated=*/false, /*distributed=*/true),
+				is_root ? top->get_data_ptr() : (real_t*)NULL,
+				(size_t)nbase, (size_t)nbase, (size_t)nbase,
+				shift, fix, flip);
 			the_tf_kernel->deallocate();
 
-			delta.create_base_hierarchy(levelmin);
-			top->copy(*delta.get_grid(levelmin));
-			delete top;
+			if (is_root) {
+				delta.create_base_hierarchy(levelmin);
+				top->copy(*delta.get_grid(levelmin));
+				delete top;
+			}
+		}
+
+		// Multi-grid (zoom) path is still serial; workers leave now so they
+		// do not touch the rank-0-only delta hierarchy.
+		if (!is_root) {
+			delete the_tf_kernel;
+			return;
 		}
 
 		for (int i = 0; i < (int)levelmax - (int)levelmin; ++i)

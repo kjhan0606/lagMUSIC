@@ -11,6 +11,11 @@
 #include "general.hh"
 #include "densities.hh"
 #include "convolution_kernel.hh"
+#include "mesh.hh"
+#include "mpi_helper.hh"
+#include "mpi_fft.hh"
+#include "mesh_distributed.hh"
+#include <vector>
 
 #if defined(FFTW3) && defined(SINGLE_PRECISION)
 //#define fftw_complex fftwf_complex
@@ -247,6 +252,266 @@ template void perform<double>(kernel *pk, void *pd, bool shift, bool fix, bool f
 template void perform<float>(kernel *pk, void *pd, bool shift, bool fix, bool flip);
 
 /*****************************************************************************************/
+/***    MPI / SLAB-DISTRIBUTED VARIANT                                                  ***/
+/*****************************************************************************************/
+
+template <typename real_t>
+void perform_mpi(kernel *pk, Meshvar<real_t> *pdist, bool shift, bool fix, bool flip)
+{
+	if( !pdist->is_distributed() ){
+		LOGERR("convolution::perform_mpi requires a slab-distributed Meshvar (see MUSIC::dist::make_slab_meshvar).");
+		throw std::runtime_error("perform_mpi: Meshvar is not distributed");
+	}
+	const bool ksampled = pk->is_ksampled();
+
+	const parameters cparam_ = pk->cparam_;
+	const size_t gnx = (size_t)cparam_.nx;
+	const size_t gny = (size_t)cparam_.ny;
+	const size_t gnz = (size_t)cparam_.nz;
+	if( pdist->global_size(0) != gnx || pdist->global_size(1) != gny || pdist->global_size(2) != gnz ){
+		LOGERR("convolution::perform_mpi: kernel/buffer size mismatch (kernel=%zux%zux%zu, buffer=%zux%zux%zu).",
+		       gnx, gny, gnz,
+		       pdist->global_size(0), pdist->global_size(1), pdist->global_size(2));
+		throw std::runtime_error("perform_mpi: size mismatch");
+	}
+
+	const size_t local_nx     = pdist->local_nx();
+	const size_t local_x_off  = pdist->local_x_start();
+	const size_t nz_complex   = gnz/2 + 1;
+
+	const double fftnormp = 1.0 / sqrt((double)gnx * (double)gny * (double)gnz);
+	const double fftnorm  = pow(2.0*M_PI, 1.5) / sqrt(cparam_.lx*cparam_.ly*cparam_.lz) * fftnormp;
+
+	fftw_real    *data  = reinterpret_cast<fftw_real*>(pdist->m_pdata);
+	fftw_complex *cdata = reinterpret_cast<fftw_complex*>(data);
+
+	double dstag = 0.0;
+	if( shift ){
+		double boxlength = pk->pcf_->getValue<double>("setup","boxlength");
+		double stagfact  = pk->pcf_->getValueSafe<double>("setup","baryon_staggering",0.5);
+		int lmax         = pk->pcf_->getValue<int>("setup","levelmax");
+		double dxmax     = boxlength / (1 << lmax);
+		double dxcur     = cparam_.lx / cparam_.nx;
+		LOGUSER("Performing staggering shift for SPH (MPI)");
+		dstag = stagfact * 2.0 * M_PI / cparam_.nx * dxmax / dxcur;
+	}
+
+	if( MUSIC::mpi::is_root() ){
+		std::cout << "   - Performing density convolution (MPI)... ("
+		          << gnx << ", " << gny << ", " << gnz << ") on " << MUSIC::mpi::size() << " ranks\n";
+	}
+	LOGUSER("Performing kernel convolution (MPI) on (%zu,%zu,%zu) grid", gnx, gny, gnz);
+
+#ifdef USE_MPI
+	MUSIC::fft::fft_plan_t plan  = MUSIC::fft::plan_r2c_3d_mpi(
+		(ptrdiff_t)gnx, (ptrdiff_t)gny, (ptrdiff_t)gnz, data);
+	MUSIC::fft::fft_plan_t iplan = MUSIC::fft::plan_c2r_3d_mpi(
+		(ptrdiff_t)gnx, (ptrdiff_t)gny, (ptrdiff_t)gnz, data);
+#else
+	MUSIC::fft::fft_plan_t plan  = MUSIC::fft::plan_r2c_3d_serial(
+		(int)gnx, (int)gny, (int)gnz, data);
+	MUSIC::fft::fft_plan_t iplan = MUSIC::fft::plan_c2r_3d_serial(
+		(int)gnx, (int)gny, (int)gnz, data);
+#endif
+
+	LOGUSER("Performing forward FFT (MPI)...");
+	MUSIC::fft::execute(plan);
+
+	// DC mode capture (only needed by the ksampled path, which zeroes it and
+	// restores it as a mean after the inverse FFT). The cached real-space path
+	// preserves the DC mode through the multiply, matching the serial behaviour.
+	std::complex<double> dcmode(0.0, 0.0);
+	if( ksampled ){
+		double dc_re_local = 0.0, dc_im_local = 0.0;
+		int    dc_owner_local = -1;
+		if( local_x_off == 0 && local_nx > 0 ){
+			dc_re_local = (double)RE(cdata[0]);
+			dc_im_local = (double)IM(cdata[0]);
+			dc_owner_local = MUSIC::mpi::rank();
+		}
+		int    dc_owner = dc_owner_local;
+		double dc_re = dc_re_local, dc_im = dc_im_local;
+#ifdef USE_MPI
+		MPI_Allreduce(&dc_owner_local, &dc_owner, 1, MPI_INT,    MPI_MAX, MUSIC::mpi::world());
+		MPI_Bcast(&dc_re, 1, MPI_DOUBLE, dc_owner, MUSIC::mpi::world());
+		MPI_Bcast(&dc_im, 1, MPI_DOUBLE, dc_owner, MUSIC::mpi::world());
+#endif
+		dcmode = std::complex<double>(dc_re, dc_im);
+	}
+
+	// K-space multiplication over the local x-slab. Global x index = local_x_off + ix.
+	if( ksampled ){
+#pragma omp parallel
+		{
+			const size_t veclen = nz_complex;
+			double *kvec   = new double[veclen];
+			double *Tkvec  = new double[veclen];
+			double *argvec = new double[veclen];
+
+#pragma omp for
+			for( size_t ix = 0; ix < local_nx; ++ix ){
+				const int gix = (int)(local_x_off + ix);
+				int kx = gix;
+				if( kx > (int)gnx/2 ) kx -= (int)gnx;
+				for( int j = 0; j < (int)gny; ++j ){
+					int ky = j;
+					if( ky > (int)gny/2 ) ky -= (int)gny;
+					for( int k = 0; k < (int)veclen; ++k ){
+						int kz = k;
+						kvec[k]   = sqrt((double)(kx*kx) + (double)(ky*ky) + (double)(kz*kz));
+						argvec[k] = ((double)kx + (double)ky + (double)kz) * dstag;
+					}
+					pk->at_k(veclen, kvec, Tkvec);
+					for( int k = 0; k < (int)veclen; ++k ){
+						size_t ii = (ix*gny + (size_t)j) * veclen + (size_t)k;
+						std::complex<double> carg(cos(argvec[k]), sin(argvec[k]));
+						std::complex<double> ccdata(RE(cdata[ii]), IM(cdata[ii]));
+						if( fix )  ccdata = ccdata / std::abs(ccdata) / fftnormp;
+						if( flip ) ccdata = -ccdata;
+						ccdata = ccdata * Tkvec[k] * fftnorm * carg;
+						RE(cdata[ii]) = ccdata.real();
+						IM(cdata[ii]) = ccdata.imag();
+					}
+				}
+			}
+
+			delete[] kvec;
+			delete[] Tkvec;
+			delete[] argvec;
+		}
+	} else {
+		// Cached real-space kernel: multiply by the rank-local k-space kernel
+		// slab. The kernel was loaded and FFT'd in fetch_kernel(.., distributed=true)
+		// with the same global (gnx,gny,gnz) and the same FFTW MPI layout, so
+		// the per-rank complex indexing matches the data buffer one-to-one.
+		fftw_complex *ckernel = reinterpret_cast<fftw_complex *>(pk->get_ptr());
+#pragma omp parallel for
+		for( size_t ix = 0; ix < local_nx; ++ix ){
+			const int gix = (int)(local_x_off + ix);
+			int kx = gix;
+			if( kx > (int)gnx/2 ) kx -= (int)gnx;
+			for( int j = 0; j < (int)gny; ++j ){
+				int ky = j;
+				if( ky > (int)gny/2 ) ky -= (int)gny;
+				for( int k = 0; k < (int)nz_complex; ++k ){
+					int kz = k;
+					double arg = ((double)kx + (double)ky + (double)kz) * dstag;
+					std::complex<double> carg(cos(arg), sin(arg));
+					size_t ii = (ix*gny + (size_t)j) * nz_complex + (size_t)k;
+					std::complex<double> ccdata  (RE(cdata[ii]),   IM(cdata[ii]));
+					std::complex<double> cckernel(RE(ckernel[ii]), IM(ckernel[ii]));
+					if( fix )  ccdata = ccdata / std::abs(ccdata);
+					if( flip ) ccdata = -ccdata;
+					ccdata = ccdata * cckernel * fftnorm * carg;
+					RE(cdata[ii]) = ccdata.real();
+					IM(cdata[ii]) = ccdata.imag();
+				}
+			}
+		}
+	}
+
+	// ksampled path zeroes & re-adds the DC mode around the inverse FFT
+	// (single-precision truncation guard). Cached path leaves DC intact.
+	if( ksampled && local_x_off == 0 && local_nx > 0 ){
+		RE(cdata[0]) = 0.0;
+		IM(cdata[0]) = 0.0;
+	}
+
+	LOGUSER("Performing backward FFT (MPI)...");
+	MUSIC::fft::execute(iplan);
+
+	MUSIC::fft::destroy(plan);
+	MUSIC::fft::destroy(iplan);
+
+	if( ksampled ){
+		// Re-add the DC mean. Each rank touches only its own logical cells
+		// (skipping the inner-dim r2c padding). This differs slightly from the
+		// serial perform() which strides through the padded buffer linearly; the
+		// MPI variant uses an explicit (ix,jy,kz) loop so the rank-collective
+		// result is well-defined.
+		const size_t nz_padded = 2 * nz_complex;
+		const real_t mean = (real_t)(dcmode.real() * fftnorm / (double)(gnx*gny*gnz));
+#pragma omp parallel for
+		for( size_t ix = 0; ix < local_nx; ++ix )
+			for( size_t jy = 0; jy < gny; ++jy )
+				for( size_t kz = 0; kz < gnz; ++kz )
+					data[(ix*gny + jy)*nz_padded + kz] += mean;
+	}
+}
+
+// perform_mpi reinterpret-casts the Meshvar buffer to fftw_real*, so the
+// template parameter must match the FFTW precision. Only one instantiation
+// is provided per build to make a mismatched call a link error.
+#ifdef SINGLE_PRECISION
+template void perform_mpi<float >(kernel *pk, Meshvar<float > *pdist, bool shift, bool fix, bool flip);
+#else
+template void perform_mpi<double>(kernel *pk, Meshvar<double> *pdist, bool shift, bool fix, bool flip);
+#endif
+
+/*****************************************************************************************/
+/***    SCATTER / PERFORM_MPI / GATHER WRAPPER AROUND ROOT-OWNED PADDED GRID            ***/
+/*****************************************************************************************/
+//
+// Root owns a contiguous padded buffer of shape (gnx, gny, 2*(gnz/2+1)) — the
+// in-place r2c FFTW layout that DensityGrid already uses. This wrapper:
+//   1. allocates a slab Meshvar on every rank (FFTW MPI layout, same padding)
+//   2. MPI_Scatterv the root buffer to the per-rank slabs
+//   3. calls perform_mpi() to do the collective convolution in-place
+//   4. MPI_Gatherv the slabs back to the root buffer
+// Workers may pass root_data = NULL; only rank 0's pointer is dereferenced.
+//
+// Falls back to scalar perform() when USE_MPI is undefined or world size == 1.
+
+template <typename real_t>
+void perform_dist(kernel *pk, real_t *root_data, size_t gnx, size_t gny, size_t gnz,
+                  bool shift, bool fix, bool flip)
+{
+#ifndef USE_MPI
+	(void)gnx; (void)gny; (void)gnz;
+	convolution::perform<real_t>(pk, reinterpret_cast<void*>(root_data), shift, fix, flip);
+#else
+	if( MUSIC::mpi::size() == 1 ){
+		convolution::perform<real_t>(pk, reinterpret_cast<void*>(root_data), shift, fix, flip);
+		return;
+	}
+
+	const int rk = MUSIC::mpi::rank();
+	const int sz = MUSIC::mpi::size();
+
+	Meshvar<real_t> *slab = MUSIC::dist::make_slab_meshvar<real_t>(gnx, gny, gnz, /*fftw_inplace_pad=*/true);
+	const size_t local_nx     = slab->local_nx();
+	const size_t nz_padded    = 2*(gnz/2+1);
+	const size_t local_count  = local_nx * gny * nz_padded;
+
+	std::vector<int> counts(sz), displs(sz);
+	int my_count = (int)local_count;
+	MPI_Allgather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MUSIC::mpi::world());
+	displs[0] = 0;
+	for( int i=1; i<sz; ++i ) displs[i] = displs[i-1] + counts[i-1];
+
+	MPI_Datatype dtype = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	MPI_Scatterv( (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype,
+	              slab->m_pdata, my_count, dtype,
+	              0, MUSIC::mpi::world() );
+
+	convolution::perform_mpi<real_t>(pk, slab, shift, fix, flip);
+
+	MPI_Gatherv( slab->m_pdata, my_count, dtype,
+	             (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype,
+	             0, MUSIC::mpi::world() );
+
+	delete slab;
+#endif
+}
+
+#ifdef SINGLE_PRECISION
+template void perform_dist<float >(kernel *pk, float  *root_data, size_t gnx, size_t gny, size_t gnz, bool shift, bool fix, bool flip);
+#else
+template void perform_dist<double>(kernel *pk, double *root_data, size_t gnx, size_t gny, size_t gnz, bool shift, bool fix, bool flip);
+#endif
+
+/*****************************************************************************************/
 /***    SPECIFIC KERNEL IMPLEMENTATIONS      *********************************************/
 /*****************************************************************************************/
 
@@ -280,8 +545,9 @@ public:
 		patchlength_ = boxlength_;
 	}
 
-	kernel *fetch_kernel(int ilevel, bool isolated = false)
+	kernel *fetch_kernel(int ilevel, bool isolated = false, bool /*distributed*/ = false)
 	{
+		// ksampled kernels need no buffer, so the distributed flag is moot.
 		if (!isolated)
 		{
 			cparam_.nx = prefh_->size(ilevel, 0);
@@ -345,10 +611,20 @@ public:
 	kernel_real_cached(config_file &cf, transfer_function *ptf, refinement_hierarchy &refh, tf_type type)
 		: kernel(cf, ptf, refh, type)
 	{
-		precompute_kernel(ptf, type, refh);
+		// SPMD-light: only root precomputes & writes temp_kernel_*.tmp.
+		// Concurrent rank writes are byte-identical so the existing race is
+		// benign, but root-only saves CPU and removes the theoretical race.
+		// In the current code workers never read the cached kernel (they
+		// early-return in densities.cc before fetch_kernel), so kdata_ may
+		// safely stay empty on non-root ranks.
+		if (MUSIC::mpi::is_root())
+			precompute_kernel(ptf, type, refh);
+#ifdef USE_MPI
+		MPI_Barrier(MUSIC::mpi::world());
+#endif
 	}
 
-	kernel *fetch_kernel(int ilevel, bool isolated = false);
+	kernel *fetch_kernel(int ilevel, bool isolated = false, bool distributed = false);
 
 	void *get_ptr()
 	{
@@ -374,52 +650,99 @@ public:
 };
 
 template <typename real_t>
-kernel *kernel_real_cached<real_t>::fetch_kernel(int ilevel, bool isolated)
+kernel *kernel_real_cached<real_t>::fetch_kernel(int ilevel, bool isolated, bool distributed)
 {
+	(void)isolated;
 	char cachefname[128];
 	sprintf(cachefname, "temp_kernel_level%03d.tmp", ilevel);
-	FILE *fp = fopen(cachefname, "r");
 
-	std::cout << " - Fetching kernel for level " << ilevel << std::endl;
-
+	if (MUSIC::mpi::is_root())
+		std::cout << " - Fetching kernel for level " << ilevel << std::endl;
 	LOGUSER("Loading kernel for level %3d from file \'%s\'...", ilevel, cachefname);
 
+	FILE *fp = fopen(cachefname, "r");
 	if (fp == NULL)
 	{
 		LOGERR("Could not open kernel file \'%s\'.", cachefname);
 		throw std::runtime_error("Internal error: cached convolution kernel does not exist on disk!");
 	}
 
-	unsigned nx, ny, nz;
+	unsigned nx, ny, nz_padded;
 	size_t nread = 0;
+	nread = fread(reinterpret_cast<void *>(&nx),        sizeof(unsigned), 1, fp);
+	nread = fread(reinterpret_cast<void *>(&ny),        sizeof(unsigned), 1, fp);
+	nread = fread(reinterpret_cast<void *>(&nz_padded), sizeof(unsigned), 1, fp);
+	(void)nread;
 
-	nread = fread(reinterpret_cast<void *>(&nx), sizeof(unsigned), 1, fp);
-	nread = fread(reinterpret_cast<void *>(&ny), sizeof(unsigned), 1, fp);
-	nread = fread(reinterpret_cast<void *>(&nz), sizeof(unsigned), 1, fp);
-
-	kdata_.assign((size_t)nx * (size_t)ny * (size_t)nz, 0.0);
-
-	for (size_t ix = 0; ix < nx; ++ix)
-	{
-		const size_t sz = ny * nz;
-		nread = fread(reinterpret_cast<void *>(&kdata_[(size_t)ix * sz]), sizeof(fftw_real), sz, fp);
-		assert(nread == sz);
-	}
-
-	fclose(fp);
+	const size_t header_bytes = 3 * sizeof(unsigned);
+	const int logical_nz = (int)nz_padded - 2;
 
 	//... set parameters
-
 	double boxlength = pcf_->getValue<double>("setup", "boxlength");
 	double dx = boxlength / (1 << ilevel);
 
 	cparam_.nx = nx;
 	cparam_.ny = ny;
-	cparam_.nz = nz - 2;
+	cparam_.nz = logical_nz;
 	cparam_.lx = dx * cparam_.nx;
 	cparam_.ly = dx * cparam_.ny;
 	cparam_.lz = dx * cparam_.nz;
 	cparam_.pcf = pcf_;
+
+#ifdef USE_MPI
+	if (distributed && MUSIC::mpi::size() > 1)
+	{
+		// Each rank reads its own x-slab from the cached file. The on-disk
+		// layout (nx rows of ny*nz_padded reals) is exactly the per-rank
+		// real-space layout FFTW MPI uses for an in-place r2c plan, so we
+		// can fread directly into the start of the slab buffer.
+		MUSIC::dist::slab_layout slab = MUSIC::dist::compute_slab_layout(
+			(size_t)nx, (size_t)ny, (size_t)logical_nz, /*fftw_inplace_pad=*/true);
+
+		kdata_.assign(slab.alloc_real_count, 0.0);
+
+		if (slab.local_nx > 0)
+		{
+			const size_t row_reals = (size_t)ny * (size_t)nz_padded;
+			const off_t  offset    = (off_t)(header_bytes + slab.local_x_start * row_reals * sizeof(fftw_real));
+			if (fseeko(fp, offset, SEEK_SET) != 0)
+			{
+				LOGERR("fseeko on cached kernel file \'%s\' failed.", cachefname);
+				fclose(fp);
+				throw std::runtime_error("fetch_kernel: fseek failure");
+			}
+			const size_t nreals = slab.local_nx * row_reals;
+			const size_t got    = fread(reinterpret_cast<void *>(&kdata_[0]),
+			                            sizeof(fftw_real), nreals, fp);
+			if (got != nreals)
+			{
+				LOGERR("Short read on cached kernel slab (rank=%d): expected %zu reals, got %zu",
+				       MUSIC::mpi::rank(), nreals, got);
+				fclose(fp);
+				throw std::runtime_error("fetch_kernel: short read");
+			}
+		}
+		fclose(fp);
+
+		fftw_real *rkernel = reinterpret_cast<fftw_real *>(&kdata_[0]);
+		MUSIC::fft::fft_plan_t plan = MUSIC::fft::plan_r2c_3d_mpi(
+			(ptrdiff_t)nx, (ptrdiff_t)ny, (ptrdiff_t)logical_nz, rkernel);
+		MUSIC::fft::execute(plan);
+		MUSIC::fft::destroy(plan);
+		return this;
+	}
+#endif
+
+	// Serial single-rank path (legacy behaviour).
+	(void)distributed;
+	kdata_.assign((size_t)nx * (size_t)ny * (size_t)nz_padded, 0.0);
+	for (size_t ix = 0; ix < nx; ++ix)
+	{
+		const size_t sz = (size_t)ny * (size_t)nz_padded;
+		nread = fread(reinterpret_cast<void *>(&kdata_[ix * sz]), sizeof(fftw_real), sz, fp);
+		assert(nread == sz);
+	}
+	fclose(fp);
 
 	fftw_real *rkernel = reinterpret_cast<fftw_real *>(&kdata_[0]);
 

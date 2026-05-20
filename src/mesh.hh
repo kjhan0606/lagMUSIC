@@ -102,29 +102,44 @@ template<typename T>
 class Meshvar{
 public:
 	typedef T real_t;
-	
-	size_t 
-		m_nx,	//!< x-extent of the rectangular mesh
+
+	size_t
+		m_nx,	//!< x-extent of the rectangular mesh (LOCAL, in distributed mode)
 		m_ny,	//!< y-extent of the rectangular mesh
 		m_nz;	//!< z-extent of the rectangular mesh
-	
-	int 
+
+	int
 		m_offx, //!< x-offset of the grid (just as a helper, not used inside the class)
 		m_offy, //!< y-offset of the grid (just as a helper, not used inside the class)
 		m_offz;	//!< z-offset of the grid (just as a helper, not used inside the class)
-	
+
+	// ---- slab-distribution metadata (opt-in; default = not distributed) ----
+	// In distributed mode, the data array stores only the local x-slab of a
+	// larger global grid. (m_nx, m_ny, m_nz) above refer to the LOCAL extent;
+	// the fields below describe the global grid and the local-slab boundaries.
+	bool m_is_distributed; //!< false: m_pdata is the full grid (legacy path).
+	size_t m_global_nx;    //!< full x-extent of the global grid
+	size_t m_global_ny;    //!< full y-extent (= m_ny in slab decomp)
+	size_t m_global_nz;    //!< full z-extent (= m_nz in slab decomp)
+	size_t m_local_x_start;//!< first global ix owned by this rank
+	size_t m_local_nx;     //!< number of global ix owned by this rank (== m_nx in slab decomp)
+
 	real_t * m_pdata; //!< pointer to the dynamic data array
-	
+
 	//! constructor for cubic mesh
 	explicit Meshvar( size_t n, int offx, int offy, int offz )
-	: m_nx( n ), m_ny( n ), m_nz( n ), m_offx( offx ), m_offy( offy ), m_offz( offz )
+	: m_nx( n ), m_ny( n ), m_nz( n ), m_offx( offx ), m_offy( offy ), m_offz( offz ),
+	  m_is_distributed(false), m_global_nx(n), m_global_ny(n), m_global_nz(n),
+	  m_local_x_start(0), m_local_nx(n)
 	{
 		m_pdata = new real_t[m_nx*m_ny*m_nz];
 	}
-	
+
 	//! constructor for rectangular mesh
 	Meshvar( size_t nx, size_t ny, size_t nz, int offx, int offy, int offz )
-	: m_nx( nx ), m_ny( ny ), m_nz( nz ), m_offx( offx ), m_offy( offy ), m_offz( offz )
+	: m_nx( nx ), m_ny( ny ), m_nz( nz ), m_offx( offx ), m_offy( offy ), m_offz( offz ),
+	  m_is_distributed(false), m_global_nx(nx), m_global_ny(ny), m_global_nz(nz),
+	  m_local_x_start(0), m_local_nx(nx)
 	{
 		m_pdata = new real_t[m_nx*m_ny*m_nz];
 	}
@@ -135,31 +150,45 @@ public:
 		m_nx = m.m_nx;
 		m_ny = m.m_ny;
 		m_nz = m.m_nz;
-		
+
 		m_offx = m.m_offx;
 		m_offy = m.m_offy;
 		m_offz = m.m_offz;
-		
+
+		m_is_distributed = m.m_is_distributed;
+		m_global_nx = m.m_global_nx;
+		m_global_ny = m.m_global_ny;
+		m_global_nz = m.m_global_nz;
+		m_local_x_start = m.m_local_x_start;
+		m_local_nx = m.m_local_nx;
+
 		m_pdata = new real_t[m_nx*m_ny*m_nz];
-		
+
 		if( copy_over )
 			for( size_t i=0; i<m_nx*m_ny*m_nz; ++i )
 				m_pdata[i] = m.m_pdata[i];
 	}
-	
+
 	//! standard copy constructor
 	explicit Meshvar( const Meshvar<real_t>& m )
 	{
 		m_nx = m.m_nx;
 		m_ny = m.m_ny;
 		m_nz = m.m_nz;
-		
+
 		m_offx = m.m_offx;
 		m_offy = m.m_offy;
 		m_offz = m.m_offz;
-		
+
+		m_is_distributed = m.m_is_distributed;
+		m_global_nx = m.m_global_nx;
+		m_global_ny = m.m_global_ny;
+		m_global_nz = m.m_global_nz;
+		m_local_x_start = m.m_local_x_start;
+		m_local_nx = m.m_local_nx;
+
 		m_pdata = new real_t[m_nx*m_ny*m_nz];
-		
+
 		for( size_t i=0; i<m_nx*m_ny*m_nz; ++i )
 			m_pdata[i] = m.m_pdata[i];
 	}
@@ -336,24 +365,74 @@ public:
 		m_nx = m.m_nx;
 		m_ny = m.m_ny;
 		m_nz = m.m_nz;
-		
+
 		m_offx = m.m_offx;
 		m_offy = m.m_offy;
 		m_offz = m.m_offz;
-		
+
+		m_is_distributed = m.m_is_distributed;
+		m_global_nx = m.m_global_nx;
+		m_global_ny = m.m_global_ny;
+		m_global_nz = m.m_global_nz;
+		m_local_x_start = m.m_local_x_start;
+		m_local_nx = m.m_local_nx;
+
 		if( m_pdata != NULL )
-			delete m_pdata;
-		
+			delete[] m_pdata;
+
 		m_pdata = new real_t[m_nx*m_ny*m_nz];
-		
+
 		for( size_t i=0; i<m_nx*m_ny*m_nz; ++i )
 			m_pdata[i] = m.m_pdata[i];
-		
+
 		return *this;
 	}
-	
+
 	real_t* get_ptr( void )
 	{	return m_pdata;		}
+
+	// ------------------------------------------------------------------------
+	// Slab-distribution interface (opt-in). See class-level fields above.
+	// ------------------------------------------------------------------------
+
+	//! true if this Meshvar stores only a slab of a larger global grid
+	inline bool is_distributed() const { return m_is_distributed; }
+
+	//! global x-extent of the full (possibly distributed) grid
+	inline size_t global_size( unsigned dim ) const
+	{
+		if( dim == 0 ) return m_global_nx;
+		if( dim == 1 ) return m_global_ny;
+		return m_global_nz;
+	}
+
+	//! first global ix owned by this rank (== 0 when not distributed)
+	inline size_t local_x_start() const { return m_local_x_start; }
+
+	//! number of global ix owned by this rank (== m_global_nx when not distributed)
+	inline size_t local_nx() const { return m_local_nx; }
+
+	//! one-past-last global ix owned by this rank
+	inline size_t local_x_end() const { return m_local_x_start + m_local_nx; }
+
+	//! does global ix lie inside this rank's slab?
+	inline bool owns_global_x( size_t gix ) const
+	{
+		return gix >= m_local_x_start && gix < m_local_x_start + m_local_nx;
+	}
+
+	//! reinterpret this Meshvar as a slab of a global grid. Caller is responsible
+	//! for ensuring m_nx == local_nx_in (or local_nx_in+2*nbnd for MeshvarBnd).
+	void mark_as_distributed( size_t global_nx_in, size_t global_ny_in, size_t global_nz_in,
+	                          size_t local_x_start_in, size_t local_nx_in )
+	{
+		m_is_distributed = true;
+		m_global_nx = global_nx_in;
+		m_global_ny = global_ny_in;
+		m_global_nz = global_nz_in;
+		m_local_x_start = local_x_start_in;
+		m_local_nx = local_nx_in;
+	}
 };
 
 //! MeshvarBnd derived class adding boundary ghost cell functionality
@@ -604,19 +683,22 @@ public:
 	//! copy constructor
 	explicit GridHierarchy( const GridHierarchy<T> & gh )
 	{
-		for( unsigned i=0; i<=gh.levelmax(); ++i )
-			m_pgrids.push_back( new MeshvarBnd<T>( *gh.get_grid(i) ) );
-		
+		// Guard against copying an empty hierarchy: levelmax() returns
+		// m_pgrids.size()-1 which underflows to UINT_MAX when empty (MPI
+		// workers carry empty hierarchies under SPMD-light).
+		for( size_t i=0; i<gh.m_pgrids.size(); ++i )
+			m_pgrids.push_back( new MeshvarBnd<T>( *gh.m_pgrids[i] ) );
+
 		m_nbnd = gh.m_nbnd;
 		m_levelmin = gh.m_levelmin;
-		
+
 		m_xoffabs = gh.m_xoffabs;
 		m_yoffabs = gh.m_yoffabs;
 		m_zoffabs = gh.m_zoffabs;
-        
+
         //ref_mask   = gh.ref_mask;
         bhave_refmask = gh.bhave_refmask;
-        
+
         if( bhave_refmask )
         {
             for( size_t i=0; i<gh.m_ref_masks.size(); ++i )
@@ -1035,18 +1117,19 @@ public:
 
         if( bhave_refmask )
         {
-            for( unsigned i=0; i<=gh.levelmax(); ++i )
+            for( size_t i=0; i<gh.m_ref_masks.size(); ++i )
                 m_ref_masks.push_back( new refinement_mask( *(gh.m_ref_masks[i]) ) );
         }
-      
+
 		if( !is_consistent(gh) )
 		{
 			for( unsigned i=0; i<m_pgrids.size(); ++i )
 				delete m_pgrids[i];
 			m_pgrids.clear();
-			
-			for( unsigned i=0; i<=gh.levelmax(); ++i )
-				m_pgrids.push_back( new MeshvarBnd<T>( *gh.get_grid(i) ) );
+
+			// see copy-ctor note: iterate by size() to handle empty source
+			for( size_t i=0; i<gh.m_pgrids.size(); ++i )
+				m_pgrids.push_back( new MeshvarBnd<T>( *gh.m_pgrids[i] ) );
 			m_levelmin = gh.levelmin();
 			m_nbnd = gh.m_nbnd;
 			

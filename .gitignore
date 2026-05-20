@@ -1,2 +1,12 @@
 build
 
+# Build artefacts
+*.o
+
+# Run-time / per-run outputs
+*_log.txt
+wnoise_*.bin
+temp_kernel_level*.tmp
+input_powerspec.txt
+input_powerspec_total.txt
+transfer_real_total.txt

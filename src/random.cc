@@ -9,6 +9,7 @@
  */
 
 #include "random.hh"
+#include "mpi_helper.hh"
 
 // TODO: move all this into a plugin!!!
 
@@ -1326,8 +1327,13 @@ random_number_generator<rng, T>::random_number_generator(config_file &cf, refine
 
 	if (!restart_)
 	{
-		//... compute the actual random numbers
-		compute_random_numbers();
+		// SPMD-light: only root computes & disk-caches white noise.
+		// Workers consume noise only via collective scatter inside
+		// perform_dist, so they neither need mem_cache_ nor should
+		// race on the shared wnoise_*.bin files (std::ios::trunc
+		// otherwise corrupts the file root reads back).
+		if (MUSIC::mpi::is_root())
+			compute_random_numbers();
 	}
 }
 

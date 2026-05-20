@@ -9,6 +9,7 @@
  */
 
 #include "log.hh"
+#include "mpi_helper.hh"
 #include <iostream>
 #include <algorithm>
 
@@ -38,6 +39,14 @@ std::string RemoveMultipleWhiteSpaces( std::string s )
 void MUSIC::log::send(messageType type, const std::string& text_)
 //void MUSIC::log::send(messageType type, std::stringstream& textstr)
 {
+	// Non-root MPI ranks: only emit Error/FatalError messages (and only to stderr),
+	// to avoid duplicated/interleaved console output and writing to a closed log file.
+	if( !MUSIC::mpi::is_root() ){
+		if( type==Error || type==FatalError ){
+			std::cerr << "[rank " << MUSIC::mpi::rank() << "] " << text_ << std::endl;
+		}
+		return;
+	}
 	std::string text(text_);// = textstr.str();
 	// Skip logging if minimum level is higher
     if (logLevel_)

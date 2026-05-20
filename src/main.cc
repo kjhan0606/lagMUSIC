@@ -42,6 +42,17 @@
 #include "convolution_kernel.hh"
 #include "cosmology.hh"
 #include "transfer_function.hh"
+#include "mpi_helper.hh"
+#include "mesh_distributed.hh"
+#include "mpi_fft.hh"
+
+#include <vector>
+#include <cstdlib>
+#include <string>
+
+#ifdef USE_MPI
+#include <fftw3-mpi.h>
+#endif
 
 #define THE_CODE_NAME "music!"
 #define THE_CODE_VERSION "1.53"
@@ -302,41 +313,474 @@ double compute_finest_max( grid_hierarchy& u )
 region_generator_plugin *the_region_generator;
 RNG_plugin *the_random_number_generator;
 
-int main (int argc, const char * argv[]) 
+//------------------------------------------------------------------------------
+// Collective MPI-FFT smoke test: forward + inverse on an N^3 slab-distributed
+// grid, reports max reconstruction error. Used to validate the slab Meshvar +
+// FFTW3-MPI plan wiring independently of the science pipeline.
+//------------------------------------------------------------------------------
+static int run_mpi_fft_smoke( size_t N )
 {
+	using MUSIC::dist::make_slab_meshvar;
+	using MUSIC::dist::slab_layout;
+	using MUSIC::dist::compute_slab_layout;
+
+	if( N == 0 ){
+		if( MUSIC::mpi::is_root() )
+			std::cerr << "[mpi-fft-smoke] N must be > 0\n";
+		return 1;
+	}
+
+	Meshvar<fftw_real>* m = make_slab_meshvar<fftw_real>(N, N, N, /*fftw_inplace_pad=*/true);
+	const size_t local_nx     = m->local_nx();
+	const size_t local_x_off  = m->local_x_start();
+	const size_t ny           = N;
+	const size_t nz_logical   = N;
+	const size_t nz_padded    = 2*(N/2+1);
+	const double TWO_PI       = 2.0 * M_PI;
+
+	// Fill with a deterministic separable mode so the FFT keeps a small support
+	// and reconstruction error is dominated by fp roundoff rather than aliasing.
+	for( size_t ix=0; ix<local_nx; ++ix ){
+		size_t gix = local_x_off + ix;
+		double sx = std::sin(TWO_PI*(double)gix/(double)N);
+		for( size_t iy=0; iy<ny; ++iy ){
+			double sy = std::sin(TWO_PI*(double)iy/(double)N);
+			for( size_t iz=0; iz<nz_logical; ++iz ){
+				double sz = std::sin(TWO_PI*(double)iz/(double)N);
+				m->m_pdata[(ix*ny + iy)*nz_padded + iz] = (fftw_real)(sx*sy*sz);
+			}
+		}
+	}
+
+	// Snapshot the unpadded payload for later comparison.
+	std::vector<fftw_real> orig(local_nx*ny*nz_logical);
+	for( size_t ix=0; ix<local_nx; ++ix )
+		for( size_t iy=0; iy<ny; ++iy )
+			for( size_t iz=0; iz<nz_logical; ++iz )
+				orig[(ix*ny + iy)*nz_logical + iz] =
+					m->m_pdata[(ix*ny + iy)*nz_padded + iz];
+
+#ifdef USE_MPI
+	MUSIC::fft::fft_plan_t pf = MUSIC::fft::plan_r2c_3d_mpi(
+		(ptrdiff_t)N, (ptrdiff_t)N, (ptrdiff_t)N, m->m_pdata);
+	MUSIC::fft::fft_plan_t pi = MUSIC::fft::plan_c2r_3d_mpi(
+		(ptrdiff_t)N, (ptrdiff_t)N, (ptrdiff_t)N, m->m_pdata);
+#else
+	MUSIC::fft::fft_plan_t pf = MUSIC::fft::plan_r2c_3d_serial(
+		(int)N, (int)N, (int)N, m->m_pdata);
+	MUSIC::fft::fft_plan_t pi = MUSIC::fft::plan_c2r_3d_serial(
+		(int)N, (int)N, (int)N, m->m_pdata);
+#endif
+	MUSIC::fft::execute(pf);
+	MUSIC::fft::execute(pi);
+
+	const double norm = 1.0 / ((double)N*(double)N*(double)N);
+	double local_max_err = 0.0, local_max_val = 0.0;
+	for( size_t ix=0; ix<local_nx; ++ix )
+		for( size_t iy=0; iy<ny; ++iy )
+			for( size_t iz=0; iz<nz_logical; ++iz ){
+				double v = (double)m->m_pdata[(ix*ny + iy)*nz_padded + iz] * norm;
+				double o = (double)orig[(ix*ny + iy)*nz_logical + iz];
+				double e = std::fabs(v - o);
+				if( e > local_max_err ) local_max_err = e;
+				if( std::fabs(o) > local_max_val ) local_max_val = std::fabs(o);
+			}
+
+	MUSIC::fft::destroy(pf);
+	MUSIC::fft::destroy(pi);
+	delete m;
+
+	double global_max_err = local_max_err;
+	double global_max_val = local_max_val;
+#ifdef USE_MPI
+	MPI_Allreduce(&local_max_err, &global_max_err, 1, MPI_DOUBLE, MPI_MAX, MUSIC::mpi::world());
+	MPI_Allreduce(&local_max_val, &global_max_val, 1, MPI_DOUBLE, MPI_MAX, MUSIC::mpi::world());
+#endif
+
+	if( MUSIC::mpi::is_root() ){
+		double rel = global_max_err / std::max(global_max_val, 1e-300);
+		std::cerr << "[mpi-fft-smoke] N=" << N
+		          << " ranks=" << MUSIC::mpi::size()
+		          << " threads=" << omp_get_max_threads()
+		          << " precision=" <<
+#ifdef SINGLE_PRECISION
+		             "single"
+#else
+		             "double"
+#endif
+		          << " max|orig|="          << global_max_val
+		          << " max|recon-orig|="    << global_max_err
+		          << " rel="                << rel
+		          << "\n";
+	}
+	return 0;
+}
+
+//------------------------------------------------------------------------------
+// Convolution-pipeline smoke test: replays the perform_mpi() forward-multiply-
+// inverse sequence with Tk == 1 on a slab grid filled with a separable sine
+// (DC == 0, single Fourier mode). The output should equal the input scaled by
+// (N * fftnorm) on every cell — we check that ratio uniformly across the
+// distributed buffer, and report a global checksum for cross-rank-count
+// determinism.
+//------------------------------------------------------------------------------
+static int run_mpi_conv_smoke( size_t N )
+{
+	using MUSIC::dist::make_slab_meshvar;
+
+	if( N == 0 ){
+		if( MUSIC::mpi::is_root() )
+			std::cerr << "[mpi-conv-smoke] N must be > 0\n";
+		return 1;
+	}
+
+	Meshvar<fftw_real>* m = make_slab_meshvar<fftw_real>(N, N, N, /*fftw_inplace_pad=*/true);
+	const size_t local_nx     = m->local_nx();
+	const size_t local_x_off  = m->local_x_start();
+	const size_t ny           = N;
+	const size_t nz_logical   = N;
+	const size_t nz_complex   = N/2 + 1;
+	const size_t nz_padded    = 2*nz_complex;
+	const double TWO_PI       = 2.0 * M_PI;
+	const double lx = 1.0, ly = 1.0, lz = 1.0;
+
+	// sin*sin*sin: pure mode at k=(1,1,1) + its symmetric partners, DC == 0.
+	for( size_t ix=0; ix<local_nx; ++ix ){
+		size_t gix = local_x_off + ix;
+		double sx = std::sin(TWO_PI*(double)gix/(double)N);
+		for( size_t iy=0; iy<ny; ++iy ){
+			double sy = std::sin(TWO_PI*(double)iy/(double)N);
+			for( size_t iz=0; iz<nz_logical; ++iz ){
+				double sz = std::sin(TWO_PI*(double)iz/(double)N);
+				m->m_pdata[(ix*ny + iy)*nz_padded + iz] = (fftw_real)(sx*sy*sz);
+			}
+		}
+	}
+
+	// Snapshot the input for ratio comparison post-roundtrip.
+	std::vector<fftw_real> orig(local_nx*ny*nz_logical);
+	for( size_t ix=0; ix<local_nx; ++ix )
+		for( size_t iy=0; iy<ny; ++iy )
+			for( size_t iz=0; iz<nz_logical; ++iz )
+				orig[(ix*ny + iy)*nz_logical + iz] = m->m_pdata[(ix*ny + iy)*nz_padded + iz];
+
+	const double fftnormp = 1.0 / std::sqrt((double)N*(double)N*(double)N);
+	const double fftnorm  = std::pow(TWO_PI, 1.5) / std::sqrt(lx*ly*lz) * fftnormp;
+
+	fftw_real    *data  = m->m_pdata;
+	fftw_complex *cdata = reinterpret_cast<fftw_complex*>(data);
+
+#ifdef USE_MPI
+	MUSIC::fft::fft_plan_t pf = MUSIC::fft::plan_r2c_3d_mpi(
+		(ptrdiff_t)N, (ptrdiff_t)N, (ptrdiff_t)N, data);
+	MUSIC::fft::fft_plan_t pi = MUSIC::fft::plan_c2r_3d_mpi(
+		(ptrdiff_t)N, (ptrdiff_t)N, (ptrdiff_t)N, data);
+#else
+	MUSIC::fft::fft_plan_t pf = MUSIC::fft::plan_r2c_3d_serial(
+		(int)N, (int)N, (int)N, data);
+	MUSIC::fft::fft_plan_t pi = MUSIC::fft::plan_c2r_3d_serial(
+		(int)N, (int)N, (int)N, data);
+#endif
+	MUSIC::fft::execute(pf);
+
+	// K-space Tk == 1 multiply (matches perform_mpi math, dstag == 0).
+	for( size_t ix=0; ix<local_nx; ++ix ){
+		for( size_t iy=0; iy<ny; ++iy ){
+			for( size_t k=0; k<nz_complex; ++k ){
+				size_t ii = (ix*ny + iy)*nz_complex + k;
+				double re = (double)RE(cdata[ii]) * fftnorm;
+				double im = (double)IM(cdata[ii]) * fftnorm;
+				RE(cdata[ii]) = (fftw_real)re;
+				IM(cdata[ii]) = (fftw_real)im;
+			}
+		}
+	}
+	// Zero DC on the owning rank (input already had DC == 0; this just mirrors perform_mpi).
+	if( local_x_off == 0 && local_nx > 0 ){
+		RE(cdata[0]) = 0.0;
+		IM(cdata[0]) = 0.0;
+	}
+
+	MUSIC::fft::execute(pi);
+	MUSIC::fft::destroy(pf);
+	MUSIC::fft::destroy(pi);
+
+	// Expected per-cell scale: N^3 (unnormalized FFTW forward+inverse) * fftnorm.
+	const double expected_scale = (double)N*(double)N*(double)N * fftnorm;
+
+	double local_max_dev = 0.0;
+	double local_sumsq   = 0.0;
+	double local_max_in  = 0.0;
+	for( size_t ix=0; ix<local_nx; ++ix )
+		for( size_t iy=0; iy<ny; ++iy )
+			for( size_t iz=0; iz<nz_logical; ++iz ){
+				double out = (double)m->m_pdata[(ix*ny + iy)*nz_padded + iz];
+				double in  = (double)orig[(ix*ny + iy)*nz_logical + iz];
+				double dev = std::fabs(out - in*expected_scale);
+				if( dev > local_max_dev ) local_max_dev = dev;
+				if( std::fabs(in) > local_max_in ) local_max_in = std::fabs(in);
+				local_sumsq += out*out;
+			}
+
+	double global_max_dev = local_max_dev;
+	double global_sumsq   = local_sumsq;
+	double global_max_in  = local_max_in;
+#ifdef USE_MPI
+	MPI_Allreduce(&local_max_dev, &global_max_dev, 1, MPI_DOUBLE, MPI_MAX, MUSIC::mpi::world());
+	MPI_Allreduce(&local_sumsq,   &global_sumsq,   1, MPI_DOUBLE, MPI_SUM, MUSIC::mpi::world());
+	MPI_Allreduce(&local_max_in,  &global_max_in,  1, MPI_DOUBLE, MPI_MAX, MUSIC::mpi::world());
+#endif
+
+	delete m;
+
+	if( MUSIC::mpi::is_root() ){
+		double rel = global_max_dev / std::max(global_max_in * expected_scale, 1e-300);
+		std::cerr.setf(std::ios::scientific);
+		std::cerr.precision(12);
+		std::cerr << "[mpi-conv-smoke] N=" << N
+		          << " ranks=" << MUSIC::mpi::size()
+		          << " threads=" << omp_get_max_threads()
+		          << " precision=" <<
+#ifdef SINGLE_PRECISION
+		             "single"
+#else
+		             "double"
+#endif
+		          << " expected_scale=" << expected_scale
+		          << " max|out - in*scale|=" << global_max_dev
+		          << " rel="                 << rel
+		          << " sum(out^2)="          << global_sumsq
+		          << "\n";
+	}
+	return 0;
+}
+
+//------------------------------------------------------------------------------
+// perform_dist smoke test: drives the full scatter / perform_mpi / gather
+// pipeline through an actual ksampled kernel built from a real config file.
+// All ranks collectively call convolution::perform_dist; root owns a
+// DensityGrid<real_t> sized to (N,N,N) with the in-place r2c padding and
+// pre-filled with a deterministic separable mode (so RNG state isn't a
+// confound). After the call, root prints a reproducible checksum that must
+// match bit-for-bit across rank counts.
+//
+// The config file just needs the keys tf_kernel_k reads (setup/boxlength,
+// cosmology/nspec + pnorm, etc.) — ics_example.conf works as-is once we
+// inject pnorm.
+//------------------------------------------------------------------------------
+static int run_mpi_perform_dist_smoke( const char* cfgfile, size_t N )
+{
+	if( cfgfile == NULL || N == 0 ){
+		if( MUSIC::mpi::is_root() )
+			std::cerr << "[mpi-perform-dist-smoke] usage: --mpi-perform-dist-smoke <conf> <N>\n";
+		return 1;
+	}
+
+	config_file cf(cfgfile);
+	// pnorm is normally injected by main() after the cosmology calc. For the
+	// smoke we just pick a fixed value; any positive number suffices for a
+	// determinism test.
+	cf.insertValue("cosmology","pnorm","1.0");
+	// Some kernel paths consult periodic_TF / deconvolve / fft_fine; defaults
+	// are safe but make them explicit so the test config is self-contained.
+	if( !cf.containsKey("setup","periodic_TF") ) cf.insertValue("setup","periodic_TF","yes");
+	if( !cf.containsKey("setup","deconvolve") )  cf.insertValue("setup","deconvolve","yes");
+	if( !cf.containsKey("poisson","fft_fine") )  cf.insertValue("poisson","fft_fine","yes");
+	// The region generator and some other helpers consult output/format; the
+	// smoke does not actually emit any output but the key must be present.
+	if( !cf.containsKey("output","format") )    cf.insertValue("output","format","generic");
+	if( !cf.containsKey("output","filename") )  cf.insertValue("output","filename","/dev/null");
+
+	transfer_function* ptf = select_transfer_function_plugin(cf);
+	// refinement_hierarchy ctor dereferences the global region generator; set
+	// it up the same way main() does before constructing rh_Poisson.
+	the_region_generator = select_region_generator_plugin(cf);
+	refinement_hierarchy refh(cf);
+
+	convolution::kernel_creator* kc =
+#ifdef SINGLE_PRECISION
+		convolution::get_kernel_map()["tf_kernel_k_float"];
+#else
+		convolution::get_kernel_map()["tf_kernel_k_double"];
+#endif
+	if( kc == NULL ){
+		if( MUSIC::mpi::is_root() )
+			std::cerr << "[mpi-perform-dist-smoke] kernel creator not found\n";
+		return 1;
+	}
+	convolution::kernel* the_kernel = kc->create(cf, ptf, refh, total);
+
+	// fetch_kernel populates cparam_ with the (nx,ny,nz) that this level will
+	// convolve over — this comes from refh, not from our N argument. We honour
+	// that to keep the test config-consistent; the user-supplied N is only
+	// used to pick which level to convolve (smallest level whose extent <= N
+	// fits in memory for the test).
+	unsigned lmin = cf.getValue<unsigned>("setup","levelmin");
+	unsigned lminTF = cf.getValueSafe<unsigned>("setup","levelmin_TF", lmin);
+	(void)N;  // accepted for CLI consistency; the actual grid is set by refh
+
+	convolution::kernel* fetched = the_kernel->fetch_kernel((int)lminTF, false);
+	const size_t gnx = (size_t)fetched->cparam_.nx;
+	const size_t gny = (size_t)fetched->cparam_.ny;
+	const size_t gnz = (size_t)fetched->cparam_.nz;
+
+	const size_t nz_padded = 2*(gnz/2+1);
+	const size_t total_padded = gnx * gny * nz_padded;
+
+	// Root allocates the full padded buffer; workers pass NULL.
+	std::vector<real_t> root_buf;
+	real_t* root_ptr = NULL;
+	if( MUSIC::mpi::is_root() ){
+		root_buf.assign(total_padded, (real_t)0);
+		const double TWO_PI = 2.0 * M_PI;
+		for( size_t ix=0; ix<gnx; ++ix ){
+			double sx = std::sin(TWO_PI*(double)ix/(double)gnx);
+			for( size_t iy=0; iy<gny; ++iy ){
+				double sy = std::sin(TWO_PI*(double)iy/(double)gny);
+				for( size_t iz=0; iz<gnz; ++iz ){
+					double sz = std::sin(TWO_PI*(double)iz/(double)gnz);
+					root_buf[(ix*gny + iy)*nz_padded + iz] = (real_t)(sx*sy*sz);
+				}
+			}
+		}
+		root_ptr = &root_buf[0];
+	}
+
+	convolution::perform_dist<real_t>( fetched, root_ptr, gnx, gny, gnz,
+	                                   /*shift=*/false, /*fix=*/false, /*flip=*/false );
+
+	// Reproducible checksum (sum and sum-of-squares of the logical, non-padded
+	// cells) — printed only on root.
+	double sum = 0.0, sumsq = 0.0;
+	double absmax = 0.0;
+	if( MUSIC::mpi::is_root() ){
+		for( size_t ix=0; ix<gnx; ++ix )
+			for( size_t iy=0; iy<gny; ++iy )
+				for( size_t iz=0; iz<gnz; ++iz ){
+					double v = (double)root_buf[(ix*gny + iy)*nz_padded + iz];
+					sum   += v;
+					sumsq += v*v;
+					if( std::fabs(v) > absmax ) absmax = std::fabs(v);
+				}
+		std::cerr.setf(std::ios::scientific);
+		std::cerr.precision(12);
+		std::cerr << "[mpi-perform-dist-smoke] gnx=" << gnx
+		          << " gny=" << gny << " gnz=" << gnz
+		          << " level=" << lminTF
+		          << " ranks=" << MUSIC::mpi::size()
+		          << " threads=" << omp_get_max_threads()
+		          << " precision=" <<
+#ifdef SINGLE_PRECISION
+		             "single"
+#else
+		             "double"
+#endif
+		          << " sum="    << sum
+		          << " sumsq="  << sumsq
+		          << " max|v|=" << absmax
+		          << "\n";
+	}
+
+	the_kernel->deallocate();
+	delete the_kernel;
+	delete ptf;
+	return 0;
+}
+
+int main (int argc, const char * argv[])
+{
+#ifdef USE_MPI
+	int mpi_thread_provided = 0;
+	MPI_Init_thread(&argc, const_cast<char***>(&argv), MPI_THREAD_FUNNELED, &mpi_thread_provided);
+	// silence stdout/clog on non-root ranks to keep console output clean.
+	// stderr stays open so genuine errors (Error/FatalError) from any rank are visible.
+	if( !MUSIC::mpi::is_root() ){
+		std::cout.rdbuf(NULL);
+		std::clog.rdbuf(NULL);
+	}
+#endif
+
 	const unsigned nbnd = 4;
-	
+
 	unsigned lbase, lmax, lbaseTF;
 	double   err = 1.0;
-	
+
 	//------------------------------------------------------------------------------
 	//... parse command line options
 	//------------------------------------------------------------------------------
-	
-	splash();
-	if( argc != 2 ){
-		std::cout << " This version is compiled with the following plug-ins:\n";
-		
-		print_region_generator_plugins();
-		print_transfer_function_plugins();
-		print_RNG_plugins();
-		print_output_plugins();
-		
-		std::cerr << "\n In order to run, you need to specify a parameter file!\n\n";
+
+	// Diagnostic modes: `MUSIC --mpi-fft-smoke <N>` runs a collective FFT
+	// round-trip; `MUSIC --mpi-conv-smoke <N>` replays the convolution-style
+	// forward-multiply-inverse pipeline with Tk == 1. All ranks must
+	// participate, so these are dispatched after FFTW MPI init but before
+	// the non-root early-return.
+	enum { SMOKE_NONE, SMOKE_FFT, SMOKE_CONV, SMOKE_PERFORM_DIST } smoke_kind = SMOKE_NONE;
+	bool   smoke_mode = false;
+	size_t smoke_N    = 0;
+	const char* smoke_cfg = NULL;
+	if( argc >= 2 ){
+		std::string a1 = argv[1];
+		if( a1 == "--mpi-fft-smoke" )           smoke_kind = SMOKE_FFT;
+		else if( a1 == "--mpi-conv-smoke" )     smoke_kind = SMOKE_CONV;
+		else if( a1 == "--mpi-perform-dist-smoke" ) smoke_kind = SMOKE_PERFORM_DIST;
+		smoke_mode = (smoke_kind != SMOKE_NONE);
+	}
+	if( smoke_mode ){
+		if( smoke_kind == SMOKE_PERFORM_DIST ){
+			if( argc < 4 ){
+				if( MUSIC::mpi::is_root() )
+					std::cerr << "Usage: " << argv[0] << " --mpi-perform-dist-smoke <conf> <N>\n";
+#ifdef USE_MPI
+				MPI_Finalize();
+#endif
+				return 1;
+			}
+			smoke_cfg = argv[2];
+			smoke_N   = (size_t)std::atol(argv[3]);
+		} else {
+			if( argc < 3 ){
+				if( MUSIC::mpi::is_root() )
+					std::cerr << "Usage: " << argv[0] << " " << argv[1] << " <N>\n";
+#ifdef USE_MPI
+				MPI_Finalize();
+#endif
+				return 1;
+			}
+			smoke_N = (size_t)std::atol(argv[2]);
+		}
+	}
+
+	if( !smoke_mode && MUSIC::mpi::is_root() ) splash();
+	if( !smoke_mode && argc != 2 ){
+		if( MUSIC::mpi::is_root() ){
+			std::cout << " This version is compiled with the following plug-ins:\n";
+
+			print_region_generator_plugins();
+			print_transfer_function_plugins();
+			print_RNG_plugins();
+			print_output_plugins();
+
+			std::cerr << "\n In order to run, you need to specify a parameter file!\n\n";
+		}
+#ifdef USE_MPI
+		MPI_Finalize();
+#endif
 		exit(0);
 	}
-	
+
 	//------------------------------------------------------------------------------
-	//... open log file
+	//... open log file (rank 0 only for now)
 	//------------------------------------------------------------------------------
 
 	char logfname[128];
-	sprintf(logfname,"%s_log.txt",argv[1]);
-	MUSIC::log::setOutput(logfname);
 	time_t ltime=time(NULL);
-	LOGINFO("Opening log file \'%s\'.",logfname);
-	LOGUSER("Running %s, version %s",THE_CODE_NAME,THE_CODE_VERSION);
-	LOGUSER("Log is for run started %s",asctime( localtime(&ltime) ));
+	if( !smoke_mode ){
+		sprintf(logfname,"%s_log.txt",argv[1]);
+		if( MUSIC::mpi::is_root() ) MUSIC::log::setOutput(logfname);
+		LOGINFO("Opening log file \'%s\'.",logfname);
+		LOGUSER("Running %s, version %s",THE_CODE_NAME,THE_CODE_VERSION);
+		LOGUSER("Log is for run started %s",asctime( localtime(&ltime) ));
+	}
 	
 #ifdef FFTW3
 	LOGUSER("Code was compiled using FFTW version 3.x");
@@ -356,8 +800,56 @@ int main (int argc, const char * argv[])
 #else
 	LOGUSER("Code was compiled for double precision.");
 #endif
-	
-	
+
+	//------------------------------------------------------------------------------
+	//... smoke-mode short-circuit: init threaded + MPI FFTW, run the collective
+	//... round-trip test, tear down FFTW, finalize MPI, exit. All ranks
+	//... participate; no config file is read.
+	//------------------------------------------------------------------------------
+	if( smoke_mode ){
+#if not defined(SINGLETHREAD_FFTW) && defined(FFTW3)
+	#ifdef SINGLE_PRECISION
+		fftwf_init_threads();
+		fftwf_plan_with_nthreads(omp_get_max_threads());
+	#else
+		fftw_init_threads();
+		fftw_plan_with_nthreads(omp_get_max_threads());
+	#endif
+#endif
+#ifdef USE_MPI
+	#ifdef SINGLE_PRECISION
+		fftwf_mpi_init();
+	#else
+		fftw_mpi_init();
+	#endif
+#endif
+		int rc;
+		if( smoke_kind == SMOKE_PERFORM_DIST )
+			rc = run_mpi_perform_dist_smoke(smoke_cfg, smoke_N);
+		else if( smoke_kind == SMOKE_CONV )
+			rc = run_mpi_conv_smoke(smoke_N);
+		else
+			rc = run_mpi_fft_smoke(smoke_N);
+#ifdef USE_MPI
+	#ifdef SINGLE_PRECISION
+		fftwf_mpi_cleanup();
+	#else
+		fftw_mpi_cleanup();
+	#endif
+#endif
+#if not defined(SINGLETHREAD_FFTW) && defined(FFTW3)
+	#ifdef SINGLE_PRECISION
+		fftwf_cleanup_threads();
+	#else
+		fftw_cleanup_threads();
+	#endif
+#endif
+#ifdef USE_MPI
+		MPI_Finalize();
+#endif
+		return rc;
+	}
+
 	//------------------------------------------------------------------------------
 	//... read and interpret config file
 	//------------------------------------------------------------------------------
@@ -416,6 +908,19 @@ int main (int argc, const char * argv[])
 #else
 	fftw_threads_init();
 #endif
+#endif
+
+#ifdef USE_MPI
+	#ifdef SINGLE_PRECISION
+	fftwf_mpi_init();
+	#else
+	fftw_mpi_init();
+	#endif
+
+	// SPMD-light: all ranks now participate in main flow. They reach every
+	// collective convolution::perform_dist() call inside GenerateDensityHierarchy.
+	// Heavy serial work (Poisson solve, output writes) is gated behind
+	// MUSIC::mpi::is_root() — workers no-op those sections.
 #endif
 	
 	//------------------------------------------------------------------------------
@@ -505,7 +1010,9 @@ int main (int argc, const char * argv[])
 	std::string outformat, outfname;
 	outformat			= cf.getValue<std::string>( "output", "format" );
 	outfname			= cf.getValue<std::string>( "output", "filename" );
-	output_plugin *the_output_plugin = select_output_plugin( cf );
+	// Only root owns the output plug-in; workers leave it NULL and skip all
+	// the_output_plugin->... calls via is_root() gates further down.
+	output_plugin *the_output_plugin = MUSIC::mpi::is_root() ? select_output_plugin( cf ) : NULL;
 	
 	//------------------------------------------------------------------------------
 	//... initialize the random numbers
@@ -553,7 +1060,8 @@ int main (int argc, const char * argv[])
 	//bdefd &= !kspace;
 	
 	poisson_plugin_creator *the_poisson_plugin_creator = get_poisson_plugin_map()[ poisson_solver_name ];
-	poisson_plugin *the_poisson_solver = the_poisson_plugin_creator->create( cf );
+	// Only root runs the (still-serial) Poisson solver; workers leave it NULL.
+	poisson_plugin *the_poisson_solver = MUSIC::mpi::is_root() ? the_poisson_plugin_creator->create( cf ) : NULL;
 	
 	//---------------------------------------------------------------------------------
 	//... THIS IS THE MAIN DRIVER BRANCHING TREE RUNNING THE VARIOUS PARTS OF THE CODE
@@ -579,28 +1087,26 @@ int main (int argc, const char * argv[])
 			
 			
 			GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
-			coarsen_density(rh_Poisson, f, bspectral_sampling);
-            f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-            
-			normalize_density(f);
-			
+			if( MUSIC::mpi::is_root() ){ coarsen_density(rh_Poisson, f, bspectral_sampling); f.add_refinement_mask( rh_Poisson.get_coord_shift() ); normalize_density(f); }
+
 			LOGUSER("Writing CDM data");
-			the_output_plugin->write_dm_mass(f);
-			the_output_plugin->write_dm_density(f);
-			
+			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_mass(f);
+			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_density(f);
+
 			grid_hierarchy u( f );	u.zero();
-			err = the_poisson_solver->solve(f, u);
-			
+			if( MUSIC::mpi::is_root() ) err = the_poisson_solver->solve(f, u);
+
 			if(!bdefd)
-				f.deallocate();	
-			
+				f.deallocate();
+
 			LOGUSER("Writing CDM potential");
-			the_output_plugin->write_dm_potential(u);
-			
-			
+			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_potential(u);
+
+
 			//------------------------------------------------------------------------------
 			//... DM displacements
 			//------------------------------------------------------------------------------
+			if( MUSIC::mpi::is_root() )
 			{
 				grid_hierarchy data_forIO(u);
 				for( int icoord = 0; icoord < 3; ++icoord )
@@ -610,10 +1116,10 @@ int main (int argc, const char * argv[])
 						data_forIO.zero();
 						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
 						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );					
+							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
 						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
 						the_poisson_solver->gradient_add(icoord, u, data_forIO );
-						
+
 					}
 					else
 						//... displacement
@@ -640,24 +1146,26 @@ int main (int argc, const char * argv[])
 				std::cout << "-------------------------------------------------------------\n";
 				LOGUSER("Computing baryon density...");
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, false, bbshift );
+				if( MUSIC::mpi::is_root() )
+				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
                 f.add_refinement_mask( rh_Poisson.get_coord_shift() );
 				normalize_density(f);
-				
+
 				if( !do_LLA )
-				{	
+				{
 					LOGUSER("Writing baryon density");
 					the_output_plugin->write_gas_density(f);
 				}
-				
+
 				if( bsph )
 				{
 					u = f;	u.zero();
-					err = the_poisson_solver->solve(f, u);					
-					
+					err = the_poisson_solver->solve(f, u);
+
 					if(!bdefd)
 						f.deallocate();
-					
+
 					grid_hierarchy data_forIO(u);
 					for( int icoord = 0; icoord < 3; ++icoord )
 					{
@@ -665,21 +1173,21 @@ int main (int argc, const char * argv[])
 						{
 							data_forIO.zero();
 							*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-							poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
-								       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons);					
+							poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+								       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons);
 							*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
 							the_poisson_solver->gradient_add(icoord, u, data_forIO );
-							
+
 						}
 						else
 							//... displacement
 							the_poisson_solver->gradient(icoord, u, data_forIO );
-						
+
 						coarsen_density( rh_Poisson, data_forIO, false );
                         LOGUSER("Writing baryon displacements");
 						the_output_plugin->write_gas_position(icoord, data_forIO );
-						
-					}	
+
+					}
 					u.deallocate();
 					data_forIO.deallocate();
 					if( bdefd )
@@ -695,8 +1203,9 @@ int main (int argc, const char * argv[])
 					LOGUSER("Writing baryon density");
 					the_output_plugin->write_gas_density(f);
 				}
-				
+
 				f.deallocate();
+				} // end is_root() — baryon density
 			}
 			
 			
@@ -715,16 +1224,21 @@ int main (int argc, const char * argv[])
 				{
 				  LOGUSER("Generating velocity perturbations...");
 				  GenerateDensityHierarchy( cf, the_transfer_function_plugin, vtotal , rh_TF, rand, f, false, false );
+				  if( MUSIC::mpi::is_root() )
+				  {
 				  coarsen_density(rh_Poisson, f, bspectral_sampling);
 				  f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-				  normalize_density(f);					
+				  normalize_density(f);
 				  u = f;
 				  u.zero();
 				  err = the_poisson_solver->solve(f, u);
-				  
+
 				  if(!bdefd)
 				    f.deallocate();
+				  }
 				}
+				if( MUSIC::mpi::is_root() )
+				{
 				grid_hierarchy data_forIO(u);
 				for( int icoord = 0; icoord < 3; ++icoord )
 				{
@@ -733,21 +1247,21 @@ int main (int argc, const char * argv[])
 					{
 						data_forIO.zero();
 						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );					
+						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
 						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
 						the_poisson_solver->gradient_add(icoord, u, data_forIO );
 					}
-					else 
+					else
 						the_poisson_solver->gradient(icoord, u, data_forIO );
-					
-					
-					
+
+
+
 					//... multiply to get velocity
 					data_forIO *= cosmo.vfact;
-					
+
 					//... velocity kick to keep refined region centered?
-					
+
 					double sigv = compute_finest_sigma( data_forIO );
 					LOGINFO("sigma of %c-velocity of high-res particles is %f",'x'+icoord, sigv);
 
@@ -756,16 +1270,17 @@ int main (int argc, const char * argv[])
 					the_output_plugin->write_dm_velocity(icoord, data_forIO);
 
 					if( do_baryons )
-					{	
+					{
 						LOGUSER("Writing baryon velocities");
 						the_output_plugin->write_gas_velocity(icoord, data_forIO);
 					}
-				
+
 				}
-				
+
 				u.deallocate();
 				data_forIO.deallocate();
-				
+				} // end is_root() — vtotal post-density
+
 			}
 			else
 			{
@@ -778,17 +1293,19 @@ int main (int argc, const char * argv[])
 				//... we do baryons and have velocity transfer functions, or we do SPH and not to shift
 				//... do DM first
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vcdm , rh_TF, rand, f, false, false );
+				if( MUSIC::mpi::is_root() )
+				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
 				normalize_density(f);
-				
+
 				u = f;	u.zero();
-				
+
 				err = the_poisson_solver->solve(f, u);
-				
+
 				if(!bdefd)
 				  f.deallocate();
-								
+
 				grid_hierarchy data_forIO(u);
 				for( int icoord = 0; icoord < 3; ++icoord )
 				{
@@ -797,17 +1314,17 @@ int main (int argc, const char * argv[])
 					{
 						data_forIO.zero();
 						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );					
+						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
 						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
 						the_poisson_solver->gradient_add(icoord, u, data_forIO );
 					}
-					else 
+					else
 						the_poisson_solver->gradient(icoord, u, data_forIO );
-					
+
 					//... multiply to get velocity
 					data_forIO *= cosmo.vfact;
-				
+
 					double sigv = compute_finest_sigma( data_forIO );
 					LOGINFO("sigma of %c-velocity of high-res DM is %f",'x'+icoord, sigv);
 
@@ -818,26 +1335,29 @@ int main (int argc, const char * argv[])
 				u.deallocate();
 				data_forIO.deallocate();
 				f.deallocate();
-				
-				
+				} // end is_root() — vcdm post-density
+
+
 				std::cout << "=============================================================\n";
 				std::cout << "   COMPUTING BARYON VELOCITIES\n";
 				std::cout << "-------------------------------------------------------------\n";
 				LOGUSER("Computing baryon velocitites...");
 				//... do baryons
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vbaryon , rh_TF, rand, f, false, bbshift );
+				if( MUSIC::mpi::is_root() )
+				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
-				
+
 				u = f;	u.zero();
-				
+
 				err = the_poisson_solver->solve(f, u);
-				
+
 				if(!bdefd)
 					f.deallocate();
-				
-				data_forIO = u;
+
+				grid_hierarchy data_forIO(u);
 				for( int icoord = 0; icoord < 3; ++icoord )
 				{
 					//... displacement
@@ -845,20 +1365,20 @@ int main (int argc, const char * argv[])
 					{
 						data_forIO.zero();
 						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );					
+						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
 						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
 						the_poisson_solver->gradient_add(icoord, u, data_forIO );
 					}
-					else 
+					else
 						the_poisson_solver->gradient(icoord, u, data_forIO );
-					
+
 					//... multiply to get velocity
 					data_forIO *= cosmo.vfact;
-										
+
 					double sigv = compute_finest_sigma( data_forIO );
 					LOGINFO("sigma of %c-velocity of high-res baryons is %f",'x'+icoord, sigv);
-					
+
 					coarsen_density( rh_Poisson, data_forIO, false );
 					LOGUSER("Writing baryon velocities");
 					the_output_plugin->write_gas_velocity(icoord, data_forIO);
@@ -866,6 +1386,7 @@ int main (int argc, const char * argv[])
 				u.deallocate();
 				f.deallocate();
 				data_forIO.deallocate();
+				} // end is_root() — vbaryon post-density
 			}
 		/*********************************************************************************************/
 		/*********************************************************************************************/
@@ -897,28 +1418,30 @@ int main (int argc, const char * argv[])
 
 			
 			GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
+			if( MUSIC::mpi::is_root() )
+			{
 			coarsen_density(rh_Poisson, f, bspectral_sampling);
 			f.add_refinement_mask( rh_Poisson.get_coord_shift() );
             normalize_density(f);
-			
+
 			if( dm_only )
 			{
 				the_output_plugin->write_dm_density(f);
-				the_output_plugin->write_dm_mass(f);	
+				the_output_plugin->write_dm_mass(f);
 			}
-			
+
 			u1 = f;	u1.zero();
-			
+
 			//... compute 1LPT term
 			err = the_poisson_solver->solve(f, u1);
-			
-			
+
+
 			//... compute 2LPT term
 			if(bdefd)
 				f2LPT=f;
 			else
 				f.deallocate();
-		
+
 			LOGINFO("Computing 2LPT term....");
 			if( !kspace2LPT )
 				compute_2LPT_source(u1, f2LPT, grad_order );
@@ -926,27 +1449,27 @@ int main (int argc, const char * argv[])
 				LOGUSER("computing term using FFT");
 				compute_2LPT_source_FFT(cf, u1, f2LPT);
 			}
-            
+
             LOGINFO("Solving 2LPT Poisson equation");
 			u2LPT = u1; u2LPT.zero();
 			err = the_poisson_solver->solve(f2LPT, u2LPT);
-            
-			
+
+
 			//... if doing the hybrid step, we need a combined source term
 			if( bdefd )
 			{
 				f2LPT*=6.0/7.0/vfac2lpt;
 				f+=f2LPT;
-				
+
 				if( !dm_only )
 					f2LPT.deallocate();
 			}
-			
+
 			//... add the 2LPT contribution
 			u2LPT *= 6.0/7.0/vfac2lpt;
 			u1 += u2LPT;
-			
-			
+
+
 			grid_hierarchy data_forIO(u1);
 			for( int icoord = 0; icoord < 3; ++icoord )
 			{
@@ -954,32 +1477,33 @@ int main (int argc, const char * argv[])
 				{
 					data_forIO.zero();
 					*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-					poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
+					poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
 						       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
 					*data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
 					the_poisson_solver->gradient_add(icoord, u1, data_forIO );
 				}
-				else 
+				else
 					the_poisson_solver->gradient(icoord, u1, data_forIO );
-				
+
 				data_forIO *= cosmo.vfact;
-				
+
 				double sigv = compute_finest_sigma( data_forIO );
 				std::cerr << " - velocity component " << icoord << " : sigma = " << sigv << std::endl;
-				
+
 				coarsen_density( rh_Poisson, data_forIO, false );
 				LOGUSER("Writing CDM velocities");
-				the_output_plugin->write_dm_velocity(icoord, data_forIO);					
-				
+				the_output_plugin->write_dm_velocity(icoord, data_forIO);
+
 				if( do_baryons && !the_transfer_function_plugin->tf_has_velocities() && !bsph)
-				{	
+				{
 					LOGUSER("Writing baryon velocities");
-					the_output_plugin->write_gas_velocity(icoord, data_forIO);				
+					the_output_plugin->write_gas_velocity(icoord, data_forIO);
 				}
 			}
 			data_forIO.deallocate();
 			if( !dm_only )
 				u1.deallocate();
+			} // end is_root() — 2LPT vcdm/total post-density
 			
 			
 			if( do_baryons && (the_transfer_function_plugin->tf_has_velocities() || bsph) )
@@ -990,73 +1514,75 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon displacements...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vbaryon , rh_TF, rand, f, false, bbshift );
+				if( MUSIC::mpi::is_root() )
+				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
-				
+
 				u1 = f;	u1.zero();
-				
+
 				if(bdefd)
 					f2LPT=f;
-				
+
 				//... compute 1LPT term
 				err = the_poisson_solver->solve(f, u1);
 
 				LOGINFO("Writing baryon potential");
 				the_output_plugin->write_gas_potential(u1);
-				
+
 				//... compute 2LPT term
 				u2LPT = f; u2LPT.zero();
-				
+
 				if( !kspace2LPT )
 					compute_2LPT_source(u1, f2LPT, grad_order );
 				else
 					compute_2LPT_source_FFT(cf, u1, f2LPT);
-				
-				
+
+
 				err = the_poisson_solver->solve(f2LPT, u2LPT);
-				
+
 				//... if doing the hybrid step, we need a combined source term
 				if( bdefd )
 				{
 					f2LPT*=6.0/7.0/vfac2lpt;
 					f+=f2LPT;
-					
+
 					f2LPT.deallocate();
 				}
-				
+
 				//... add the 2LPT contribution
 				u2LPT *= 6.0/7.0/vfac2lpt;
 				u1 += u2LPT;
 				u2LPT.deallocate();
-				
-				//grid_hierarchy data_forIO(u1);
-				data_forIO = u1;
+
+				grid_hierarchy data_forIO(u1);
 				for( int icoord = 0; icoord < 3; ++icoord )
 				{
 					if(bdefd)
 					{
 						data_forIO.zero();
 						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );					
+						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
 						*data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
 						the_poisson_solver->gradient_add(icoord, u1, data_forIO );
 					}
-					else 
+					else
 						the_poisson_solver->gradient(icoord, u1, data_forIO );
-					
+
 					data_forIO *= cosmo.vfact;
-										
+
 					double sigv = compute_finest_sigma( data_forIO );
 					std::cerr << " - velocity component " << icoord << " : sigma = " << sigv << std::endl;
-					
+
 					coarsen_density( rh_Poisson, data_forIO, false );
 					LOGUSER("Writing baryon velocities");
-					the_output_plugin->write_gas_velocity(icoord, data_forIO);				
+					the_output_plugin->write_gas_velocity(icoord, data_forIO);
 				}
 				data_forIO.deallocate();
 				u1.deallocate();
+				} // end is_root() — 2LPT vbaryon post-density
 			}
 			
 			
@@ -1073,54 +1599,57 @@ int main (int argc, const char * argv[])
 				my_tf_type = cdm;
 				if( !do_baryons || !the_transfer_function_plugin->tf_is_distinct() )
 					my_tf_type = total;
-				
+
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
+				if( MUSIC::mpi::is_root() )
+				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
-				
+
 				LOGUSER("Writing CDM data");
 				the_output_plugin->write_dm_density(f);
 				the_output_plugin->write_dm_mass(f);
 				u1 = f;	u1.zero();
-				
+
 				if(bdefd)
 					f2LPT=f;
-				
+
 				//... compute 1LPT term
 				err = the_poisson_solver->solve(f, u1);
-				
+
 				//... compute 2LPT term
 				u2LPT = f; u2LPT.zero();
-				
+
 				if( !kspace2LPT )
 					compute_2LPT_source(u1, f2LPT, grad_order );
 				else
 					compute_2LPT_source_FFT(cf, u1, f2LPT);
-				
+
 				err = the_poisson_solver->solve(f2LPT, u2LPT);
-				
+
 				if( bdefd )
 				{
 					f2LPT*=3.0/7.0;
 					f+=f2LPT;
 					f2LPT.deallocate();
 				}
-				
+
 				u2LPT *= 3.0/7.0;
 				u1 += u2LPT;
 				u2LPT.deallocate();
-			}else{
+				} // end is_root() — 2LPT !dm_only DM displacements
+			}else if( MUSIC::mpi::is_root() ){
 				//... reuse prior data
 				/*f-=f2LPT;
 				the_output_plugin->write_dm_density(f);
 				the_output_plugin->write_dm_mass(f);
 				f+=f2LPT;*/
-				
+
 				u2LPT *= 0.5;
 				u1 -= u2LPT;
 				u2LPT.deallocate();
-				
+
 				if(bdefd)
 				{
 					f2LPT *= 0.5;
@@ -1128,9 +1657,11 @@ int main (int argc, const char * argv[])
 					f2LPT.deallocate();
 				}
 			}
-						
-			data_forIO = u1;
-			
+
+			if( MUSIC::mpi::is_root() )
+			{
+			grid_hierarchy data_forIO(u1);
+
 			for( int icoord = 0; icoord < 3; ++icoord )
 			{
 				//... displacement
@@ -1138,24 +1669,25 @@ int main (int argc, const char * argv[])
 				{
 					data_forIO.zero();
 					*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-					poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
+					poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
 						       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
 					*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
 					the_poisson_solver->gradient_add(icoord, u1, data_forIO );
 				}
-				else 
+				else
 					the_poisson_solver->gradient(icoord, u1, data_forIO );
-				
+
 				double dispmax = compute_finest_max( data_forIO );
 				LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
 
 				coarsen_density( rh_Poisson, data_forIO, false );
 				LOGUSER("Writing CDM displacements");
-				the_output_plugin->write_dm_position(icoord, data_forIO );	
+				the_output_plugin->write_dm_position(icoord, data_forIO );
 			}
-			
+
 			data_forIO.deallocate();
 			u1.deallocate();
+			} // end is_root() — 2LPT DM displacements post-density
 			
 
 			if( do_baryons && !bsph )
@@ -1166,38 +1698,41 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon density...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, true, false );
+				if( MUSIC::mpi::is_root() )
+				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
-				
+
 				if( !do_LLA )
 					the_output_plugin->write_gas_density(f);
-				else 
-				{	
+				else
+				{
 					u1 = f;	u1.zero();
-					
+
 					//... compute 1LPT term
 					err = the_poisson_solver->solve(f, u1);
-					
+
 					//... compute 2LPT term
 					u2LPT = f; u2LPT.zero();
-					
+
 					if( !kspace2LPT )
 						compute_2LPT_source(u1, f2LPT, grad_order );
 					else
 						compute_2LPT_source_FFT(cf, u1, f2LPT);
-					
+
 					err = the_poisson_solver->solve(f2LPT, u2LPT);
 					u2LPT *= 3.0/7.0;
 					u1 += u2LPT;
 					u2LPT.deallocate();
-					
+
 					compute_LLA_density( u1, f, grad_order );
                     normalize_density(f);
-					
+
 					LOGUSER("Writing baryon density");
 					the_output_plugin->write_gas_density(f);
 				}
+				} // end is_root() — 2LPT gas density (!bsph)
 			}
 			else if( do_baryons && bsph )
 			{
@@ -1207,43 +1742,45 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon displacements...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, false, bbshift );
+				if( MUSIC::mpi::is_root() )
+				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
-				
+
 				LOGUSER("Writing baryon density");
 				the_output_plugin->write_gas_density(f);
 				u1 = f;	u1.zero();
-				
+
 				if(bdefd)
 					f2LPT=f;
-				
+
 				//... compute 1LPT term
 				err = the_poisson_solver->solve(f, u1);
-				
+
 				//... compute 2LPT term
 				u2LPT = f; u2LPT.zero();
-				
+
 				if( !kspace2LPT )
 					compute_2LPT_source(u1, f2LPT, grad_order );
 				else
 					compute_2LPT_source_FFT(cf, u1, f2LPT);
-				
+
 				err = the_poisson_solver->solve(f2LPT, u2LPT);
-				
+
 				if( bdefd )
 				{
 					f2LPT*=3.0/7.0;
 					f+=f2LPT;
 					f2LPT.deallocate();
 				}
-				
+
 				u2LPT *= 3.0/7.0;
 				u1 += u2LPT;
 				u2LPT.deallocate();
-				
-				data_forIO = u1;
-				
+
+				grid_hierarchy data_forIO(u1);
+
 				for( int icoord = 0; icoord < 3; ++icoord )
 				{
 					//... displacement
@@ -1251,28 +1788,31 @@ int main (int argc, const char * argv[])
 					{
 						data_forIO.zero();
 						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order, 
+						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
 							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
 						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
 						the_poisson_solver->gradient_add(icoord, u1, data_forIO );
 					}
-					else 
+					else
 						the_poisson_solver->gradient(icoord, u1, data_forIO );
-					
+
 					coarsen_density( rh_Poisson, data_forIO, false );
 					LOGUSER("Writing baryon displacements");
-					the_output_plugin->write_gas_position(icoord, data_forIO );	
+					the_output_plugin->write_gas_position(icoord, data_forIO );
 				}
+				} // end is_root() — 2LPT gas displacements (bsph)
 			}
 
 		}
-		
+
 		//------------------------------------------------------------------------------
 		//... finish output
 		//------------------------------------------------------------------------------
-		
-		the_output_plugin->finalize();
-		delete the_output_plugin;
+
+		if( MUSIC::mpi::is_root() ){
+			the_output_plugin->finalize();
+			delete the_output_plugin;
+		}
 		
 	}catch(std::runtime_error& excp){
 		LOGERR("Fatal error occured. Code will exit:");
@@ -1305,19 +1845,30 @@ int main (int argc, const char * argv[])
 	fftw_cleanup_threads();
 	#endif
 #endif
+
+#ifdef USE_MPI
+	#ifdef SINGLE_PRECISION
+	fftwf_mpi_cleanup();
+	#else
+	fftw_mpi_cleanup();
+	#endif
+#endif
 	
 	
 	//------------------------------------------------------------------------------
 	//... we are done !
 	//------------------------------------------------------------------------------
-	std::cout << " - Done!" << std::endl << std::endl;
-	
+	if( MUSIC::mpi::is_root() ) std::cout << " - Done!" << std::endl << std::endl;
+
 	ltime=time(NULL);
-	
+
 	LOGUSER("Run finished succesfully on %s",asctime( localtime(&ltime) ));
-	
-	cf.log_dump();
-	
-	
+
+	if( MUSIC::mpi::is_root() ) cf.log_dump();
+
+#ifdef USE_MPI
+	MPI_Finalize();
+#endif
+
 	return 0;
 }

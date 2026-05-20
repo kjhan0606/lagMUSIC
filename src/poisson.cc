@@ -12,6 +12,8 @@
 
 #include "poisson.hh"
 #include "Numerics.hh"
+#include "mpi_helper.hh"
+#include "mpi_poisson.hh"
 
 std::map< std::string, poisson_plugin_creator *>& 
 get_poisson_plugin_map()
@@ -519,44 +521,51 @@ double fft_poisson_plugin::solve( grid_hierarchy& f, grid_hierarchy& u )
 			}
 	
 	//... perform FFT and Poisson solve................................
+#ifdef USE_MPI
+	if( MUSIC::mpi::size() > 1 ){
+		LOGUSER("Performing distributed forward+backward FFT Poisson solve.");
+		MUSIC::poisson::rank0_dist_solve<fftw_real>(data, (size_t)nx, (size_t)ny, (size_t)nz);
+	} else
+#endif
+	{
 	LOGUSER("Performing forward transform.");
 
 #ifdef FFTW3
 	#ifdef SINGLE_PRECISION
-	fftwf_plan 
+	fftwf_plan
 		plan  = fftwf_plan_dft_r2c_3d( nx, ny, nz, data, cdata, FFTW_ESTIMATE ),
 		iplan = fftwf_plan_dft_c2r_3d( nx, ny, nz, cdata, data, FFTW_ESTIMATE );
-	
+
 	fftwf_execute(plan);
 	#else
-	fftw_plan 
+	fftw_plan
 	plan  = fftw_plan_dft_r2c_3d( nx, ny, nz, data, cdata, FFTW_ESTIMATE ),
 	iplan = fftw_plan_dft_c2r_3d( nx, ny, nz, cdata, data, FFTW_ESTIMATE );
-	
+
 	fftw_execute(plan);
 	#endif
-	
+
 #else
-	rfftwnd_plan 
+	rfftwnd_plan
 		plan = rfftw3d_create_plan( nx,ny,nz,
 								   FFTW_REAL_TO_COMPLEX, FFTW_ESTIMATE|FFTW_IN_PLACE),
 		iplan = rfftw3d_create_plan( nx,ny,nz,
 									FFTW_COMPLEX_TO_REAL, FFTW_ESTIMATE|FFTW_IN_PLACE);
-	
-		
-	#ifndef SINGLETHREAD_FFTW		
+
+
+	#ifndef SINGLETHREAD_FFTW
 	rfftwnd_threads_one_real_to_complex( omp_get_max_threads(), plan, data, NULL );
 	#else
 	rfftwnd_one_real_to_complex( plan, data, NULL );
 	#endif
-	
+
 #endif
 	double kfac = 2.0*M_PI;
 	double fac = -1.0/(double)((size_t)nx*(size_t)ny*(size_t)nz);
-	
+
 	#pragma omp parallel for
 	for( int i=0; i<nx; ++i )
-		for( int j=0; j<ny; ++j )	
+		for( int j=0; j<ny; ++j )
 			for( int k=0; k<nz/2+1; ++k )
 			{
 				int ii = i; if(ii>nx/2) ii-=nx;
@@ -564,20 +573,20 @@ double fft_poisson_plugin::solve( grid_hierarchy& f, grid_hierarchy& u )
 				double ki = (double)ii;
 				double kj = (double)jj;
 				double kk = (double)k;
-				
+
 				double kk2 = kfac*kfac*(ki*ki+kj*kj+kk*kk);
-				
+
 				size_t idx = (size_t)(i*ny+j)*(size_t)(nzp/2)+(size_t)k;
-				
+
 				RE(cdata[idx]) *= -1.0/kk2*fac;
 				IM(cdata[idx]) *= -1.0/kk2*fac;
 			}
 
 	RE(cdata[0]) = 0.0;
 	IM(cdata[0]) = 0.0;
-	
+
 	LOGUSER("Performing backward transform.");
-	
+
 #ifdef FFTW3
 	#ifdef SINGLE_PRECISION
 	fftwf_execute(iplan);
@@ -589,15 +598,16 @@ double fft_poisson_plugin::solve( grid_hierarchy& f, grid_hierarchy& u )
 	fftw_destroy_plan(iplan);
 	#endif
 #else
-	#ifndef SINGLETHREAD_FFTW		
+	#ifndef SINGLETHREAD_FFTW
 	rfftwnd_threads_one_complex_to_real( omp_get_max_threads(), iplan, cdata, NULL );
 	#else
 	rfftwnd_one_complex_to_real( iplan, cdata, NULL );
 	#endif
-	
+
 	rfftwnd_destroy_plan(plan);
 	rfftwnd_destroy_plan(iplan);
 #endif
+	} // serial FFT branch
 	
 	
 
@@ -691,48 +701,52 @@ double fft_poisson_plugin::gradient( int dir, grid_hierarchy& u, grid_hierarchy&
 				data[idx] = (*u.get_grid(u.levelmax()))(i,j,k);
 			}
 	
+	bool do_glass = cf_.getValueSafe<bool>("output","glass",false);
+	bool deconvolve_cic = do_glass | cf_.getValueSafe<bool>("output","glass_cicdeconvolve",false);
+
+	if( deconvolve_cic )
+		LOGINFO("CIC deconvolution is enabled for kernel!");
+
 	//... perform FFT and Poisson solve................................
-	
+#ifdef USE_MPI
+	if( MUSIC::mpi::size() > 1 ){
+		LOGUSER("Performing distributed k-space gradient.");
+		MUSIC::poisson::rank0_dist_gradient<fftw_real>(dir, data, (size_t)nx, (size_t)ny, (size_t)nz, deconvolve_cic);
+	} else
+#endif
+	{
 #ifdef FFTW3
 	#ifdef SINGLE_PRECISION
-	fftwf_plan 
+	fftwf_plan
 		plan  = fftwf_plan_dft_r2c_3d(nx, ny, nz, data, cdata, FFTW_ESTIMATE),
 		iplan = fftwf_plan_dft_c2r_3d(nx, ny, nz, cdata, data, FFTW_ESTIMATE);
-	
+
 	fftwf_execute(plan);
-	#else	
-	fftw_plan 
+	#else
+	fftw_plan
 	plan  = fftw_plan_dft_r2c_3d(nx, ny, nz, data, cdata, FFTW_ESTIMATE),
 	iplan = fftw_plan_dft_c2r_3d(nx, ny, nz, cdata, data, FFTW_ESTIMATE);
-	
+
 	fftw_execute(plan);
 	#endif
 #else
-	rfftwnd_plan 
+	rfftwnd_plan
 		plan = rfftw3d_create_plan( nx,ny,nz,
 					    FFTW_REAL_TO_COMPLEX, FFTW_ESTIMATE|FFTW_IN_PLACE),
 		iplan = rfftw3d_create_plan( nx,ny,nz,
 					     FFTW_COMPLEX_TO_REAL, FFTW_ESTIMATE|FFTW_IN_PLACE);
-	
-	
-	#ifndef SINGLETHREAD_FFTW		
+
+
+	#ifndef SINGLETHREAD_FFTW
 	rfftwnd_threads_one_real_to_complex( omp_get_max_threads(), plan, data, NULL );
 	#else
 	rfftwnd_one_real_to_complex( plan, data, NULL );
 	#endif
-	
+
 #endif
-	
+
 	double fac = -1.0/(double)((size_t)nx*(size_t)ny*(size_t)nz);
 	double kfac = 2.0*M_PI;
-	
-	
-	
-	bool do_glass = cf_.getValueSafe<bool>("output","glass",false);
-	bool deconvolve_cic = do_glass | cf_.getValueSafe<bool>("output","glass_cicdeconvolve",false);
-    
-    if( deconvolve_cic )
-        LOGINFO("CIC deconvolution is enabled for kernel!");
 	
 	#pragma omp parallel for
 	for( int i=0; i<nx; ++i )
@@ -816,11 +830,12 @@ double fft_poisson_plugin::gradient( int dir, grid_hierarchy& u, grid_hierarchy&
 	rfftwnd_destroy_plan(plan);
 	rfftwnd_destroy_plan(iplan);
 #endif
-	
+	} // serial FFT branch
+
 	//... copy data ..........................................
 	double dmax = 0.0;
 	for( int i=0; i<nx; ++i )
-		for( int j=0; j<ny; ++j )	
+		for( int j=0; j<ny; ++j )
 			for( int k=0; k<nz; ++k )
 			{
 				size_t idx = ((size_t)i*ny+(size_t)j)*nzp+(size_t)k;
@@ -830,9 +845,9 @@ double fft_poisson_plugin::gradient( int dir, grid_hierarchy& u, grid_hierarchy&
 			}
 
 	delete[] data;
-	
+
 	LOGUSER("Done with k-space gradient.\n");
-	
+
 	return 0.0;
 }
 

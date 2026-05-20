@@ -45,6 +45,7 @@
 #include "mpi_helper.hh"
 #include "mesh_distributed.hh"
 #include "mpi_fft.hh"
+#include "mpi_poisson.hh"
 
 #include <vector>
 #include <cstdlib>
@@ -1094,7 +1095,9 @@ int main (int argc, const char * argv[])
 			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_density(f);
 
 			grid_hierarchy u( f );	u.zero();
+			{ MUSIC::poisson::phase_scope _ps;
 			if( MUSIC::mpi::is_root() ) err = the_poisson_solver->solve(f, u);
+			}
 
 			if(!bdefd)
 				f.deallocate();
@@ -1106,6 +1109,7 @@ int main (int argc, const char * argv[])
 			//------------------------------------------------------------------------------
 			//... DM displacements
 			//------------------------------------------------------------------------------
+			{ MUSIC::poisson::phase_scope _ps;
 			if( MUSIC::mpi::is_root() )
 			{
 				grid_hierarchy data_forIO(u);
@@ -1134,6 +1138,7 @@ int main (int argc, const char * argv[])
 					u.deallocate();
 				data_forIO.deallocate();
 			}
+			}
 			
 			
 			//------------------------------------------------------------------------------
@@ -1146,6 +1151,7 @@ int main (int argc, const char * argv[])
 				std::cout << "-------------------------------------------------------------\n";
 				LOGUSER("Computing baryon density...");
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, false, bbshift );
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1206,6 +1212,7 @@ int main (int argc, const char * argv[])
 
 				f.deallocate();
 				} // end is_root() — baryon density
+				}
 			}
 			
 			
@@ -1224,6 +1231,7 @@ int main (int argc, const char * argv[])
 				{
 				  LOGUSER("Generating velocity perturbations...");
 				  GenerateDensityHierarchy( cf, the_transfer_function_plugin, vtotal , rh_TF, rand, f, false, false );
+				  { MUSIC::poisson::phase_scope _ps;
 				  if( MUSIC::mpi::is_root() )
 				  {
 				  coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1236,7 +1244,9 @@ int main (int argc, const char * argv[])
 				  if(!bdefd)
 				    f.deallocate();
 				  }
+				  }
 				}
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				grid_hierarchy data_forIO(u);
@@ -1280,6 +1290,7 @@ int main (int argc, const char * argv[])
 				u.deallocate();
 				data_forIO.deallocate();
 				} // end is_root() — vtotal post-density
+				}
 
 			}
 			else
@@ -1293,6 +1304,7 @@ int main (int argc, const char * argv[])
 				//... we do baryons and have velocity transfer functions, or we do SPH and not to shift
 				//... do DM first
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vcdm , rh_TF, rand, f, false, false );
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1336,6 +1348,7 @@ int main (int argc, const char * argv[])
 				data_forIO.deallocate();
 				f.deallocate();
 				} // end is_root() — vcdm post-density
+				}
 
 
 				std::cout << "=============================================================\n";
@@ -1344,6 +1357,7 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon velocitites...");
 				//... do baryons
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vbaryon , rh_TF, rand, f, false, bbshift );
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1387,6 +1401,7 @@ int main (int argc, const char * argv[])
 				f.deallocate();
 				data_forIO.deallocate();
 				} // end is_root() — vbaryon post-density
+				}
 			}
 		/*********************************************************************************************/
 		/*********************************************************************************************/
@@ -1418,6 +1433,7 @@ int main (int argc, const char * argv[])
 
 			
 			GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
+			{ MUSIC::poisson::phase_scope _ps;
 			if( MUSIC::mpi::is_root() )
 			{
 			coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1504,6 +1520,7 @@ int main (int argc, const char * argv[])
 			if( !dm_only )
 				u1.deallocate();
 			} // end is_root() — 2LPT vcdm/total post-density
+			}
 			
 			
 			if( do_baryons && (the_transfer_function_plugin->tf_has_velocities() || bsph) )
@@ -1514,6 +1531,7 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon displacements...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vbaryon , rh_TF, rand, f, false, bbshift );
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1583,6 +1601,7 @@ int main (int argc, const char * argv[])
 				data_forIO.deallocate();
 				u1.deallocate();
 				} // end is_root() — 2LPT vbaryon post-density
+				}
 			}
 			
 			
@@ -1601,6 +1620,7 @@ int main (int argc, const char * argv[])
 					my_tf_type = total;
 
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1639,6 +1659,7 @@ int main (int argc, const char * argv[])
 				u1 += u2LPT;
 				u2LPT.deallocate();
 				} // end is_root() — 2LPT !dm_only DM displacements
+				}
 			}else if( MUSIC::mpi::is_root() ){
 				//... reuse prior data
 				/*f-=f2LPT;
@@ -1658,6 +1679,7 @@ int main (int argc, const char * argv[])
 				}
 			}
 
+			{ MUSIC::poisson::phase_scope _ps;
 			if( MUSIC::mpi::is_root() )
 			{
 			grid_hierarchy data_forIO(u1);
@@ -1688,6 +1710,7 @@ int main (int argc, const char * argv[])
 			data_forIO.deallocate();
 			u1.deallocate();
 			} // end is_root() — 2LPT DM displacements post-density
+			}
 			
 
 			if( do_baryons && !bsph )
@@ -1698,6 +1721,7 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon density...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, true, false );
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1733,6 +1757,7 @@ int main (int argc, const char * argv[])
 					the_output_plugin->write_gas_density(f);
 				}
 				} // end is_root() — 2LPT gas density (!bsph)
+				}
 			}
 			else if( do_baryons && bsph )
 			{
@@ -1742,6 +1767,7 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon displacements...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, false, bbshift );
+				{ MUSIC::poisson::phase_scope _ps;
 				if( MUSIC::mpi::is_root() )
 				{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
@@ -1801,6 +1827,7 @@ int main (int argc, const char * argv[])
 					the_output_plugin->write_gas_position(icoord, data_forIO );
 				}
 				} // end is_root() — 2LPT gas displacements (bsph)
+				}
 			}
 
 		}

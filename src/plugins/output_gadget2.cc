@@ -15,6 +15,11 @@
 #include "output.hh"
 #include "mg_interp.hh"
 #include "mesh.hh"
+#include "mpi_helper.hh"
+
+#ifdef USE_MPI
+#include <mpi.h>
+#endif
 
 const int empty_fill_bytes = 56;
 
@@ -342,20 +347,10 @@ protected:
     
   }
   
-  void assemble_gadget_file( void )
+  void remove_temp_files( void )
   {
-    
-    if( do_baryons_ )
-      combine_components_for_coarse();
-    
-    
-    
-    //............................................................................
-    //... copy from the temporary files, interleave the data and save ............
-		
     char fnx[256],fny[256],fnz[256],fnvx[256],fnvy[256],fnvz[256],fnm[256];
     char fnbx[256], fnby[256], fnbz[256], fnbvx[256], fnbvy[256], fnbvz[256];
-    
     sprintf( fnx,  "___ic_temp_%05d.bin", 100*id_dm_pos+0 );
     sprintf( fny,  "___ic_temp_%05d.bin", 100*id_dm_pos+1 );
     sprintf( fnz,  "___ic_temp_%05d.bin", 100*id_dm_pos+2 );
@@ -363,79 +358,68 @@ protected:
     sprintf( fnvy, "___ic_temp_%05d.bin", 100*id_dm_vel+1 );
     sprintf( fnvz, "___ic_temp_%05d.bin", 100*id_dm_vel+2 );
     sprintf( fnm,  "___ic_temp_%05d.bin", 100*id_dm_mass  );
-    
     sprintf( fnbx,  "___ic_temp_%05d.bin", 100*id_gas_pos+0 );
     sprintf( fnby,  "___ic_temp_%05d.bin", 100*id_gas_pos+1 );
     sprintf( fnbz,  "___ic_temp_%05d.bin", 100*id_gas_pos+2 );
     sprintf( fnbvx, "___ic_temp_%05d.bin", 100*id_gas_vel+0 );
     sprintf( fnbvy, "___ic_temp_%05d.bin", 100*id_gas_vel+1 );
     sprintf( fnbvz, "___ic_temp_%05d.bin", 100*id_gas_vel+2 );
-    
-    
+    remove( fnbx ); remove( fnby ); remove( fnbz );
+    remove( fnx );  remove( fny );  remove( fnz );
+    remove( fnbvx ); remove( fnbvy ); remove( fnbvz );
+    remove( fnvx ); remove( fnvy ); remove( fnvz );
+    remove( fnm );
+  }
+
+  // Write a single output file (fname_ for nfiles_==1, fname_.<ifile> otherwise).
+  // Caller must thread the cumulative offsets wrote_dm/wrote_gas/wrote_coarse/
+  // idcount_base across calls. Reads temp files via pistream — no MPI; safe for
+  // any rank to call as long as the temp files exist on the shared FS.
+  void write_one_file( unsigned ifile,
+                       const std::vector< std::vector<unsigned> >& np_per_file,
+                       const std::vector<unsigned>& np_tot_per_file,
+                       size_t wrote_dm, size_t wrote_gas, size_t wrote_coarse,
+                       size_t idcount_base, bool bneed_long_ids )
+  {
+    char fnx[256],fny[256],fnz[256],fnvx[256],fnvy[256],fnvz[256],fnm[256];
+    char fnbx[256], fnby[256], fnbz[256], fnbvx[256], fnbvy[256], fnbvz[256];
+
+    sprintf( fnx,  "___ic_temp_%05d.bin", 100*id_dm_pos+0 );
+    sprintf( fny,  "___ic_temp_%05d.bin", 100*id_dm_pos+1 );
+    sprintf( fnz,  "___ic_temp_%05d.bin", 100*id_dm_pos+2 );
+    sprintf( fnvx, "___ic_temp_%05d.bin", 100*id_dm_vel+0 );
+    sprintf( fnvy, "___ic_temp_%05d.bin", 100*id_dm_vel+1 );
+    sprintf( fnvz, "___ic_temp_%05d.bin", 100*id_dm_vel+2 );
+    sprintf( fnm,  "___ic_temp_%05d.bin", 100*id_dm_mass  );
+
+    sprintf( fnbx,  "___ic_temp_%05d.bin", 100*id_gas_pos+0 );
+    sprintf( fnby,  "___ic_temp_%05d.bin", 100*id_gas_pos+1 );
+    sprintf( fnbz,  "___ic_temp_%05d.bin", 100*id_gas_pos+2 );
+    sprintf( fnbvx, "___ic_temp_%05d.bin", 100*id_gas_vel+0 );
+    sprintf( fnbvy, "___ic_temp_%05d.bin", 100*id_gas_vel+1 );
+    sprintf( fnbvz, "___ic_temp_%05d.bin", 100*id_gas_vel+2 );
+
     pistream iffs1, iffs2, iffs3;
-    
-    const size_t 
+
+    const size_t
       nptot = np_per_type_[0]+np_per_type_[1]+np_per_type_[2]+np_per_type_[3]+np_per_type_[4]+np_per_type_[5],
-      //npgas = np_fine_gas_,
-      npcdm = nptot-np_per_type_[0];
-    
-    size_t
-      wrote_coarse = 0,
-      wrote_gas  = 0,
-      wrote_dm   = 0;
-    
-    size_t
-      npleft = nptot, 
-      n2read = std::min((size_t)block_buf_size_,npleft);
-    
-    std::cout << " - Gadget2 : writing " << nptot << " particles to file...\n";
-    for( int i=0; i<6; ++i )
-      if( np_per_type_[i] > 0 )
-	LOGINFO("      type   %d : %12llu [m=%g]", i, np_per_type_[i], header_.mass[i] );
-    
-    bool bbaryons = np_per_type_[0] > 0;
-    
+      npcdm = nptot - np_per_type_[0];
+
+    size_t npleft, n2read;
+    const bool bbaryons = np_per_type_[0] > 0;
+    const size_t curr_block_buf_size = block_buf_size_;
+    size_t idcount = idcount_base;
+
     std::vector<T_store> adata3;
     adata3.reserve( 3*block_buf_size_ );
-    T_store *tmp1, *tmp2, *tmp3;
-    
-    tmp1 = new T_store[block_buf_size_];
-    tmp2 = new T_store[block_buf_size_];
-    tmp3 = new T_store[block_buf_size_];
-    
-    //... for multi-file output
-    //int fileno = 0;
-    //size_t npart_left = nptot;
-    
-    //std::vector<unsigned> nfdm_per_file, nfgas_per_file, nc_per_file;
-        
-    std::vector< std::vector<unsigned> > np_per_file;
-    std::vector<unsigned> np_tot_per_file;
-    
-    distribute_particles( nfiles_, np_per_file, np_tot_per_file );
-    
-    if( nfiles_ > 1 )
-      {
-	LOGINFO("Gadget2 : distributing particles to %d files", nfiles_ );
-	//<< "                 " << std::setw(12) << "type 0" << "," << std::setw(12) << "type 1" << "," << std::setw(12) << "type " << bndparticletype_ << std::endl;
-	for( unsigned i=0; i<nfiles_; ++i )
-	  LOGINFO("      file %i : %12llu", i, np_tot_per_file[i], header_.mass[i] );
-      }
-    
-    
-    size_t curr_block_buf_size = block_buf_size_;
-    
-    size_t idcount = 0;
-    bool bneed_long_ids = blongids_;
-    if( nptot >= 1ul<<32 && !bneed_long_ids )
-      {
-	bneed_long_ids = true;
-	LOGWARN("Need long particle IDs, will write 64bit, make sure to enable in Gadget!");
-      }   
-    
-    for( unsigned ifile=0; ifile<nfiles_; ++ifile )
-      {
-	
+    T_store *tmp1 = new T_store[block_buf_size_];
+    T_store *tmp2 = new T_store[block_buf_size_];
+    T_store *tmp3 = new T_store[block_buf_size_];
+
+    std::ofstream ofs_local;
+    std::ofstream &ofs_ = ofs_local;  // shadow the class member so the legacy body works unchanged
+
+    {
 	if( nfiles_ > 1 )
 	  {
 	    char ffname[256];
@@ -714,34 +698,60 @@ protected:
 	
 	ofs_.flush();
 	ofs_.close();
-	
-	wrote_gas       += np_per_file[ifile][0];
-	wrote_dm        += np_this_file-np_per_file[ifile][0];
-	wrote_coarse    += np_per_file[ifile][5];
-	
-        
-      }
-    
+
+	(void)idcount;  // suppress unused-but-set warning when nptot==0
+    }
+
     delete[] tmp1;
     delete[] tmp2;
     delete[] tmp3;
-    
-    remove( fnbx );
-    remove( fnby );
-    remove( fnbz );
-    remove( fnx );
-    remove( fny );
-    remove( fnz );
-    remove( fnbvx );
-    remove( fnbvy );
-    remove( fnbvz );
-    remove( fnvx );
-    remove( fnvy );
-    remove( fnvz );
-    remove( fnm );
-    
   }
-  
+
+  void assemble_gadget_file( void )
+  {
+    if( do_baryons_ )
+      combine_components_for_coarse();
+
+    const size_t nptot =
+      np_per_type_[0]+np_per_type_[1]+np_per_type_[2]+np_per_type_[3]+np_per_type_[4]+np_per_type_[5];
+
+    std::cout << " - Gadget2 : writing " << nptot << " particles to file...\n";
+    for( int i=0; i<6; ++i )
+      if( np_per_type_[i] > 0 )
+	LOGINFO("      type   %d : %12llu [m=%g]", i, np_per_type_[i], header_.mass[i] );
+
+    std::vector< std::vector<unsigned> > np_per_file;
+    std::vector<unsigned> np_tot_per_file;
+    distribute_particles( nfiles_, np_per_file, np_tot_per_file );
+
+    if( nfiles_ > 1 )
+      {
+	LOGINFO("Gadget2 : distributing particles to %d files", nfiles_ );
+	for( unsigned i=0; i<nfiles_; ++i )
+	  LOGINFO("      file %i : %12llu", i, np_tot_per_file[i], header_.mass[i] );
+      }
+
+    bool bneed_long_ids = blongids_;
+    if( nptot >= 1ul<<32 && !bneed_long_ids )
+      {
+	bneed_long_ids = true;
+	LOGWARN("Need long particle IDs, will write 64bit, make sure to enable in Gadget!");
+      }
+
+    size_t wrote_coarse = 0, wrote_gas = 0, wrote_dm = 0, idcount = 0;
+    for( unsigned ifile=0; ifile<nfiles_; ++ifile )
+      {
+	write_one_file( ifile, np_per_file, np_tot_per_file,
+	                wrote_dm, wrote_gas, wrote_coarse, idcount, bneed_long_ids );
+	wrote_gas    += np_per_file[ifile][0];
+	wrote_dm     += np_tot_per_file[ifile] - np_per_file[ifile][0];
+	wrote_coarse += np_per_file[ifile][5];
+	idcount      += np_tot_per_file[ifile];
+      }
+
+    remove_temp_files();
+  }
+
   void determine_particle_numbers( const grid_hierarchy& gh )
   {
     if( !bhave_particlenumbers_ )
@@ -836,7 +846,11 @@ public:
     //if( nfiles_ < (int)ceil((double)npart/(double)npartmax_) )
     //	LOGWARN("Should use more files.");
     
-    if (nfiles_ > 1 ) 
+    // Only rank 0 truncates/verifies the output files in the ctor. Workers
+    // skip this to avoid racing on the same paths; each rank's write step
+    // re-opens the file it owns with std::ios::trunc anyway.
+    if( MUSIC::mpi::is_root() ){
+    if (nfiles_ > 1 )
       {
 	for( unsigned ifile=0; ifile<nfiles_; ++ifile )
 	  {
@@ -844,20 +858,21 @@ public:
 	    sprintf(ffname,"%s.%d",fname_.c_str(), ifile);
 	    ofs_.open(ffname, std::ios::binary|std::ios::trunc );
 	    if(!ofs_.good())
-	      {	
+	      {
 		LOGERR("gadget-2 output plug-in could not open output file \'%s\' for writing!",ffname);
 		throw std::runtime_error(std::string("gadget-2 output plug-in could not open output file \'")+std::string(ffname)+"\' for writing!\n");
 	      }
-	    ofs_.close();	
+	    ofs_.close();
 	  }
       }else{
       ofs_.open(fname_.c_str(), std::ios::binary|std::ios::trunc );
       if(!ofs_.good())
-	{	
+	{
 	  LOGERR("gadget-2 output plug-in could not open output file \'%s\' for writing!",fname_.c_str());
 	  throw std::runtime_error(std::string("gadget-2 output plug-in could not open output file \'")+fname_+"\' for writing!\n");
 	}
       ofs_.close();
+    }
     }
 
     bhave_particlenumbers_ = false;
@@ -1392,8 +1407,97 @@ public:
   }
   
   void finalize( void )
-  {	
+  {
     this->assemble_gadget_file();
+  }
+
+  // Collective entry: parallelizes multi-file output across ranks. Called on
+  // every rank from main.cc; rank 0 has populated header_/np_per_type_/etc.
+  // via write_dm_* on the way in, workers have not — so we broadcast first.
+  void finalize_collective( void )
+  {
+#ifdef USE_MPI
+    const int rk = MUSIC::mpi::rank();
+    const int sz = MUSIC::mpi::size();
+
+    if( sz <= 1 ) {
+      if( MUSIC::mpi::is_root() ) this->finalize();
+      return;
+    }
+
+    // Broadcast the per-finalize state that workers don't have (because all
+    // write_dm_* / write_gas_* calls in main.cc are rank-0-only).
+    MPI_Bcast( &header_, sizeof(header_), MPI_BYTE, 0, MUSIC::mpi::world() );
+    MPI_Bcast( np_per_type_, sizeof(np_per_type_), MPI_BYTE, 0, MUSIC::mpi::world() );
+    int bm = bmorethan2bnd_ ? 1 : 0;
+    MPI_Bcast( &bm, 1, MPI_INT, 0, MUSIC::mpi::world() );
+    bmorethan2bnd_ = (bm != 0);
+
+    // combine_components_for_coarse rewrites the temp files; rank 0 only.
+    if( do_baryons_ && MUSIC::mpi::is_root() )
+      combine_components_for_coarse();
+    MUSIC::mpi::barrier();
+
+    const size_t nptot =
+      np_per_type_[0]+np_per_type_[1]+np_per_type_[2]+np_per_type_[3]+np_per_type_[4]+np_per_type_[5];
+
+    bool bneed_long_ids = blongids_;
+    if( nptot >= 1ul<<32 && !bneed_long_ids ) bneed_long_ids = true;
+
+    std::vector< std::vector<unsigned> > np_per_file;
+    std::vector<unsigned> np_tot_per_file;
+    distribute_particles( nfiles_, np_per_file, np_tot_per_file );
+
+    if( MUSIC::mpi::is_root() )
+      {
+	std::cout << " - Gadget2 : writing " << nptot << " particles to file...\n";
+	for( int i=0; i<6; ++i )
+	  if( np_per_type_[i] > 0 )
+	    LOGINFO("      type   %d : %12llu [m=%g]", i, np_per_type_[i], header_.mass[i] );
+	if( nfiles_ > 1 )
+	  {
+	    LOGINFO("Gadget2 : distributing %d files across %d ranks", nfiles_, sz );
+	    for( unsigned i=0; i<nfiles_; ++i )
+	      LOGINFO("      file %i : %12llu (rank %d)", i, np_tot_per_file[i], (int)(i % sz) );
+	  }
+      }
+
+    // Single-file output: no parallelism possible. Rank 0 writes; workers wait.
+    if( nfiles_ <= 1 )
+      {
+	if( MUSIC::mpi::is_root() )
+	  write_one_file( 0, np_per_file, np_tot_per_file,
+	                  0, 0, 0, 0, bneed_long_ids );
+	MUSIC::mpi::barrier();
+	if( MUSIC::mpi::is_root() ) remove_temp_files();
+	return;
+      }
+
+    // Multi-file: precompute cumulative offsets (deterministic on all ranks),
+    // then each rank writes the ifiles for which (ifile % size == rank).
+    std::vector<size_t> cum_dm(nfiles_+1, 0), cum_gas(nfiles_+1, 0),
+                        cum_coarse(nfiles_+1, 0), cum_id(nfiles_+1, 0);
+    for( unsigned i=0; i<nfiles_; ++i )
+      {
+	cum_gas[i+1]    = cum_gas[i]    + np_per_file[i][0];
+	cum_dm[i+1]     = cum_dm[i]     + (np_tot_per_file[i] - np_per_file[i][0]);
+	cum_coarse[i+1] = cum_coarse[i] + np_per_file[i][5];
+	cum_id[i+1]     = cum_id[i]     + np_tot_per_file[i];
+      }
+
+    for( unsigned ifile=0; ifile<nfiles_; ++ifile )
+      {
+	if( (int)(ifile % sz) != rk ) continue;
+	write_one_file( ifile, np_per_file, np_tot_per_file,
+	                cum_dm[ifile], cum_gas[ifile], cum_coarse[ifile],
+	                cum_id[ifile], bneed_long_ids );
+      }
+
+    MUSIC::mpi::barrier();
+    if( MUSIC::mpi::is_root() ) remove_temp_files();
+#else
+    this->finalize();
+#endif
   }
 };
 

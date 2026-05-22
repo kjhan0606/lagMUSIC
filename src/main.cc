@@ -255,53 +255,103 @@ void store_grid_structure( config_file& cf, const refinement_hierarchy& rh )
 
 double compute_finest_mean( grid_hierarchy& u )
 {
-
+	// D.3.3/D.4: at multi-box finest level iterate per-box (excludes gap
+	// cells); at single-box use union with is_refined gate (existing path).
+	unsigned L = u.levelmax();
 	double sum = 0.0;
-    size_t count = 0;
-	for( int ix = 0; ix < (int)(*u.get_grid(u.levelmax())).size(0); ++ix )
-		for( int iy = 0; iy < (int)(*u.get_grid(u.levelmax())).size(1); ++iy )
-			for( int iz = 0; iz < (int)(*u.get_grid(u.levelmax())).size(2); ++iz )
-                if( ! u.is_refined(u.levelmax(),ix,iy,iz) )
-                {
-                    sum += (*u.get_grid(u.levelmax()))(ix,iy,iz);
-                    ++count;
-                }
-	sum /= count;
+	size_t count = 0;
+	const size_t nb = u.num_boxes(L);
+
+	if( nb > 1 ){
+		for( size_t b=0; b<nb; ++b ){
+			meshvar_bnd * pm = u.get_grid(L, b);
+			int nx=pm->size(0), ny=pm->size(1), nz=pm->size(2);
+			for( int ix=0; ix<nx; ++ix )
+				for( int iy=0; iy<ny; ++iy )
+					for( int iz=0; iz<nz; ++iz ){
+						sum += (*pm)(ix,iy,iz);
+						++count;
+					}
+		}
+	} else {
+		meshvar_bnd * pm = u.get_grid(L);
+		for( int ix = 0; ix < (int)pm->size(0); ++ix )
+			for( int iy = 0; iy < (int)pm->size(1); ++iy )
+				for( int iz = 0; iz < (int)pm->size(2); ++iz )
+					if( ! u.is_refined(L,ix,iy,iz) ){
+						sum += (*pm)(ix,iy,iz);
+						++count;
+					}
+	}
+	if( count ) sum /= count;
 	return sum;
-	
 }
 
 double compute_finest_sigma( grid_hierarchy& u )
 {
+	// D.3.3/D.4: per-box at multi-box finest level.
+	unsigned L = u.levelmax();
 	double sum = 0.0, sum2 = 0.0;
-	for( int ix = 0; ix < (int)(*u.get_grid(u.levelmax())).size(0); ++ix )
-		for( int iy = 0; iy < (int)(*u.get_grid(u.levelmax())).size(1); ++iy )
-			for( int iz = 0; iz < (int)(*u.get_grid(u.levelmax())).size(2); ++iz )
-			{
-				sum +=  (*u.get_grid(u.levelmax()))(ix,iy,iz);
-				sum2 +=  (*u.get_grid(u.levelmax()))(ix,iy,iz)* (*u.get_grid(u.levelmax()))(ix,iy,iz);
-			}
+	size_t N = 0;
+	const size_t nb = u.num_boxes(L);
 
-	size_t N = (size_t)(*u.get_grid(u.levelmax())).size(0)
-		 * (size_t)(*u.get_grid(u.levelmax())).size(1)
-		 * (size_t)(*u.get_grid(u.levelmax())).size(2);
-	sum /= N;
-	sum2 /= N;
-
-	return sqrt(sum2-sum*sum);
+	if( nb > 1 ){
+		for( size_t b=0; b<nb; ++b ){
+			meshvar_bnd * pm = u.get_grid(L, b);
+			int nx=pm->size(0), ny=pm->size(1), nz=pm->size(2);
+			for( int ix=0; ix<nx; ++ix )
+				for( int iy=0; iy<ny; ++iy )
+					for( int iz=0; iz<nz; ++iz ){
+						double v = (*pm)(ix,iy,iz);
+						sum  += v;
+						sum2 += v*v;
+						++N;
+					}
+		}
+	} else {
+		meshvar_bnd * pm = u.get_grid(L);
+		int nx=pm->size(0), ny=pm->size(1), nz=pm->size(2);
+		for( int ix=0; ix<nx; ++ix )
+			for( int iy=0; iy<ny; ++iy )
+				for( int iz=0; iz<nz; ++iz ){
+					double v = (*pm)(ix,iy,iz);
+					sum  += v;
+					sum2 += v*v;
+				}
+		N = (size_t)nx*(size_t)ny*(size_t)nz;
+	}
+	if( N==0 ) return 0.0;
+	sum /= N; sum2 /= N;
+	return sqrt(sum2 - sum*sum);
 }
 
 double compute_finest_max( grid_hierarchy& u )
 {
+	// D.3.3/D.4: per-box at multi-box finest level.
+	unsigned L = u.levelmax();
 	double valmax = 0.0;
-	for( int ix = 0; ix < (int)(*u.get_grid(u.levelmax())).size(0); ++ix )
-		for( int iy = 0; iy < (int)(*u.get_grid(u.levelmax())).size(1); ++iy )
-			for( int iz = 0; iz < (int)(*u.get_grid(u.levelmax())).size(2); ++iz )
-			{
-			  if( fabs((*u.get_grid(u.levelmax()))(ix,iy,iz)) > fabs(valmax) )
-			    valmax = (*u.get_grid(u.levelmax()))(ix,iy,iz);
-			}
+	const size_t nb = u.num_boxes(L);
 
+	if( nb > 1 ){
+		for( size_t b=0; b<nb; ++b ){
+			meshvar_bnd * pm = u.get_grid(L, b);
+			int nx=pm->size(0), ny=pm->size(1), nz=pm->size(2);
+			for( int ix=0; ix<nx; ++ix )
+				for( int iy=0; iy<ny; ++iy )
+					for( int iz=0; iz<nz; ++iz ){
+						double v = (*pm)(ix,iy,iz);
+						if( fabs(v) > fabs(valmax) ) valmax = v;
+					}
+		}
+	} else {
+		meshvar_bnd * pm = u.get_grid(L);
+		for( int ix = 0; ix < (int)pm->size(0); ++ix )
+			for( int iy = 0; iy < (int)pm->size(1); ++iy )
+				for( int iz = 0; iz < (int)pm->size(2); ++iz ){
+					double v = (*pm)(ix,iy,iz);
+					if( fabs(v) > fabs(valmax) ) valmax = v;
+				}
+	}
 	return valmax;
 }
 
@@ -1011,9 +1061,13 @@ int main (int argc, const char * argv[])
 	std::string outformat, outfname;
 	outformat			= cf.getValue<std::string>( "output", "format" );
 	outfname			= cf.getValue<std::string>( "output", "filename" );
-	// Only root owns the output plug-in; workers leave it NULL and skip all
-	// the_output_plugin->... calls via is_root() gates further down.
-	output_plugin *the_output_plugin = MUSIC::mpi::is_root() ? select_output_plugin( cf ) : NULL;
+	// Plugins that override finalize_collective() (gadget2 family) instantiate
+	// on ALL ranks so workers can participate in the parallel multi-file write.
+	// Everyone else stays rank-0-only — workers leave the_output_plugin NULL
+	// and skip all the_output_plugin->... calls via is_root() gates.
+	const bool plugin_all_ranks = (outformat == "gadget2" || outformat == "gadget2_double");
+	output_plugin *the_output_plugin = (plugin_all_ranks || MUSIC::mpi::is_root())
+	                                   ? select_output_plugin( cf ) : NULL;
 	
 	//------------------------------------------------------------------------------
 	//... initialize the random numbers
@@ -1836,9 +1890,12 @@ int main (int argc, const char * argv[])
 		//... finish output
 		//------------------------------------------------------------------------------
 
-		if( MUSIC::mpi::is_root() ){
-			the_output_plugin->finalize();
+		// Collective: workers participate in finalize_collective() for plugins
+		// that override it (e.g. gadget2 multi-file). Default impl is rank-0-only.
+		if( the_output_plugin ){
+			the_output_plugin->finalize_collective();
 			delete the_output_plugin;
+			the_output_plugin = NULL;
 		}
 		
 	}catch(std::runtime_error& excp){

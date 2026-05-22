@@ -967,6 +967,18 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 
 	delete the_tf_kernel;
 
+	// Phase D.2b: allocate per-box MeshvarBnd sub-meshes alongside the union
+	// meshes. This is bookkeeping/verification only — the union meshes still
+	// carry all density data consumed by the Poisson solver and output
+	// plugins. D.3 will migrate compute paths to read per-box meshes.
+	if( MUSIC::mpi::is_root() ){
+		delta.populate_per_box_meshes(refh.get_level_boxes());
+		// Phase D.3.1: copy density data from union mesh into per-box meshes
+		// so downstream consumers (D.4 output) can read per-cluster slices.
+		delta.sync_per_box_from_union();
+		delta.log_per_box_stats("density");
+	}
+
 #ifndef SINGLETHREAD_FFTW
 	tend = omp_get_wtime();
 	if (true) //verbosity > 1 )

@@ -5,6 +5,7 @@
 #include "mesh.hh"
 #include "mesh_distributed.hh"
 #include "mpi_fft.hh"
+#include "mg_dist.hh"
 
 #include <cmath>
 #include <cstring>
@@ -156,6 +157,8 @@ void worker_pump()
 		const bool   dec = (meta[5] != 0);
 		if( op == OP_SOLVE || op == OP_GRADIENT ){
 			run_dist_fft_op<fftw_real>(op, dir, NULL, gnx, gny, gnz, dec);
+		} else if( op >= MUSIC::mg::OP_MG_BEGIN && op <= MUSIC::mg::OP_MG_INTERP_CF ){
+			MUSIC::mg::worker_handle(op);
 		} else {
 			LOGERR("MUSIC::poisson::worker_pump: unknown op %d", op);
 			throw std::runtime_error("worker_pump: unknown op");

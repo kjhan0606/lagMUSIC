@@ -197,8 +197,9 @@ public:
 template< typename real_t >
 class stencil_7P : public base_stencil<1,real_t>
 {
-	
+
 public:
+	static const int order = 2;
 	stencil_7P( void )
 	{
 		(*this)( 0, 0, 0) = -6.0;
@@ -233,8 +234,9 @@ public:
 template< typename real_t >
 class stencil_13P : public base_stencil<2,real_t>
 {
-	
+
 public:
+	static const int order = 4;
 	stencil_13P( void )
 	{
 		(*this)( 0, 0, 0) = -90.0/12.;
@@ -282,8 +284,9 @@ public:
 template< typename real_t >
 class stencil_19P : public base_stencil<3,real_t>
 {
-	
+
 public:
+	static const int order = 6;
 	stencil_19P( void )
 	{
 		(*this)( 0, 0, 0) = -1470./180.;

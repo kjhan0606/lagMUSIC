@@ -391,6 +391,9 @@ public:
 	real_t* get_ptr( void )
 	{	return m_pdata;		}
 
+	const real_t* get_ptr( void ) const
+	{	return m_pdata;		}
+
 	// ------------------------------------------------------------------------
 	// Slab-distribution interface (opt-in). See class-level fields above.
 	// ------------------------------------------------------------------------
@@ -596,6 +599,18 @@ public:
 
 
 
+//! one disjoint refinement box at one level (multibox Phase D.2 bookkeeping).
+//! Fields mirror the per-level scalar arrays in refinement_hierarchy but per box.
+//! Declared here (before GridHierarchy) so both classes can reference it.
+struct LevelBox {
+    unsigned oax, oay, oaz;   //!< absolute offset in fine cells at this level
+    unsigned nx,  ny,  nz;    //!< extent in fine cells at this level
+    int      ox,  oy,  oz;    //!< offset relative to parent box (in coarse cells at level-1)
+    double   x0,  y0,  z0;    //!< absolute origin in [0,1)
+    double   xl,  yl,  zl;    //!< extent in [0,1)
+    size_t   parent_idx;      //!< index into level_boxes_[level-1] of the containing parent box
+};
+
 //! class that subsumes a nested grid collection
 template< typename T >
 class GridHierarchy
@@ -610,14 +625,32 @@ public:
 	
 	//! vector of pointers to the underlying rectangular mesh data for each level
 	std::vector< MeshvarBnd<T>* > m_pgrids;
-	
-	std::vector<int> 
+
+	std::vector<int>
 		m_xoffabs,		//!< vector of x-offsets of a level mesh relative to the coarser level
 		m_yoffabs,		//!< vector of x-offsets of a level mesh relative to the coarser level
 		m_zoffabs;		//!< vector of x-offsets of a level mesh relative to the coarser level
-    
+
     std::vector< refinement_mask* > m_ref_masks;
     bool bhave_refmask;
+
+    //-------- per-box meshes (Phase D.2b) --------------------------------
+    //! m_pgrids_per_box_[L][b] is one MeshvarBnd per disjoint sub-mesh at
+    //! level L. Allocated by populate_per_box_meshes(level_boxes). For
+    //! single-box plugins (1 box per level) this carries one mesh per level
+    //! sized identically to m_pgrids[L]. For region=multibox with N
+    //! clusters this carries N small meshes per level. Compute paths still
+    //! consume m_pgrids[L] (union mesh) — D.3 migrates them.
+    std::vector< std::vector<MeshvarBnd<T>*> > m_pgrids_per_box_;
+    //! Per-box absolute offsets (fine cells at this level). Indexing
+    //! matches m_pgrids_per_box_.
+    std::vector< std::vector<int> > m_xoffabs_per_box_, m_yoffabs_per_box_, m_zoffabs_per_box_;
+    //! Phase D.3.2: per-box parent-box index at level L-1, copied from
+    //! LevelBox.parent_idx so the multi-box V-cycle can route each child's
+    //! restrict/prolong into the correct parent mesh when L-1 is itself
+    //! multi-box.
+    std::vector< std::vector<size_t> > m_parent_idx_per_box_;
+    //---------------------------------------------------------------------
 	
 protected:
 	
@@ -704,8 +737,18 @@ public:
             for( size_t i=0; i<gh.m_ref_masks.size(); ++i )
                 m_ref_masks.push_back( new refinement_mask( *(gh.m_ref_masks[i]) ) );
         }
+
+        // Deep-copy per-box meshes (Phase D.2b).
+        m_pgrids_per_box_.assign( gh.m_pgrids_per_box_.size(), std::vector<MeshvarBnd<T>*>() );
+        for( size_t L=0; L<gh.m_pgrids_per_box_.size(); ++L )
+            for( size_t b=0; b<gh.m_pgrids_per_box_[L].size(); ++b )
+                m_pgrids_per_box_[L].push_back( new MeshvarBnd<T>( *gh.m_pgrids_per_box_[L][b] ) );
+        m_xoffabs_per_box_ = gh.m_xoffabs_per_box_;
+        m_yoffabs_per_box_ = gh.m_yoffabs_per_box_;
+        m_zoffabs_per_box_ = gh.m_zoffabs_per_box_;
+        m_parent_idx_per_box_ = gh.m_parent_idx_per_box_;
 	}
-	
+
 	//! destructor
 	~GridHierarchy()
 	{
@@ -719,16 +762,339 @@ public:
 			delete m_pgrids[i];
 		m_pgrids.clear();
 		std::vector< MeshvarBnd<T>* >().swap( m_pgrids );
-		
+
 		m_xoffabs.clear();
 		m_yoffabs.clear();
 		m_zoffabs.clear();
 		m_levelmin = 0;
-        
+
         for( size_t i=0; i<m_ref_masks.size(); ++i )
             delete m_ref_masks[i];
         m_ref_masks.clear();
+
+        deallocate_per_box_meshes();
 	}
+
+	//! release just the per-box mesh allocations (Phase D.2b).
+	void deallocate_per_box_meshes()
+	{
+	    for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+	        for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+	            delete m_pgrids_per_box_[L][b];
+	    m_pgrids_per_box_.clear();
+	    m_parent_idx_per_box_.clear();
+	    m_xoffabs_per_box_.clear();
+	    m_yoffabs_per_box_.clear();
+	    m_zoffabs_per_box_.clear();
+	}
+
+	//! Allocate per-box MeshvarBnd<T> meshes from a per-level box list.
+	//! Replaces any prior per-box allocation. Called once per hierarchy
+	//! after add_patch loop completes; takes a vector view to avoid a
+	//! forward declaration of refinement_hierarchy.
+	void populate_per_box_meshes( const std::vector< std::vector<LevelBox> > & level_boxes )
+	{
+	    deallocate_per_box_meshes();
+	    size_t Lmax = level_boxes.size();
+	    if( Lmax == 0 ) return;
+	    m_pgrids_per_box_.assign(Lmax, std::vector<MeshvarBnd<T>*>());
+	    m_xoffabs_per_box_.assign(Lmax, std::vector<int>());
+	    m_yoffabs_per_box_.assign(Lmax, std::vector<int>());
+	    m_zoffabs_per_box_.assign(Lmax, std::vector<int>());
+	    m_parent_idx_per_box_.assign(Lmax, std::vector<size_t>());
+
+	    size_t total_bytes = 0;
+	    size_t multi_levels = 0;
+
+	    for( size_t L = 0; L < Lmax; ++L )
+	    {
+	        const auto & lvl = level_boxes[L];
+	        for( size_t b = 0; b < lvl.size(); ++b )
+	        {
+	            const LevelBox & bx = lvl[b];
+	            MeshvarBnd<T> * m = new MeshvarBnd<T>(m_nbnd, bx.nx, bx.ny, bx.nz,
+	                                                  (unsigned)bx.ox, (unsigned)bx.oy, (unsigned)bx.oz);
+	            m->zero();
+	            m_pgrids_per_box_[L].push_back(m);
+	            m_xoffabs_per_box_[L].push_back((int)bx.oax);
+	            m_yoffabs_per_box_[L].push_back((int)bx.oay);
+	            m_zoffabs_per_box_[L].push_back((int)bx.oaz);
+	            m_parent_idx_per_box_[L].push_back(bx.parent_idx);
+
+	            size_t span_x = (size_t)bx.nx + 2*m_nbnd;
+	            size_t span_y = (size_t)bx.ny + 2*m_nbnd;
+	            size_t span_z = (size_t)bx.nz + 2*m_nbnd;
+	            total_bytes += sizeof(T) * span_x * span_y * span_z;
+	        }
+	        if( lvl.size() > 1 )
+	        {
+	            ++multi_levels;
+	            LOGINFO("GridHierarchy per-box: level %zu allocated %zu MeshvarBnd<T> (each excl. halo: n=(%u,%u,%u) ...)",
+	                    L, lvl.size(), lvl[0].nx, lvl[0].ny, lvl[0].nz);
+	        }
+	    }
+
+	    if( multi_levels > 0 )
+	        LOGINFO("GridHierarchy::populate_per_box_meshes: per-box total = %.2f MB across %zu multi-box level(s)",
+	                total_bytes / (1024.0*1024.0), multi_levels);
+	}
+
+	//-------- multibox per-box accessors (Phase D.2b) --------------------
+	//! Number of disjoint sub-meshes allocated at level L; 0 if
+	//! populate_per_box_meshes was never called.
+	size_t num_boxes( unsigned ilevel ) const
+	{
+	    if( ilevel >= m_pgrids_per_box_.size() ) return 0;
+	    return m_pgrids_per_box_[ilevel].size();
+	}
+
+	//! Pointer to one per-box mesh (Phase D.2b). Falls back to the union
+	//! mesh when box_id==0 and per-box meshes have not been allocated, so
+	//! existing single-arg get_grid callers keep working.
+	MeshvarBnd<T> * get_grid( unsigned ilevel, size_t box_id )
+	{
+	    if( ilevel >= m_pgrids_per_box_.size() ||
+	        box_id >= m_pgrids_per_box_[ilevel].size() )
+	    {
+	        LOGERR("GridHierarchy::get_grid(%u, %zu): per-box mesh missing", ilevel, box_id);
+	        throw std::runtime_error("GridHierarchy::get_grid: per-box mesh missing");
+	    }
+	    return m_pgrids_per_box_[ilevel][box_id];
+	}
+
+	const MeshvarBnd<T> * get_grid( unsigned ilevel, size_t box_id ) const
+	{
+	    if( ilevel >= m_pgrids_per_box_.size() ||
+	        box_id >= m_pgrids_per_box_[ilevel].size() )
+	    {
+	        LOGERR("GridHierarchy::get_grid(%u, %zu): per-box mesh missing", ilevel, box_id);
+	        throw std::runtime_error("GridHierarchy::get_grid: per-box mesh missing");
+	    }
+	    return m_pgrids_per_box_[ilevel][box_id];
+	}
+
+	int offset_abs( int ilevel, size_t box_id, int idim ) const
+	{
+	    if( idim == 0 ) return m_xoffabs_per_box_.at(ilevel).at(box_id);
+	    if( idim == 1 ) return m_yoffabs_per_box_.at(ilevel).at(box_id);
+	    return m_zoffabs_per_box_.at(ilevel).at(box_id);
+	}
+
+	//! Phase D.3.2: parent-box index at level L-1 for child box b at L.
+	//! Returns 0 if there's only one parent box (always valid then).
+	size_t parent_box_index( unsigned ilevel, size_t box_id ) const
+	{
+	    if( ilevel >= m_parent_idx_per_box_.size() ||
+	        box_id >= m_parent_idx_per_box_[ilevel].size() )
+	        return 0;
+	    return m_parent_idx_per_box_[ilevel][box_id];
+	}
+
+	//! Phase D.3.1: copy per-cluster sub-regions out of the union mesh
+	//! m_pgrids[L] into m_pgrids_per_box_[L][b]. Per-box meshes share the
+	//! same fine-cell coordinate system as the union mesh, so the copy is a
+	//! windowed translation by (dx,dy,dz) = box_oa - union_oa. Cells of the
+	//! per-box mesh that fall outside the union range are zero-filled.
+	//! The halo (m_nbnd) is included in the copy when the corresponding
+	//! union cells exist; otherwise zero. Used by densities.cc post-density
+	//! and main.cc post-Poisson so D.4 output can read from per-box meshes
+	//! without changing the compute path.
+	void sync_per_box_from_union()
+	{
+	    if( m_pgrids_per_box_.empty() ) return;
+
+	    size_t multi_log = 0;
+	    for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+	    {
+	        if( L >= m_pgrids.size() || m_pgrids[L] == NULL ) continue;
+	        if( m_pgrids_per_box_[L].empty() ) continue;
+
+	        MeshvarBnd<T> * um = m_pgrids[L];
+	        int u_oax = m_xoffabs[L];
+	        int u_oay = m_yoffabs[L];
+	        int u_oaz = m_zoffabs[L];
+	        int unx = (int)um->size(0);
+	        int uny = (int)um->size(1);
+	        int unz = (int)um->size(2);
+	        int unbnd = um->m_nbnd;
+
+	        for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+	        {
+	            MeshvarBnd<T> * bm = m_pgrids_per_box_[L][b];
+	            int b_oax = m_xoffabs_per_box_[L][b];
+	            int b_oay = m_yoffabs_per_box_[L][b];
+	            int b_oaz = m_zoffabs_per_box_[L][b];
+	            int bnx = (int)bm->size(0);
+	            int bny = (int)bm->size(1);
+	            int bnz = (int)bm->size(2);
+	            int bnbnd = bm->m_nbnd;
+
+	            int dx = b_oax - u_oax;
+	            int dy = b_oay - u_oay;
+	            int dz = b_oaz - u_oaz;
+
+	            for( int i=-bnbnd; i<bnx+bnbnd; ++i )
+	            {
+	                int ui = i + dx;
+	                for( int j=-bnbnd; j<bny+bnbnd; ++j )
+	                {
+	                    int uj = j + dy;
+	                    for( int k=-bnbnd; k<bnz+bnbnd; ++k )
+	                    {
+	                        int uk = k + dz;
+	                        if( ui<-unbnd || ui>=unx+unbnd ||
+	                            uj<-unbnd || uj>=uny+unbnd ||
+	                            uk<-unbnd || uk>=unz+unbnd )
+	                            (*bm)(i,j,k) = T(0);
+	                        else
+	                            (*bm)(i,j,k) = (*um)(ui,uj,uk);
+	                    }
+	                }
+	            }
+	        }
+
+	        if( m_pgrids_per_box_[L].size() > 1 ) ++multi_log;
+	    }
+
+	    if( multi_log > 0 )
+	        LOGUSER("GridHierarchy::sync_per_box_from_union: synced %zu multi-box level(s)",
+	                multi_log);
+	}
+
+	//! Phase D.3.2: reverse of sync_per_box_from_union. Copies the interior
+	//! of each per-box mesh back into the corresponding window of the union
+	//! mesh m_pgrids[L]. Used at end of the multi-box V-cycle so downstream
+	//! consumers that still read the union mesh (gradient, output, mask)
+	//! see the per-cluster solution. Halo cells are NOT pushed back (the
+	//! union mesh has its own halo updated by neighbouring per-box meshes
+	//! and by the make_periodic / coarse-fine BC machinery).
+	//!
+	//! Only multi-box levels (>1 sub-mesh) are synced. Single-box levels
+	//! are owned by the union compute path; their per-box mesh is allocated
+	//! for bookkeeping but never written by the solver, so copying it back
+	//! would wipe the union solution to zero.
+	void sync_union_from_per_box()
+	{
+	    if( m_pgrids_per_box_.empty() ) return;
+	    for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+	    {
+	        if( L >= m_pgrids.size() || m_pgrids[L] == NULL ) continue;
+	        if( m_pgrids_per_box_[L].size() <= 1 ) continue;
+	        MeshvarBnd<T> * um = m_pgrids[L];
+	        int u_oax = m_xoffabs[L];
+	        int u_oay = m_yoffabs[L];
+	        int u_oaz = m_zoffabs[L];
+	        int unx = (int)um->size(0);
+	        int uny = (int)um->size(1);
+	        int unz = (int)um->size(2);
+	        for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+	        {
+	            MeshvarBnd<T> * bm = m_pgrids_per_box_[L][b];
+	            int b_oax = m_xoffabs_per_box_[L][b];
+	            int b_oay = m_yoffabs_per_box_[L][b];
+	            int b_oaz = m_zoffabs_per_box_[L][b];
+	            int bnx = (int)bm->size(0);
+	            int bny = (int)bm->size(1);
+	            int bnz = (int)bm->size(2);
+	            int dx = b_oax - u_oax;
+	            int dy = b_oay - u_oay;
+	            int dz = b_oaz - u_oaz;
+	            for( int i=0; i<bnx; ++i ){
+	                int ui = i+dx;
+	                if( ui<0 || ui>=unx ) continue;
+	                for( int j=0; j<bny; ++j ){
+	                    int uj = j+dy;
+	                    if( uj<0 || uj>=uny ) continue;
+	                    for( int k=0; k<bnz; ++k ){
+	                        int uk = k+dz;
+	                        if( uk<0 || uk>=unz ) continue;
+	                        (*um)(ui,uj,uk) = (*bm)(i,j,k);
+	                    }
+	                }
+	            }
+	        }
+	    }
+	}
+
+	//! D.3.3: at multi-box levels (where the per-cluster V-cycle leaves the
+	//! union mesh's gap cells uninitialized), pre-fill the entire union L from
+	//! the coarse parent union L-1 via nearest-coarse prolongation. After this
+	//! call, downstream code that writes per-cluster fine values into the
+	//! cluster cells (sync_union_from_per_box) will produce a union that is
+	//! coarse-prolonged at gap cells and fine per-cluster at cluster cells,
+	//! avoiding the cluster-to-zero discontinuity that distorts gradients.
+	//!
+	//! Iterates multi-box levels in ascending order so each level reads a
+	//! fully-populated L-1 union (single-box L-1 already has the solver result;
+	//! multi-box L-1 was filled by this routine's earlier iteration).
+	void fill_union_gap_from_coarse()
+	{
+	    if( m_pgrids_per_box_.empty() ) return;
+	    for( size_t L=1; L<m_pgrids_per_box_.size(); ++L )
+	    {
+	        if( L >= m_pgrids.size() || m_pgrids[L] == NULL ) continue;
+	        if( m_pgrids_per_box_[L].size() <= 1 ) continue;
+	        MeshvarBnd<T> * um = m_pgrids[L];
+	        MeshvarBnd<T> * uc = m_pgrids[L-1];
+	        if( uc == NULL ) continue;
+	        int u_oax=m_xoffabs[L], u_oay=m_yoffabs[L], u_oaz=m_zoffabs[L];
+	        int c_oax=m_xoffabs[L-1], c_oay=m_yoffabs[L-1], c_oaz=m_zoffabs[L-1];
+	        int unx=(int)um->size(0), uny=(int)um->size(1), unz=(int)um->size(2);
+	        int cnx=(int)uc->size(0), cny=(int)uc->size(1), cnz=(int)uc->size(2);
+	        int unbnd = um->m_nbnd;
+	        int cnbnd = uc->m_nbnd;
+	        for( int i=-unbnd; i<unx+unbnd; ++i ){
+	            int gf_i = i + u_oax;
+	            // floor-div by 2 (handle negative correctly)
+	            int gc_i = (gf_i>=0) ? (gf_i>>1) : -(((-gf_i)+1)>>1);
+	            int ci = gc_i - c_oax;
+	            if( ci<-cnbnd || ci>=cnx+cnbnd ) continue;
+	            for( int j=-unbnd; j<uny+unbnd; ++j ){
+	                int gf_j = j + u_oay;
+	                int gc_j = (gf_j>=0) ? (gf_j>>1) : -(((-gf_j)+1)>>1);
+	                int cj = gc_j - c_oay;
+	                if( cj<-cnbnd || cj>=cny+cnbnd ) continue;
+	                for( int k=-unbnd; k<unz+unbnd; ++k ){
+	                    int gf_k = k + u_oaz;
+	                    int gc_k = (gf_k>=0) ? (gf_k>>1) : -(((-gf_k)+1)>>1);
+	                    int ck = gc_k - c_oaz;
+	                    if( ck<-cnbnd || ck>=cnz+cnbnd ) continue;
+	                    (*um)(i,j,k) = (*uc)(ci,cj,ck);
+	                }
+	            }
+	        }
+	    }
+	}
+
+	//! Phase D.3.1: per-cluster mean/sigma over the interior (no halo) of
+	//! each per-box mesh, plus the corresponding union sub-window mean/sigma
+	//! for cross-check. Logged only at multi-box levels. Diagnostic only.
+	void log_per_box_stats( const char * tag ) const
+	{
+	    for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+	    {
+	        if( m_pgrids_per_box_[L].size() <= 1 ) continue;
+	        for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+	        {
+	            const MeshvarBnd<T> * bm = m_pgrids_per_box_[L][b];
+	            int bnx=(int)bm->size(0), bny=(int)bm->size(1), bnz=(int)bm->size(2);
+	            double sum=0.0, sq=0.0;
+	            size_t ncell=0;
+	            for( int i=0; i<bnx; ++i )
+	                for( int j=0; j<bny; ++j )
+	                    for( int k=0; k<bnz; ++k ){
+	                        double v = (double)(*bm)(i,j,k);
+	                        sum += v; sq += v*v; ++ncell;
+	                    }
+	            double mean = ncell ? sum/ncell : 0.0;
+	            double var  = ncell ? (sq/ncell - mean*mean) : 0.0;
+	            double sd   = var>0 ? std::sqrt(var) : 0.0;
+	            LOGINFO("%s per-box stats L=%zu b=%zu n=(%d,%d,%d) mean=%.6e sigma=%.6e",
+	                    tag, L, b, bnx, bny, bnz, mean, sd);
+	        }
+	    }
+	}
+	//---------------------------------------------------------------------
     
     
     // meaning of the mask:
@@ -960,6 +1326,11 @@ public:
 	{
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			m_pgrids[i]->zero();
+		// Phase D.3.2: also clear per-box meshes so the per-cluster
+		// V-cycle starts from u=0 (matching the union path).
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+				m_pgrids_per_box_[L][b]->zero();
 	}
 	
 	
@@ -1033,33 +1404,46 @@ public:
 	{
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) *= x;
+		// D.3.3 proper: per-box meshes are peer storage at multi-box levels.
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+				(*m_pgrids_per_box_[L][b]) *= x;
 		return *this;
 	}
-	
+
 	//! divide entire grid hierarchy by a constant
 	GridHierarchy<T>& operator/=( T x )
 	{
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) /= x;
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+				(*m_pgrids_per_box_[L][b]) /= x;
 		return *this;
 	}
-	
+
 	//! add a constant to the entire grid hierarchy
 	GridHierarchy<T>& operator+=( T x )
 	{
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) += x;
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+				(*m_pgrids_per_box_[L][b]) += x;
 		return *this;
 	}
-	
+
 	//! subtract a constant from the entire grid hierarchy
 	GridHierarchy<T>& operator-=( T x )
 	{
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) -= x;
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+				(*m_pgrids_per_box_[L][b]) -= x;
 		return *this;
 	}
-	
+
 	//! multiply (element-wise) two grid hierarchies
 	GridHierarchy<T>& operator*=( const GridHierarchy<T>& gh )
 	{
@@ -1070,6 +1454,11 @@ public:
 		}
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) *= *gh.get_grid(i);
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			if( L < gh.m_pgrids_per_box_.size()
+				&& gh.m_pgrids_per_box_[L].size() == m_pgrids_per_box_[L].size() )
+				for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+					(*m_pgrids_per_box_[L][b]) *= *gh.m_pgrids_per_box_[L][b];
 		return *this;
 	}
 	
@@ -1083,20 +1472,30 @@ public:
 		}
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) /= *gh.get_grid(i);
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			if( L < gh.m_pgrids_per_box_.size()
+				&& gh.m_pgrids_per_box_[L].size() == m_pgrids_per_box_[L].size() )
+				for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+					(*m_pgrids_per_box_[L][b]) /= *gh.m_pgrids_per_box_[L][b];
 		return *this;
 	}
-	
+
 	//! add (element-wise) two grid hierarchies
 	GridHierarchy<T>& operator+=( const GridHierarchy<T>& gh )
 	{
 		if( !is_consistent(gh) )
 			throw std::runtime_error("GridHierarchy::operator+= : attempt to operate on incompatible data");
-		
+
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) += *gh.get_grid(i);
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			if( L < gh.m_pgrids_per_box_.size()
+				&& gh.m_pgrids_per_box_[L].size() == m_pgrids_per_box_[L].size() )
+				for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+					(*m_pgrids_per_box_[L][b]) += *gh.m_pgrids_per_box_[L][b];
 		return *this;
 	}
-	
+
 	//! subtract (element-wise) two grid hierarchies
 	GridHierarchy<T>& operator-=( const GridHierarchy<T>& gh )
 	{
@@ -1107,6 +1506,11 @@ public:
 		}
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) -= *gh.get_grid(i);
+		for( size_t L=0; L<m_pgrids_per_box_.size(); ++L )
+			if( L < gh.m_pgrids_per_box_.size()
+				&& gh.m_pgrids_per_box_[L].size() == m_pgrids_per_box_[L].size() )
+				for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b )
+					(*m_pgrids_per_box_[L][b]) -= *gh.m_pgrids_per_box_[L][b];
 		return *this;
 	}
 	
@@ -1132,17 +1536,33 @@ public:
 				m_pgrids.push_back( new MeshvarBnd<T>( *gh.m_pgrids[i] ) );
 			m_levelmin = gh.levelmin();
 			m_nbnd = gh.m_nbnd;
-			
+
 			m_xoffabs = gh.m_xoffabs;
 			m_yoffabs = gh.m_yoffabs;
 			m_zoffabs = gh.m_zoffabs;
-			
-			
+
+			// Per-box meshes (Phase D.2b) — deep copy with replace.
+			deallocate_per_box_meshes();
+			m_pgrids_per_box_.assign( gh.m_pgrids_per_box_.size(), std::vector<MeshvarBnd<T>*>() );
+			for( size_t L=0; L<gh.m_pgrids_per_box_.size(); ++L )
+				for( size_t b=0; b<gh.m_pgrids_per_box_[L].size(); ++b )
+					m_pgrids_per_box_[L].push_back( new MeshvarBnd<T>( *gh.m_pgrids_per_box_[L][b] ) );
+			m_xoffabs_per_box_ = gh.m_xoffabs_per_box_;
+			m_yoffabs_per_box_ = gh.m_yoffabs_per_box_;
+			m_zoffabs_per_box_ = gh.m_zoffabs_per_box_;
+			m_parent_idx_per_box_ = gh.m_parent_idx_per_box_;
+
 			return *this;
 		}//throw std::runtime_error("GridHierarchy::operator= : attempt to operate on incompatible data");
-		
+
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
 			(*m_pgrids[i]) = *gh.get_grid(i);
+
+		// Per-box meshes — element-wise assign if sizes match (consistent path).
+		for( size_t L=0; L<m_pgrids_per_box_.size() && L<gh.m_pgrids_per_box_.size(); ++L )
+			for( size_t b=0; b<m_pgrids_per_box_[L].size() && b<gh.m_pgrids_per_box_[L].size(); ++b )
+				(*m_pgrids_per_box_[L][b]) = *gh.m_pgrids_per_box_[L][b];
+
 		return *this;
 	}
 	
@@ -1353,8 +1773,8 @@ class refinement_hierarchy
 		xl_,	//!< x-extent of grids (in [0..1[)
 		yl_,	//!< y-extent of grids (in [0..1[)
 		zl_;	//!< z-extent of grids (in [0..1[)
-	
-	std::vector<unsigned> 
+
+	std::vector<unsigned>
 		ox_,	//!< relative x-coordinates of grid origins (in coarser grid cells)
 		oy_,	//!< relative y-coordinates of grid origins (in coarser grid cells)
 		oz_,	//!< relative z-coordinates of grid origins (in coarser grid cells)
@@ -1364,6 +1784,15 @@ class refinement_hierarchy
 		nx_,	//!< x-extent of grids (in fine grid cells)
 		ny_,	//!< y-extent of grids (in fine grid cells)
 		nz_;	//!< z-extent of grids (in fine grid cells)
+
+	//! Per-level list of disjoint refinement boxes (multibox Phase D.2 bookkeeping).
+	//! For single-box plugins (or single connected component), level_boxes_[L] has one
+	//! entry equal to the union arrays at level L — so legacy compute paths stay
+	//! bit-identical. For region=multibox with N>1 clusters, level_boxes_[L] holds the
+	//! N disjoint cluster sub-AABBs (post align/pad/blocking). Compute paths still
+	//! consume the union arrays in D.2a; per-box GridHierarchy meshes / per-box
+	//! Poisson V-cycle are wired up in D.2b / D.3.
+	std::vector< std::vector<LevelBox> > level_boxes_;
 	
 	unsigned 
 		levelmin_,		//!< minimum grid level for Poisson solver
@@ -1427,8 +1856,28 @@ public:
 	      
 	      LOGINFO("refinement region is \'%s\', w/ bounding box\n        left = [%f,%f,%f]\n       right = [%f,%f,%f]",
 		      region_type.c_str(),x0ref_[0],x0ref_[1],x0ref_[2],x1ref[0],x1ref[1],x1ref[2]);
-	      
-	      
+
+	      // Diagnostic: report per-level disjoint refinement boxes as seen by the region
+	      // generator. Most plugins return 1 (single union bbox); region=multibox exposes
+	      // the true connected-component count after Phase D.1 of the multibox refactor.
+	      // Mesh allocation still consumes the union bbox here — disjoint sub-meshes will
+	      // be plumbed through in Phase D.2.
+	      for( unsigned L = levelmin_+1; L <= levelmax_; ++L )
+	      {
+	          size_t nb = the_region_generator->get_num_boxes(L);
+	          if( nb > 1 )
+	          {
+	              LOGINFO("Level %u: %zu disjoint refinement box(es)", L, nb);
+	              for( size_t b = 0; b < nb; ++b )
+	              {
+	                  double l[3], r[3];
+	                  the_region_generator->get_AABB_box(l, r, L, b);
+	                  LOGINFO("  box %zu: [%.4f,%.4f] x [%.4f,%.4f] x [%.4f,%.4f]",
+	                          b, l[0], r[0], l[1], r[1], l[2], r[2]);
+	              }
+	          }
+	      }
+
 	      bhave_nref = the_region_generator->is_grid_dim_forced( lnref_ );
 	    }
 	  
@@ -1786,7 +2235,180 @@ public:
 	  double left[3] =  { x0_[levelmax_]+rshift_[0], y0_[levelmax_]+rshift_[1], z0_[levelmax_]+rshift_[2] };
 	  double right[3] = { left[0]+xl_[levelmax_], left[1]+yl_[levelmax_], left[2]+zl_[levelmax_] };
       the_region_generator->update_AABB( left, right );
+
+	  //==================================================================
+	  // Phase D.2a: populate per-box LevelBox storage.
+	  //
+	  // For single-box plugins (default get_num_boxes==1) level_boxes_[L][0]
+	  // is just a copy of the existing union arrays — zoom paths remain
+	  // bit-identical because no compute path consumes level_boxes_ yet.
+	  // For region=multibox with N>1 connected components level_boxes_[L]
+	  // holds the N disjoint sub-AABBs after align/pad/blocking. Future
+	  // GridHierarchy per-box allocation (D.2b) and per-box Poisson V-cycle
+	  // (D.3) will read these.
+	  //==================================================================
+	  populate_level_boxes();
 	}
+
+private:
+	//! Mirror a single-box level (union arrays) into level_boxes_[L] as one entry.
+	void push_union_as_single_box( unsigned L )
+	{
+	    LevelBox bx;
+	    bx.oax = oax_[L]; bx.oay = oay_[L]; bx.oaz = oaz_[L];
+	    bx.nx  = nx_[L];  bx.ny  = ny_[L];  bx.nz  = nz_[L];
+	    bx.ox  = (int)ox_[L]; bx.oy  = (int)oy_[L]; bx.oz  = (int)oz_[L];
+	    bx.x0  = x0_[L];  bx.y0  = y0_[L];  bx.z0  = z0_[L];
+	    bx.xl  = xl_[L];  bx.yl  = yl_[L];  bx.zl  = zl_[L];
+	    bx.parent_idx = 0;
+	    level_boxes_[L].push_back(bx);
+	}
+
+	//! Apply the same coarser-grid / blocking_factor alignment that the union
+	//! path uses at lines 1547-1605 (levelmax) and 1685-1718 (coarser), to
+	//! one box at level L given by integer fine-cell bounds [il,ir)x[jl,jr)x[kl,kr).
+	void align_box_inplace( unsigned L, int &il, int &jl, int &kl,
+	                                     int &ir, int &jr, int &kr ) const
+	{
+	    int nresL = 1<<L;
+	    if( align_top_ )
+	    {
+	        unsigned nref = (L == levelmax_) ? (1u<<(levelmax_-levelmin_+1))
+	                                          : (1u<<(L-levelmin_));
+	        il = (int)((double)il/nref)*nref;
+	        jl = (int)((double)jl/nref)*nref;
+	        kl = (int)((double)kl/nref)*nref;
+	        int irr = (int)((double)ir/nref)*nref;
+	        int jrr = (int)((double)jr/nref)*nref;
+	        int krr = (int)((double)kr/nref)*nref;
+	        ir = (irr < ir) ? (int)((double)ir/nref + 1.0)*nref : irr;
+	        jr = (jrr < jr) ? (int)((double)jr/nref + 1.0)*nref : jrr;
+	        kr = (krr < kr) ? (int)((double)kr/nref + 1.0)*nref : krr;
+	    } else {
+	        il -= il%2; jl -= jl%2; kl -= kl%2;
+	        ir += ir%2; jr += jr%2; kr += kr%2;
+	    }
+	    if( blocking_factor_ ) {
+	        unsigned coarse_block = 2u * blocking_factor_;
+	        il -= il % coarse_block;
+	        jl -= jl % coarse_block;
+	        kl -= kl % coarse_block;
+	        ir += (nresL - ir) % coarse_block;
+	        jr += (nresL - jr) % coarse_block;
+	        kr += (nresL - kr) % coarse_block;
+	    }
+	}
+
+	void populate_level_boxes( void )
+	{
+	    level_boxes_.assign(levelmax_+1, std::vector<LevelBox>());
+
+	    // Levels [0, levelmin_]: full periodic domain, single box.
+	    for( unsigned L = 0; L <= levelmin_; ++L )
+	    {
+	        unsigned n = 1u<<L;
+	        LevelBox bx;
+	        bx.oax = bx.oay = bx.oaz = 0;
+	        bx.nx  = bx.ny  = bx.nz  = n;
+	        bx.ox  = bx.oy  = bx.oz  = 0;
+	        bx.x0  = bx.y0  = bx.z0 = 0.0;
+	        bx.xl  = bx.yl  = bx.zl = 1.0;
+	        bx.parent_idx = 0;
+	        level_boxes_[L].push_back(bx);
+	    }
+
+	    if( levelmin_ == levelmax_ ) return;
+
+	    // Levels [levelmin_+1, levelmax_]: ask the region generator for the
+	    // disjoint boxes, run the same alignment/blocking logic the union
+	    // path used at the finest level, and attach each to its parent.
+	    for( unsigned L = levelmin_+1; L <= levelmax_; ++L )
+	    {
+	        size_t nb = the_region_generator->get_num_boxes(L);
+
+	        // Single-box plugin (default) → mirror the union arrays so that
+	        // legacy callers asking the per-box accessors get identical
+	        // numbers as the legacy scalar accessors.
+	        if( nb <= 1 ) { push_union_as_single_box(L); continue; }
+
+	        int nresL = 1<<L;
+	        double shift_norm[3] = {
+	            (double)xshift_[0]/(double)(1u<<levelmin_),
+	            (double)xshift_[1]/(double)(1u<<levelmin_),
+	            (double)xshift_[2]/(double)(1u<<levelmin_),
+	        };
+
+	        for( size_t b = 0; b < nb; ++b )
+	        {
+	            double l[3], r[3];
+	            the_region_generator->get_AABB_box(l, r, L, b);
+	            for( int d=0; d<3; ++d ) { l[d] += shift_norm[d]; r[d] += shift_norm[d]; }
+
+	            int il = (int)(l[0]*nresL), jl = (int)(l[1]*nresL), kl = (int)(l[2]*nresL);
+	            int ir = (int)(r[0]*nresL), jr = (int)(r[1]*nresL), kr = (int)(r[2]*nresL);
+
+	            // Mirror the union-path "ir = il+lnref" forced size only when
+	            // user pinned grid dims — keep it simple here and skip.
+	            align_box_inplace(L, il, jl, kl, ir, jr, kr);
+
+	            // Wrap into [0,nresL). Same minimal handling the union path does.
+	            il = (il + nresL) % nresL;
+	            jl = (jl + nresL) % nresL;
+	            kl = (kl + nresL) % nresL;
+	            if( ir <= il ) ir = il + 1;
+	            if( jr <= jl ) jr = jl + 1;
+	            if( kr <= kl ) kr = kl + 1;
+
+	            LevelBox bx;
+	            bx.oax = (unsigned)il;
+	            bx.oay = (unsigned)jl;
+	            bx.oaz = (unsigned)kl;
+	            bx.nx  = (unsigned)(ir - il);
+	            bx.ny  = (unsigned)(jr - jl);
+	            bx.nz  = (unsigned)(kr - kl);
+
+	            double h = 1.0/(double)nresL;
+	            bx.x0 = h*(double)bx.oax;
+	            bx.y0 = h*(double)bx.oay;
+	            bx.z0 = h*(double)bx.oaz;
+	            bx.xl = h*(double)bx.nx;
+	            bx.yl = h*(double)bx.ny;
+	            bx.zl = h*(double)bx.nz;
+
+	            // Parent box: the level-(L-1) box that contains this one.
+	            // Containment in fine cells at level L (parent's cells doubled).
+	            bx.parent_idx = 0;
+	            const auto & parents = level_boxes_[L-1];
+	            for( size_t p = 0; p < parents.size(); ++p )
+	            {
+	                unsigned pox = parents[p].oax * 2, poy = parents[p].oay * 2, poz = parents[p].oaz * 2;
+	                unsigned pnx = parents[p].nx  * 2, pny = parents[p].ny  * 2, pnz = parents[p].nz  * 2;
+	                if( bx.oax >= pox && bx.oax + bx.nx <= pox + pnx &&
+	                    bx.oay >= poy && bx.oay + bx.ny <= poy + pny &&
+	                    bx.oaz >= poz && bx.oaz + bx.nz <= poz + pnz )
+	                { bx.parent_idx = p; break; }
+	            }
+
+	            const LevelBox & parent = level_boxes_[L-1][bx.parent_idx];
+	            bx.ox = (int)(bx.oax/2) - (int)parent.oax;
+	            bx.oy = (int)(bx.oay/2) - (int)parent.oay;
+	            bx.oz = (int)(bx.oaz/2) - (int)parent.oaz;
+
+	            level_boxes_[L].push_back(bx);
+	        }
+
+	        LOGINFO("Multibox allocator: level %u → %zu disjoint sub-mesh(es) (post align/blocking)", L, level_boxes_[L].size());
+	        for( size_t b = 0; b < level_boxes_[L].size(); ++b )
+	        {
+	            const LevelBox & bx = level_boxes_[L][b];
+	            LOGINFO("    box %zu: oax=(%u,%u,%u) n=(%u,%u,%u) parent=%zu  rel_off=(%d,%d,%d)",
+	                    b, bx.oax, bx.oay, bx.oaz, bx.nx, bx.ny, bx.nz, bx.parent_idx,
+	                    bx.ox, bx.oy, bx.oz);
+	        }
+	    }
+	}
+
+public:
   
   //! asignment operator
   refinement_hierarchy& operator=( const refinement_hierarchy& o )
@@ -1809,7 +2431,8 @@ public:
     ox_ = o.ox_; oy_ = o.oy_; oz_ = o.oz_;
     oax_= o.oax_; oay_ = o.oay_; oaz_ = o.oaz_;
     nx_ = o.nx_; ny_=o.ny_; nz_=o.nz_;
-    
+    level_boxes_ = o.level_boxes_;
+
     return *this;
   }
 	
@@ -1913,7 +2536,61 @@ public:
 			return ny_.at(ilevel);
 		return nz_.at(ilevel);
 	}
-	
+
+	//-------- multibox per-box accessors (Phase D.2) ---------------------
+	//! Number of disjoint sub-meshes at the given level. 1 for single-box
+	//! plugins; N for region=multibox with N connected components.
+	size_t num_boxes( unsigned ilevel ) const
+	{
+	    if( ilevel >= level_boxes_.size() ) return 0;
+	    return level_boxes_[ilevel].size();
+	}
+
+	//! Read-only access to one LevelBox at (level, box_id).
+	const LevelBox & level_box( unsigned ilevel, size_t box_id ) const
+	{
+	    return level_boxes_.at(ilevel).at(box_id);
+	}
+
+	//! Per-box absolute offset (fine cells at this level), dim ∈ {0,1,2}.
+	unsigned offset_abs( unsigned ilevel, size_t box_id, int dim ) const
+	{
+	    const LevelBox & b = level_boxes_.at(ilevel).at(box_id);
+	    if( dim==0 ) return b.oax;
+	    if( dim==1 ) return b.oay;
+	    return b.oaz;
+	}
+
+	//! Per-box size in fine cells at this level, dim ∈ {0,1,2}.
+	size_t size( unsigned ilevel, size_t box_id, int dim ) const
+	{
+	    const LevelBox & b = level_boxes_.at(ilevel).at(box_id);
+	    if( dim==0 ) return b.nx;
+	    if( dim==1 ) return b.ny;
+	    return b.nz;
+	}
+
+	//! Per-box offset relative to parent box (in coarse cells at level-1).
+	int offset( unsigned ilevel, size_t box_id, int dim ) const
+	{
+	    const LevelBox & b = level_boxes_.at(ilevel).at(box_id);
+	    if( dim==0 ) return b.ox;
+	    if( dim==1 ) return b.oy;
+	    return b.oz;
+	}
+
+	//! Index (in level_boxes_[ilevel-1]) of this box's parent.
+	size_t parent_box_index( unsigned ilevel, size_t box_id ) const
+	{
+	    return level_boxes_.at(ilevel).at(box_id).parent_idx;
+	}
+
+	//! Raw view of the per-level per-box bookkeeping (used by
+	//! GridHierarchy::populate_per_box_meshes to avoid a forward-decl).
+	const std::vector< std::vector<LevelBox> > & get_level_boxes( void ) const
+	{   return level_boxes_; }
+	//---------------------------------------------------------------------
+
 	//! get minimum grid level (the level for which the grid covers the entire domain)
 	unsigned levelmin( void ) const
 	{	return levelmin_;	}

@@ -16,6 +16,7 @@
 
 #include "general.hh"
 #include "mesh.hh"
+#include "mpi_helper.hh"
 
 
 /*!
@@ -119,6 +120,16 @@ public:
 	
 	//! purely virtual prototype for all things to be done at the very end
 	virtual void finalize( void ) = 0;
+
+	//! collective finalize entry point — called on ALL ranks after every write_*
+	//  call has returned. Default behavior: rank 0 runs finalize() and workers
+	//  no-op, matching the legacy rank-0-only plugin instantiation in main.cc.
+	//  Plugins that opt in to all-rank instantiation (currently only gadget2)
+	//  override this to parallelize the final write phase across ranks.
+	virtual void finalize_collective( void )
+	{
+		if( MUSIC::mpi::is_root() ) this->finalize();
+	}
 };
 
 /*!

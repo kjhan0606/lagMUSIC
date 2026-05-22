@@ -2,6 +2,7 @@
 #define __REGION_GENERATOR_HH
 
 #include <vector>
+#include <stdexcept>
 #include "config_file.hh"
 
 //! Abstract base class for region generators
@@ -42,6 +43,23 @@ public:
   
     //! update the highres bounding box to what the grid generator actually uses
     virtual void update_AABB( double *left, double *right ) = 0;
+
+    //! number of disjoint refinement boxes at the given level (default: 1, i.e. only the union bbox).
+    //! Plugins that natively support disjoint sub-meshes (e.g. multibox) override this.
+    virtual size_t get_num_boxes( unsigned /*level*/ )
+    {
+        return 1;
+    }
+
+    //! AABB of the (box_id)-th disjoint refinement box at the given level.
+    //! Default forwards to get_AABB() for box_id==0 and throws otherwise; multi-box-aware
+    //! plugins override.
+    virtual void get_AABB_box( double *left, double *right, unsigned level, size_t box_id )
+    {
+        if( box_id != 0 )
+            throw std::runtime_error("region_generator: get_AABB_box: this plugin only exposes a single bounding box");
+        get_AABB( left, right, level );
+    }
 };
 
 //! Implements abstract factory design pattern for region generator plug-ins

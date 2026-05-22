@@ -1016,56 +1016,6 @@ public:
 	    }
 	}
 
-	//! D.3.3: at multi-box levels (where the per-cluster V-cycle leaves the
-	//! union mesh's gap cells uninitialized), pre-fill the entire union L from
-	//! the coarse parent union L-1 via nearest-coarse prolongation. After this
-	//! call, downstream code that writes per-cluster fine values into the
-	//! cluster cells (sync_union_from_per_box) will produce a union that is
-	//! coarse-prolonged at gap cells and fine per-cluster at cluster cells,
-	//! avoiding the cluster-to-zero discontinuity that distorts gradients.
-	//!
-	//! Iterates multi-box levels in ascending order so each level reads a
-	//! fully-populated L-1 union (single-box L-1 already has the solver result;
-	//! multi-box L-1 was filled by this routine's earlier iteration).
-	void fill_union_gap_from_coarse()
-	{
-	    if( m_pgrids_per_box_.empty() ) return;
-	    for( size_t L=1; L<m_pgrids_per_box_.size(); ++L )
-	    {
-	        if( L >= m_pgrids.size() || m_pgrids[L] == NULL ) continue;
-	        if( m_pgrids_per_box_[L].size() <= 1 ) continue;
-	        MeshvarBnd<T> * um = m_pgrids[L];
-	        MeshvarBnd<T> * uc = m_pgrids[L-1];
-	        if( uc == NULL ) continue;
-	        int u_oax=m_xoffabs[L], u_oay=m_yoffabs[L], u_oaz=m_zoffabs[L];
-	        int c_oax=m_xoffabs[L-1], c_oay=m_yoffabs[L-1], c_oaz=m_zoffabs[L-1];
-	        int unx=(int)um->size(0), uny=(int)um->size(1), unz=(int)um->size(2);
-	        int cnx=(int)uc->size(0), cny=(int)uc->size(1), cnz=(int)uc->size(2);
-	        int unbnd = um->m_nbnd;
-	        int cnbnd = uc->m_nbnd;
-	        for( int i=-unbnd; i<unx+unbnd; ++i ){
-	            int gf_i = i + u_oax;
-	            // floor-div by 2 (handle negative correctly)
-	            int gc_i = (gf_i>=0) ? (gf_i>>1) : -(((-gf_i)+1)>>1);
-	            int ci = gc_i - c_oax;
-	            if( ci<-cnbnd || ci>=cnx+cnbnd ) continue;
-	            for( int j=-unbnd; j<uny+unbnd; ++j ){
-	                int gf_j = j + u_oay;
-	                int gc_j = (gf_j>=0) ? (gf_j>>1) : -(((-gf_j)+1)>>1);
-	                int cj = gc_j - c_oay;
-	                if( cj<-cnbnd || cj>=cny+cnbnd ) continue;
-	                for( int k=-unbnd; k<unz+unbnd; ++k ){
-	                    int gf_k = k + u_oaz;
-	                    int gc_k = (gf_k>=0) ? (gf_k>>1) : -(((-gf_k)+1)>>1);
-	                    int ck = gc_k - c_oaz;
-	                    if( ck<-cnbnd || ck>=cnz+cnbnd ) continue;
-	                    (*um)(i,j,k) = (*uc)(ci,cj,ck);
-	                }
-	            }
-	        }
-	    }
-	}
-
 	//! Phase D.3.1: per-cluster mean/sigma over the interior (no halo) of
 	//! each per-box mesh, plus the corresponding union sub-window mean/sigma
 	//! for cross-check. Logged only at multi-box levels. Diagnostic only.
@@ -2219,15 +2169,37 @@ public:
 	  
 	  
 	  
-	  // do a consistency check that largest subgrid in zoom is not larger than half the box size
+	  // do a consistency check that largest subgrid in zoom is not larger than half the box size.
+	  // For multibox runs with >1 disjoint cluster, this check applies to each per-box AABB
+	  // independently rather than to the union (the legacy union mesh is allowed to span more
+	  // than half the box because real compute now happens on the per-box sub-meshes).
 	  for( unsigned ilevel=levelmin_+1; ilevel<=levelmax_; ++ilevel )
-	    {	
-	      if( nx_[ilevel] > (1ul<<(ilevel-1)) ||
-		  ny_[ilevel] > (1ul<<(ilevel-1)) ||
-		  nz_[ilevel] > (1ul<<(ilevel-1)) )
+	    {
+	      const size_t nb = the_region_generator->get_num_boxes(ilevel);
+	      if( nb <= 1 )
 		{
-		  LOGERR("On level %d, subgrid is larger than half the box. This is not allowed!",ilevel);
-		  throw std::runtime_error("Fatal: Subgrid larger than half boxin zoom.");
+		  if( nx_[ilevel] > (1ul<<(ilevel-1)) ||
+		      ny_[ilevel] > (1ul<<(ilevel-1)) ||
+		      nz_[ilevel] > (1ul<<(ilevel-1)) )
+		    {
+		      LOGERR("On level %d, subgrid is larger than half the box. This is not allowed!",ilevel);
+		      throw std::runtime_error("Fatal: Subgrid larger than half boxin zoom.");
+		    }
+		}
+	      else
+		{
+		  for( size_t b=0; b<nb; ++b )
+		    {
+		      double l[3], r[3];
+		      the_region_generator->get_AABB_box(l, r, ilevel, b);
+		      const double half = 0.5;
+		      if( (r[0]-l[0]) > half || (r[1]-l[1]) > half || (r[2]-l[2]) > half )
+			{
+			  LOGERR("On level %d, multibox cluster %zu spans >half the box (%.4f,%.4f,%.4f). Not allowed!",
+				 ilevel, b, r[0]-l[0], r[1]-l[1], r[2]-l[2]);
+			  throw std::runtime_error("Fatal: Multibox cluster larger than half box.");
+			}
+		    }
 		}
 	    }
 	  
@@ -2377,7 +2349,7 @@ private:
 
 	            // Parent box: the level-(L-1) box that contains this one.
 	            // Containment in fine cells at level L (parent's cells doubled).
-	            bx.parent_idx = 0;
+	            bx.parent_idx = (size_t)-1;
 	            const auto & parents = level_boxes_[L-1];
 	            for( size_t p = 0; p < parents.size(); ++p )
 	            {
@@ -2387,6 +2359,15 @@ private:
 	                    bx.oay >= poy && bx.oay + bx.ny <= poy + pny &&
 	                    bx.oaz >= poz && bx.oaz + bx.nz <= poz + pnz )
 	                { bx.parent_idx = p; break; }
+	            }
+	            if( bx.parent_idx == (size_t)-1 )
+	            {
+	                char emsg[512];
+	                snprintf(emsg, sizeof(emsg),
+	                    "Multibox allocator: level %u box %zu at oax=(%u,%u,%u) n=(%u,%u,%u) has no parent at level %u. "
+	                    "Increase padding or check region_generator output.",
+	                    L, level_boxes_[L].size(), bx.oax, bx.oay, bx.oaz, bx.nx, bx.ny, bx.nz, L-1);
+	                throw std::runtime_error(emsg);
 	            }
 
 	            const LevelBox & parent = level_boxes_[L-1][bx.parent_idx];

@@ -308,7 +308,7 @@ void multigrid_poisson_plugin::implementation::gradient_add_O2( int dir, grid_hi
 		}
 	}
 
-	LOGUSER("Done computing a 4th order finite difference gradient.");
+	LOGUSER("Done computing a 2nd order finite difference gradient.");
 }
 
 void multigrid_poisson_plugin::implementation::gradient_O4( int dir, grid_hierarchy& u, grid_hierarchy& Du )

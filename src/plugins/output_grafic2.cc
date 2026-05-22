@@ -337,32 +337,43 @@ protected:
             << "nexpand=";
       
         if( gh.levelmax() == gh.levelmin() )
+        {
           ofst << "1";
-        else 
+          for( unsigned k=0; k<naddref; ++k )
+            ofst << ",1";
+        }
+        else
         {
           for( unsigned ilevel=gh.levelmin(); ilevel<gh.levelmax()-1; ++ilevel )
             ofst << nexpand << ",";
           ofst << "1,1";
-          
+          for( unsigned k=0; k<naddref; ++k )
+            ofst << ",1";
         }
-      
+
         ofst << "\n"
              << "ngridtot=2000000\n"
              << "nparttot=3000000\n"
              << "/\n\n";
-      
+
         ofst << "&REFINE_PARAMS\n"
             << "m_refine=" << gh.levelmax()-gh.levelmin()+1+naddref << "*8.,\n";
-      
+
         if( bhavehydro_ )
           ofst << "ivar_refine=" << 5+passive_variable_index_ << "\n"
                << "var_cut_refine=" << passive_variable_value_*0.01 << "\n";
         else
           ofst << "ivar_refine=0\n";
-      
+
         ofst << "mass_cut_refine=" << 2.0/pow(2,3*gh.levelmax()) << "\n"
              << "interpol_var=1\n"
              << "interpol_type=0\n"
+             << "/\n\n";
+
+        // -- OUTPUT_PARAMS (default: single snapshot at a=1; user should edit) --
+        ofst << "&OUTPUT_PARAMS\n"
+             << "noutput=1\n"
+             << "aout=1.0\n"
              << "/\n\n";
         
         

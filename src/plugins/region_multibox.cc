@@ -53,6 +53,15 @@ private:
     std::vector< std::vector<cc_box> > boxes_per_level_;
     //! union bounding box per level (used by get_AABB to preserve legacy single-box behaviour).
     std::vector<cc_box> union_box_per_level_;
+    //! When true, get_AABB / get_AABB_box inflate each face by (padding+1) fine cells.
+    //! Set in the constructor when the output plugin is grafic2: RAMSES reads the IC
+    //! sub-volume cell-by-cell from ic_refmap and refuses to refine outside it. The
+    //! refinement_hierarchy already pads by (padding+1) when allocating the union
+    //! mesh, but the AABB itself must report the padded extent so the grafic2 plugin
+    //! emits an IC block large enough to cover every cell RAMSES will touch. Matches
+    //! region_ellipsoid / region_convex_hull behaviour.
+    bool do_extra_padding_;
+    int padding_;
     
     region where(unsigned level)
     {
@@ -259,6 +268,7 @@ public:
     : region_generator_plugin( cf )
     {
         res = 1<<(levelmin_-1);
+        padding_ = cf.getValue<int>("setup","padding");
         //check parameters
         if ( !cf.containsKey("setup", "region_point_file"))
         {
@@ -293,6 +303,15 @@ public:
         get_center(cen);
         if( cf.getValueSafe<bool>("setup", "multibox_dump_grid", false) )
             dump_grid();
+
+        //-----------------------------------------------------------------
+        // when querying the bounding box, do we need extra padding?
+        do_extra_padding_ = false;
+        {
+            std::string output_plugin = cf.getValue<std::string>("output","format");
+            if( output_plugin == std::string("grafic2") )
+                do_extra_padding_ = true;
+        }
     }
     
     
@@ -331,6 +350,15 @@ public:
                 right[2] = float(cp->z+1)/res;
             cp++;
         }
+        if( do_extra_padding_ )
+        {
+            double dx = 1.0/(double)(1ul<<level);
+            double pad = (double)(padding_+1) * dx;
+            for( int d=0; d<3; ++d ) {
+                left[d]  -= pad;
+                right[d] += pad;
+            }
+        }
     }
     //! Number of disjoint refinement boxes at the requested level.
     //! Returns 1 for the base level and for levels outside [levelmin_+1, levelmax_].
@@ -360,6 +388,15 @@ public:
         for( int d=0; d<3; ++d ) {
             left[d]  = (double)b.lo[d] * inv;
             right[d] = (double)b.hi[d] * inv;
+        }
+        if( do_extra_padding_ )
+        {
+            double dx = 1.0/(double)(1ul<<level);
+            double pad = (double)(padding_+1) * dx;
+            for( int d=0; d<3; ++d ) {
+                left[d]  -= pad;
+                right[d] += pad;
+            }
         }
     }
 

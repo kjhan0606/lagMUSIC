@@ -17,6 +17,7 @@
 #include "mesh_distributed.hh"
 #include <vector>
 #include <cstring>
+#include <climits>
 
 #if defined(FFTW3) && defined(SINGLE_PRECISION)
 //#define fftw_complex fftwf_complex
@@ -482,26 +483,41 @@ void perform_dist(kernel *pk, real_t *root_data, size_t gnx, size_t gny, size_t 
 	Meshvar<real_t> *slab = MUSIC::dist::make_slab_meshvar<real_t>(gnx, gny, gnz, /*fftw_inplace_pad=*/true);
 	const size_t local_nx     = slab->local_nx();
 	const size_t nz_padded    = 2*(gnz/2+1);
-	const size_t local_count  = local_nx * gny * nz_padded;
+	const size_t plane        = gny * nz_padded;
+
+	// Scatter/gather one x-slice (plane = gny*nz_padded reals) at a time via
+	// a derived MPI datatype. counts/displs become x-slice units (== local_nx
+	// per rank), which fit in int easily even for huge grids. The naive
+	// real-count form overflowed int around 1968^3 (level-10 zoom): for n=4
+	// displs[2] = 2*1.9e9 reals wraps to negative, corrupting MPI_Scatterv
+	// destination offsets on rank 0.
+	if( plane > (size_t)INT_MAX ){
+		LOGERR("convolution::perform_dist: gny*nz_padded (%zu) exceeds INT_MAX; need a deeper datatype factorization.", plane);
+		throw std::runtime_error("perform_dist: y-z plane too large for int count");
+	}
+
+	MPI_Datatype dtype_base = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+	MPI_Datatype dtype_plane;
+	MPI_Type_contiguous((int)plane, dtype_base, &dtype_plane);
+	MPI_Type_commit(&dtype_plane);
 
 	std::vector<int> counts(sz), displs(sz);
-	int my_count = (int)local_count;
+	int my_count = (int)local_nx;
 	MPI_Allgather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MUSIC::mpi::world());
 	displs[0] = 0;
 	for( int i=1; i<sz; ++i ) displs[i] = displs[i-1] + counts[i-1];
 
-	MPI_Datatype dtype = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
-
-	MPI_Scatterv( (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype,
-	              slab->m_pdata, my_count, dtype,
+	MPI_Scatterv( (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype_plane,
+	              slab->m_pdata, my_count, dtype_plane,
 	              0, MUSIC::mpi::world() );
 
 	convolution::perform_mpi<real_t>(pk, slab, shift, fix, flip);
 
-	MPI_Gatherv( slab->m_pdata, my_count, dtype,
-	             (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype,
+	MPI_Gatherv( slab->m_pdata, my_count, dtype_plane,
+	             (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype_plane,
 	             0, MUSIC::mpi::world() );
 
+	MPI_Type_free(&dtype_plane);
 	delete slab;
 #endif
 }
@@ -554,21 +570,33 @@ void perform_dist_slab(kernel *pk, Meshvar<real_t> *slab, real_t *root_data,
 	const int sz = MUSIC::mpi::size();
 	const size_t local_nx    = slab->local_nx();
 	const size_t nz_padded   = 2*(gnz/2+1);
-	const size_t local_count = local_nx * gny * nz_padded;
+	const size_t plane       = gny * nz_padded;
+
+	// Same int-count fix as perform_dist: gather x-slices using a derived
+	// datatype so counts/displs stay in the small (gnx-sized) range.
+	if( plane > (size_t)INT_MAX ){
+		LOGERR("convolution::perform_dist_slab: gny*nz_padded (%zu) exceeds INT_MAX; need a deeper datatype factorization.", plane);
+		throw std::runtime_error("perform_dist_slab: y-z plane too large for int count");
+	}
+
+	MPI_Datatype dtype_base = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+	MPI_Datatype dtype_plane;
+	MPI_Type_contiguous((int)plane, dtype_base, &dtype_plane);
+	MPI_Type_commit(&dtype_plane);
 
 	std::vector<int> counts(sz), displs(sz);
-	int my_count = (int)local_count;
+	int my_count = (int)local_nx;
 	MPI_Allgather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MUSIC::mpi::world());
 	displs[0] = 0;
 	for( int i=1; i<sz; ++i ) displs[i] = displs[i-1] + counts[i-1];
 
-	MPI_Datatype dtype = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
-
 	convolution::perform_mpi<real_t>(pk, slab, shift, fix, flip);
 
-	MPI_Gatherv( slab->m_pdata, my_count, dtype,
-	             (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype,
+	MPI_Gatherv( slab->m_pdata, my_count, dtype_plane,
+	             (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype_plane,
 	             0, MUSIC::mpi::world() );
+
+	MPI_Type_free(&dtype_plane);
 #endif
 }
 

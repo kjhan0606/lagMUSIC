@@ -1995,10 +1995,20 @@ public:
 	    }
 	  
 	  //... make sure bounding box lies in domain
+	  // Track original spans before modulo: a full-extent box (span == nresmax)
+	  // would have its right edge wrap to 0, breaking the il<ir check below.
+	  // This case arises from multibox plugins whose union AABB spans a full
+	  // periodic axis (e.g. z-column pillars).
+	  const int orig_span_x = ir - il;
+	  const int orig_span_y = jr - jl;
+	  const int orig_span_z = kr - kl;
 	  il = (il+nresmax)%nresmax; ir = (ir+nresmax)%nresmax;
 	  jl = (jl+nresmax)%nresmax; jr = (jr+nresmax)%nresmax;
 	  kl = (kl+nresmax)%nresmax; kr = (kr+nresmax)%nresmax;
-	  
+	  if( orig_span_x >= nresmax ) { il = 0; ir = nresmax; }
+	  if( orig_span_y >= nresmax ) { jl = 0; jr = nresmax; }
+	  if( orig_span_z >= nresmax ) { kl = 0; kr = nresmax; }
+
 	  if( il>=ir || jl>=jr || kl>=kr )
 	    {
 	      LOGERR("Internal refinement bounding box error: [%d,%d]x[%d,%d]x[%d,%d]",il,ir,jl,jr,kl,kr);
@@ -2093,7 +2103,17 @@ public:
 			kr += (nres - kr) % coarse_block;
 		}
 
-			
+
+	      // Full-extent at this coarser level: after halving + padding + alignment,
+	      // a full-axis region may span beyond [0, 1<<ilevel) on both sides. Clamp
+	      // to the full level extent so downstream offsets/sizes stay sensible.
+	      {
+	        const int nres_lev = 1<<ilevel;
+	        if( ir - il >= nres_lev ) { il = 0; ir = nres_lev; }
+	        if( jr - jl >= nres_lev ) { jl = 0; jr = nres_lev; }
+	        if( kr - kl >= nres_lev ) { kl = 0; kr = nres_lev; }
+	      }
+
 	      if( il>=ir || jl>=jr || kl>=kr || il < 0 || jl < 0 || kl < 0)
 		{
 		  LOGERR("Internal refinement bounding box error: [%d,%d]x[%d,%d]x[%d,%d], level=%d",il,ir,jl,jr,kl,kr,ilevel);
@@ -2188,16 +2208,21 @@ public:
 		}
 	      else
 		{
+		  // Multibox: clusters come from connected-component labeling on
+		  // a user-supplied Lagrangian point file, so any extent up to the
+		  // full periodic axis is legitimate by construction. We only emit
+		  // an INFO note for unusually large clusters (>half) so anomalous
+		  // geometries still leave a trail.
 		  for( size_t b=0; b<nb; ++b )
 		    {
 		      double l[3], r[3];
 		      the_region_generator->get_AABB_box(l, r, ilevel, b);
-		      const double half = 0.5;
-		      if( (r[0]-l[0]) > half || (r[1]-l[1]) > half || (r[2]-l[2]) > half )
+		      for( int d=0; d<3; ++d )
 			{
-			  LOGERR("On level %d, multibox cluster %zu spans >half the box (%.4f,%.4f,%.4f). Not allowed!",
-				 ilevel, b, r[0]-l[0], r[1]-l[1], r[2]-l[2]);
-			  throw std::runtime_error("Fatal: Multibox cluster larger than half box.");
+			  double ext = r[d]-l[d];
+			  if( ext > 0.5 )
+			    LOGINFO("Level %d multibox cluster %zu axis=%d extent=%.4f (> half box; allowed for multibox)",
+				    ilevel, b, d, ext);
 			}
 		    }
 		}
@@ -2396,6 +2421,7 @@ public:
   {
     levelmin_ = o.levelmin_;
     levelmax_ = o.levelmax_;
+    levelmin_tf_ = o.levelmin_tf_;
     padding_  = o.padding_;
     cf_ = o.cf_;
     align_top_ = o.align_top_;
@@ -2472,18 +2498,26 @@ public:
 	void find_new_levelmin( bool print=false )
 	{
 		unsigned old_levelmin( levelmin_ );
-		
+
 		for( unsigned i=0; i<=levelmax(); ++i )
 		{
 			unsigned n = 1<<i;
-			
+
 			if(	oax_[i]==0 && oay_[i]==0 && oaz_[i]==0
 			   && nx_[i]==n && ny_[i]==n && nz_[i]==n )
 			{
 				levelmin_=i;
 			}
 		}
-		
+
+		// Don't promote past the configured TF base level. A refinement
+		// level can transiently span the full domain after TF cubic-inflate
+		// padding (e.g. multibox unions that already cover most of the box)
+		// without being a legitimate new base — promoting would cause rng
+		// generation to skip the true coarsest level.
+		if( levelmin_ > levelmin_tf_ )
+			levelmin_ = levelmin_tf_;
+
 		if( (old_levelmin != levelmin_) && print)
 			LOGINFO("refinement_hierarchy: set new levelmin to %d", levelmin_ );
 	}

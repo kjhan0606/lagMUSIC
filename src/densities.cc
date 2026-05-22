@@ -9,6 +9,9 @@
  */
 
 #include <cstring>
+#include <climits>
+#include <vector>
+#include <stdexcept>
 
 #include "densities.hh"
 #include "convolution_kernel.hh"
@@ -210,6 +213,20 @@ void fft_interpolate(m1 &V, m2 &v, bool from_basegrid = false)
 	// copy coarse data to rcoarse[.]
 	memset(rcoarse, 0, sizeof(fftw_real) * nxc * nyc * nzcp);
 
+	// Periodic wrap for the coarse read: when the fine patch sits at the
+	// corner of the coarse grid (e.g. multibox cubic-inflate places level
+	// L+1 at offset 0 on the full domain), the -nxf/8 pre-roll makes
+	// oxf+i negative on entry. The coarse grid is periodic (cosmological
+	// IC, periodic_TF=yes), so wrap to the positive equivalent before
+	// indexing — V::operator() takes size_t, so a raw negative value would
+	// underflow into a huge unsigned and segfault.
+	auto wrap = [](int x, size_t N) {
+		int n = (int)N;
+		x %= n;
+		if (x < 0) x += n;
+		return (size_t)x;
+	};
+
 #ifdef NO_COARSE_OVERLAP
 #pragma omp parallel for
 	for (int i = 0; i < (int)nxc / 2; ++i)
@@ -220,7 +237,7 @@ void fft_interpolate(m1 &V, m2 &v, bool from_basegrid = false)
 				int jj(j + nyc / 4);
 				int kk(k + nzc / 4);
 				size_t q = ((size_t)ii * nyc + (size_t)jj) * nzcp + (size_t)kk;
-				rcoarse[q] = V(oxf + i, oyf + j, ozf + k);
+				rcoarse[q] = V(wrap(oxf + i, nxF), wrap(oyf + j, nyF), wrap(ozf + k, nzF));
 			}
 #else
 #pragma omp parallel for
@@ -232,7 +249,7 @@ void fft_interpolate(m1 &V, m2 &v, bool from_basegrid = false)
 				int jj(j);
 				int kk(k);
 				size_t q = ((size_t)ii * nyc + (size_t)jj) * nzcp + (size_t)kk;
-				rcoarse[q] = V(oxf + i, oyf + j, ozf + k);
+				rcoarse[q] = V(wrap(oxf + i, nxF), wrap(oyf + j, nyF), wrap(ozf + k, nzF));
 			}
 #endif
 
@@ -463,6 +480,277 @@ void fft_interpolate(m1 &V, m2 &v, bool from_basegrid = false)
 }
 
 /*******************************************************************************************/
+//
+// Phase D.7.2: SPMD/MPI-distributed variant of fft_interpolate.
+//
+// Coarse FFT is computed redundantly on every rank (the coarse grid is 1/8
+// the volume of fine, so replicate-and-compute is cheaper than building a
+// separate distribution). Fine forward / inverse FFTs use FFTW3-MPI slab
+// decomposition along x. The coarse buffer is packed and broadcast from
+// rank 0; the fine buffer is packed on rank 0 and scattered, then the
+// gathered slabs are written back into v with FFT normalization.
+//
+// V (coarse) and v (fine) are only meaningful on rank 0. Workers pass
+// nullptr for both and never deref them — they only own the slab buffer.
+// Falls back to the serial fft_interpolate when USE_MPI is undefined or
+// MPI size == 1.
+//
+/*******************************************************************************************/
+
+#ifdef USE_MPI
+template <typename m1, typename m2>
+void fft_interpolate_dist(m1 *V, m2 *v, bool from_basegrid = false)
+{
+	if (MUSIC::mpi::size() == 1) {
+		fft_interpolate(*V, *v, from_basegrid);
+		return;
+	}
+	const int rk = MUSIC::mpi::rank();
+	const int sz = MUSIC::mpi::size();
+	const bool is_root = (rk == 0);
+
+	// -- Broadcast geometry (workers do not own V or v) --
+	int dims[9] = {0};
+	if (is_root) {
+		dims[0] = (int)v->size(0);
+		dims[1] = (int)v->size(1);
+		dims[2] = (int)v->size(2);
+		dims[3] = (int)V->size(0);
+		dims[4] = (int)V->size(1);
+		dims[5] = (int)V->size(2);
+		int oxf = v->offset(0), oyf = v->offset(1), ozf = v->offset(2);
+		if (!from_basegrid) {
+#ifdef NO_COARSE_OVERLAP
+			oxf += dims[3] / 4;
+			oyf += dims[4] / 4;
+			ozf += dims[5] / 4;
+#else
+			oxf += dims[3] / 4 - dims[0] / 8;
+			oyf += dims[4] / 4 - dims[1] / 8;
+			ozf += dims[5] / 4 - dims[2] / 8;
+		} else {
+			oxf -= dims[0] / 8;
+			oyf -= dims[1] / 8;
+			ozf -= dims[2] / 8;
+#endif
+		}
+		dims[6] = oxf; dims[7] = oyf; dims[8] = ozf;
+	}
+	MPI_Bcast(dims, 9, MPI_INT, 0, MUSIC::mpi::world());
+
+	const size_t nxf = (size_t)dims[0];
+	const size_t nyf = (size_t)dims[1];
+	const size_t nzf = (size_t)dims[2];
+	const size_t nxF = (size_t)dims[3];
+	const size_t nyF = (size_t)dims[4];
+	const size_t nzF = (size_t)dims[5];
+	const int    oxf = dims[6], oyf = dims[7], ozf = dims[8];
+	const size_t nzfp = nzf + 2;
+
+	assert(nxf % 2 == 0 && nyf % 2 == 0 && nzf % 2 == 0);
+	const size_t nxc = nxf / 2, nyc = nyf / 2, nzc = nzf / 2, nzcp = nzc + 2;
+
+	LOGUSER("FFT interpolate (SPMD): offset=%d,%d,%d size=%zu,%zu,%zu",
+	        oxf, oyf, ozf, nxf, nyf, nzf);
+
+	MPI_Datatype mpi_real = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	// -- Coarse path (replicated): pack on rank 0, Bcast, local r2c on all ranks --
+	fftw_real *rcoarse = new fftw_real[nxc * nyc * nzcp];
+	fftw_complex *ccoarse = reinterpret_cast<fftw_complex *>(rcoarse);
+	std::memset(rcoarse, 0, sizeof(fftw_real) * nxc * nyc * nzcp);
+
+	if (is_root) {
+		auto wrap = [](int x, size_t N) {
+			int n = (int)N;
+			x %= n;
+			if (x < 0) x += n;
+			return (size_t)x;
+		};
+#ifdef NO_COARSE_OVERLAP
+#pragma omp parallel for
+		for (int i = 0; i < (int)nxc / 2; ++i)
+			for (int j = 0; j < (int)nyc / 2; ++j)
+				for (int k = 0; k < (int)nzc / 2; ++k) {
+					int ii(i + (int)nxc / 4);
+					int jj(j + (int)nyc / 4);
+					int kk(k + (int)nzc / 4);
+					size_t q = ((size_t)ii * nyc + (size_t)jj) * nzcp + (size_t)kk;
+					rcoarse[q] = (*V)(wrap(oxf + i, nxF), wrap(oyf + j, nyF), wrap(ozf + k, nzF));
+				}
+#else
+#pragma omp parallel for
+		for (int i = 0; i < (int)nxc; ++i)
+			for (int j = 0; j < (int)nyc; ++j)
+				for (int k = 0; k < (int)nzc; ++k) {
+					size_t q = ((size_t)i * nyc + (size_t)j) * nzcp + (size_t)k;
+					rcoarse[q] = (*V)(wrap(oxf + i, nxF), wrap(oyf + j, nyF), wrap(ozf + k, nzF));
+				}
+#endif
+	}
+
+	{
+		size_t total = nxc * nyc * nzcp;
+		size_t plane = nyc * nzcp;
+		if (total <= (size_t)INT_MAX) {
+			MPI_Bcast(rcoarse, (int)total, mpi_real, 0, MUSIC::mpi::world());
+		} else {
+			if (plane > (size_t)INT_MAX)
+				throw std::runtime_error("fft_interpolate_dist: coarse plane exceeds INT_MAX");
+			MPI_Datatype dt;
+			MPI_Type_contiguous((int)plane, mpi_real, &dt);
+			MPI_Type_commit(&dt);
+			MPI_Bcast(rcoarse, (int)nxc, dt, 0, MUSIC::mpi::world());
+			MPI_Type_free(&dt);
+		}
+	}
+
+#ifdef SINGLE_PRECISION
+	fftwf_plan pc = fftwf_plan_dft_r2c_3d((int)nxc, (int)nyc, (int)nzc, rcoarse, ccoarse, FFTW_ESTIMATE);
+	fftwf_execute(pc);
+	fftwf_destroy_plan(pc);
+#else
+	fftw_plan pc = fftw_plan_dft_r2c_3d((int)nxc, (int)nyc, (int)nzc, rcoarse, ccoarse, FFTW_ESTIMATE);
+	fftw_execute(pc);
+	fftw_destroy_plan(pc);
+#endif
+
+	// -- Fine path (distributed): allocate slab, scatter from rank 0 --
+	Meshvar<real_t> *slab = MUSIC::dist::make_slab_meshvar<real_t>(
+	    nxf, nyf, nzf, /*fftw_inplace_pad=*/true);
+	const size_t local_nx      = slab->local_nx();
+	const size_t local_x_start = slab->local_x_start();
+	const size_t plane_fine    = nyf * nzfp;
+	if (plane_fine > (size_t)INT_MAX) {
+		throw std::runtime_error("fft_interpolate_dist: fine y-z plane exceeds INT_MAX");
+	}
+	MPI_Datatype dtype_plane_fine;
+	MPI_Type_contiguous((int)plane_fine, mpi_real, &dtype_plane_fine);
+	MPI_Type_commit(&dtype_plane_fine);
+
+	std::vector<int> counts(sz), displs(sz);
+	int my_count = (int)local_nx;
+	MPI_Allgather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MUSIC::mpi::world());
+	displs[0] = 0;
+	for (int i = 1; i < sz; ++i) displs[i] = displs[i - 1] + counts[i - 1];
+
+	real_t *fine_root = NULL;
+	if (is_root) {
+		fine_root = new real_t[nxf * nyf * nzfp];
+#pragma omp parallel for
+		for (int i = 0; i < (int)nxf; ++i)
+			for (int j = 0; j < (int)nyf; ++j)
+				for (int k = 0; k < (int)nzf; ++k) {
+					size_t q = ((size_t)i * nyf + (size_t)j) * nzfp + (size_t)k;
+					fine_root[q] = (*v)(i, j, k);
+				}
+	}
+
+	MPI_Scatterv(is_root ? fine_root : (real_t *)NULL,
+	             counts.data(), displs.data(), dtype_plane_fine,
+	             slab->m_pdata, my_count, dtype_plane_fine,
+	             0, MUSIC::mpi::world());
+
+	fftw_complex *cslab = reinterpret_cast<fftw_complex *>(slab->m_pdata);
+
+#ifdef SINGLE_PRECISION
+	fftwf_plan p_fwd = fftwf_mpi_plan_dft_r2c_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    slab->m_pdata, cslab, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftwf_plan p_inv = fftwf_mpi_plan_dft_c2r_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    cslab, slab->m_pdata, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftwf_execute(p_fwd);
+#else
+	fftw_plan p_fwd = fftw_mpi_plan_dft_r2c_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    slab->m_pdata, cslab, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftw_plan p_inv = fftw_mpi_plan_dft_c2r_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    cslab, slab->m_pdata, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftw_execute(p_fwd);
+#endif
+
+	// -- K-space blend on owned x-slab --
+	const double fftnorm = 1.0 / ((double)nxf * (double)nyf * (double)nzf);
+	const double sqrt8 = 8.0;
+	const double phasefac = -0.5;
+
+	for (int i = 0; i < (int)nxc; ++i) {
+		int ii = i;
+		if (i > (int)nxc / 2) ii += (int)nxf / 2;
+		if ((size_t)ii < local_x_start || (size_t)ii >= local_x_start + local_nx) continue;
+		const size_t ii_local = (size_t)ii - local_x_start;
+
+#pragma omp parallel for
+		for (int j = 0; j < (int)nyc; ++j) {
+			for (int k = 0; k < (int)nzc / 2 + 1; ++k) {
+				int jj = j, kk = k;
+				if (j > (int)nyc / 2) jj += (int)nyf / 2;
+				if (k > (int)nzc / 2) kk += (int)nzf / 2;
+
+				size_t qc = ((size_t)i * nyc + (size_t)j) * (nzc / 2 + 1) + (size_t)k;
+				size_t qf = (ii_local * nyf + (size_t)jj) * (nzf / 2 + 1) + (size_t)kk;
+
+				double kx = (i <= (int)nxc / 2) ? (double)i : (double)(i - (int)nxc);
+				double ky = (j <= (int)nyc / 2) ? (double)j : (double)(j - (int)nyc);
+				double kz = (k <= (int)nzc / 2) ? (double)k : (double)(k - (int)nzc);
+
+				double phase = phasefac * (kx / (double)nxc + ky / (double)nyc + kz / (double)nzc) * M_PI;
+				std::complex<double> val_phas(cos(phase), sin(phase));
+
+				std::complex<double> val(RE(ccoarse[qc]), IM(ccoarse[qc]));
+				val *= sqrt8 * val_phas;
+
+				double blend_coarse = Blend_Function(sqrt(kx * kx + ky * ky + kz * kz), nxc / 2);
+				double blend_fine = 1.0 - blend_coarse;
+
+				RE(cslab[qf]) = blend_fine * RE(cslab[qf]) + blend_coarse * val.real();
+				IM(cslab[qf]) = blend_fine * IM(cslab[qf]) + blend_coarse * val.imag();
+			}
+		}
+	}
+
+	delete[] rcoarse;
+
+#ifdef SINGLE_PRECISION
+	fftwf_execute(p_inv);
+	fftwf_destroy_plan(p_fwd);
+	fftwf_destroy_plan(p_inv);
+#else
+	fftw_execute(p_inv);
+	fftw_destroy_plan(p_fwd);
+	fftw_destroy_plan(p_inv);
+#endif
+
+	MPI_Gatherv(slab->m_pdata, my_count, dtype_plane_fine,
+	            is_root ? fine_root : (real_t *)NULL,
+	            counts.data(), displs.data(), dtype_plane_fine,
+	            0, MUSIC::mpi::world());
+
+	MPI_Type_free(&dtype_plane_fine);
+	delete slab;
+
+	if (is_root) {
+#pragma omp parallel for
+		for (int i = 0; i < (int)nxf; ++i)
+			for (int j = 0; j < (int)nyf; ++j)
+				for (int k = 0; k < (int)nzf; ++k) {
+					size_t q = ((size_t)i * nyf + (size_t)j) * nzfp + (size_t)k;
+					(*v)(i, j, k) = fine_root[q] * fftnorm;
+				}
+		delete[] fine_root;
+	}
+}
+#else  // !USE_MPI
+template <typename m1, typename m2>
+void fft_interpolate_dist(m1 *V, m2 *v, bool from_basegrid = false)
+{
+	fft_interpolate(*V, *v, from_basegrid);
+}
+#endif // USE_MPI
+
+/*******************************************************************************************/
 /*******************************************************************************************/
 /*******************************************************************************************/
 
@@ -652,62 +940,81 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 				shift, fix, flip);
 		}
 
-		if (!is_root) {
-			delete the_tf_kernel;
-			return;
-		}
+		// Phase D.7.1: workers no longer early-return. They participate in
+		// every collective perform_dist() inside the zoom loop below so the
+		// per-level FFT convolution is slab-distributed across all ranks.
 
-		delta.create_base_hierarchy(levelmin);
-		top->copy(*delta.get_grid(levelmin));
+		if (is_root) {
+			delta.create_base_hierarchy(levelmin);
+			top->copy(*delta.get_grid(levelmin));
+		}
 
 		for (int i = 1; i < nlevels; ++i)
 		{
-			LOGINFO("Performing noise convolution on level %3d...", levelmin + i);
-			/////////////////////////////////////////////////////////////////////////
-			//... add new refinement patch
-			LOGUSER("Allocating refinement patch");
-			LOGUSER("   offset=(%5d,%5d,%5d)", refh.offset(levelmin + i, 0),
-					refh.offset(levelmin + i, 1), refh.offset(levelmin + i, 2));
-			LOGUSER("   size  =(%5d,%5d,%5d)", refh.size(levelmin + i, 0),
-					refh.size(levelmin + i, 1), refh.size(levelmin + i, 2));
+			if (is_root) {
+				LOGINFO("Performing noise convolution on level %3d... (SPMD)", levelmin + i);
+				LOGUSER("Allocating refinement patch");
+				LOGUSER("   offset=(%5d,%5d,%5d)", refh.offset(levelmin + i, 0),
+						refh.offset(levelmin + i, 1), refh.offset(levelmin + i, 2));
+				LOGUSER("   size  =(%5d,%5d,%5d)", refh.size(levelmin + i, 0),
+						refh.size(levelmin + i, 1), refh.size(levelmin + i, 2));
 
-			fine = new PaddedDensitySubGrid<real_t>(refh.offset(levelmin + i, 0),
-													refh.offset(levelmin + i, 1),
-													refh.offset(levelmin + i, 2),
-													refh.size(levelmin + i, 0),
-													refh.size(levelmin + i, 1),
-													refh.size(levelmin + i, 2));
-			/////////////////////////////////////////////////////////////////////////
+				fine = new PaddedDensitySubGrid<real_t>(refh.offset(levelmin + i, 0),
+														refh.offset(levelmin + i, 1),
+														refh.offset(levelmin + i, 2),
+														refh.size(levelmin + i, 0),
+														refh.size(levelmin + i, 1),
+														refh.size(levelmin + i, 2));
 
-			// load white noise for patch
-			rand.load(*fine, levelmin + i);
+				// load white noise for patch
+				rand.load(*fine, levelmin + i);
+			}
 
-			convolution::perform<real_t>(the_tf_kernel->fetch_kernel(levelmin + i, true),
-										 reinterpret_cast<void *>(fine->get_data_ptr()), shift, fix, flip);
+			// Collective: PaddedDensitySubGrid stores 2*refh.size() per axis,
+			// which is the FFT extent the kernel was sampled for. Workers don't
+			// own `fine`; they create a local FFTW slab inside perform_dist and
+			// participate in the scatter/FFT/gather. Only rank 0's data pointer
+			// is meaningful.
+			const size_t gnx = 2 * (size_t)refh.size(levelmin + i, 0);
+			const size_t gny = 2 * (size_t)refh.size(levelmin + i, 1);
+			const size_t gnz = 2 * (size_t)refh.size(levelmin + i, 2);
+			convolution::perform_dist<real_t>(
+				the_tf_kernel->fetch_kernel(levelmin + i, /*isolated=*/true),
+				is_root ? reinterpret_cast<real_t*>(fine->get_data_ptr())
+				        : (real_t*)NULL,
+				gnx, gny, gnz,
+				shift, fix, flip);
 
+			// Phase D.7.2: collective FFT-based interpolate. Workers pass NULL
+			// for V/v; the function broadcasts geometry, distributes the fine
+			// FFT across ranks via FFTW3-MPI, and writes the result back into
+			// *fine on rank 0.
 			if (i == 1)
-				fft_interpolate(*top, *fine, true);
+				fft_interpolate_dist(top, fine, true);
 			else
-				fft_interpolate(*coarse, *fine, false);
+				fft_interpolate_dist(coarse, fine, false);
 
-			delta.add_patch(refh.offset(levelmin + i, 0),
-							refh.offset(levelmin + i, 1),
-							refh.offset(levelmin + i, 2),
-							refh.size(levelmin + i, 0),
-							refh.size(levelmin + i, 1),
-							refh.size(levelmin + i, 2));
+			if (is_root) {
+				delta.add_patch(refh.offset(levelmin + i, 0),
+								refh.offset(levelmin + i, 1),
+								refh.offset(levelmin + i, 2),
+								refh.size(levelmin + i, 0),
+								refh.size(levelmin + i, 1),
+								refh.size(levelmin + i, 2));
 
-			fine->copy_unpad(*delta.get_grid(levelmin + i));
+				fine->copy_unpad(*delta.get_grid(levelmin + i));
 
-			if (i == 1)
-				delete top;
-			else
-				delete coarse;
+				if (i == 1)
+					delete top;
+				else
+					delete coarse;
 
-			coarse = fine;
+				coarse = fine;
+			}
 		}
 
-		delete coarse;
+		if (is_root)
+			delete coarse;
 	}
 	else
 	{

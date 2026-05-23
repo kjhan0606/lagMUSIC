@@ -1779,8 +1779,233 @@ public:
 #endif
 	}
 	//---------------------------------------------------------------------
-    
-    
+
+	//-------- Phase E.2.1b: storage-flip helpers (full <-> slab) --------
+	//! Collective. Convert level L from rank-0-full storage to all-rank
+	//! slab storage, preserving the data content.
+	//!
+	//! Preconditions:
+	//!   - rank 0 holds m_pgrids[L] as a populated full MeshvarBnd<T>
+	//!     with extent (gnx, gny, gnz) (typically just allocated by
+	//!     create_base_hierarchy + top->copy)
+	//!   - workers may have empty m_pgrids; we resize and populate slot L.
+	//!
+	//! Postconditions on all ranks: m_pgrids[L] is a slab MeshvarBnd<T>
+	//! holding that rank's x-strip; is_level_slab(L) == true; data preserved.
+	//!
+	//! Must run OUTSIDE phase_scope (workers cannot service MPI_Send while
+	//! parked in worker_pump). On serial builds the existing full mesh stays
+	//! in place (slab == full); only the metadata flips.
+	void convert_level_full_to_slab( unsigned ilevel,
+	                                 size_t gnx, size_t gny, size_t gnz,
+	                                 int oax=0, int oay=0, int oaz=0 )
+	{
+#ifdef USE_MPI
+	    const int nproc = MUSIC::mpi::size();
+	    if( nproc <= 1 ) {
+	        ensure_level_slab_meta_(ilevel);
+	        if( ilevel < m_pgrids.size() && m_pgrids[ilevel] != NULL ) {
+	            m_level_is_slab_[ilevel] = true;
+	            m_level_gnx_[ilevel] = gnx;
+	            m_level_gny_[ilevel] = gny;
+	            m_level_gnz_[ilevel] = gnz;
+	        }
+	        return;
+	    }
+	    const int rk = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+	    const int tag_base = 2100; // E.2.1b distinct from gather(1500)/scatter(1700)/roundtrip(1800,1900)
+
+	    // ensure m_pgrids and offset metadata sized to L+1 on every rank
+	    if( m_pgrids.size() <= ilevel ) m_pgrids.resize(ilevel+1, (MeshvarBnd<T>*)NULL);
+	    if( m_xoffabs.size() <= ilevel ) m_xoffabs.resize(ilevel+1, 0);
+	    if( m_yoffabs.size() <= ilevel ) m_yoffabs.resize(ilevel+1, 0);
+	    if( m_zoffabs.size() <= ilevel ) m_zoffabs.resize(ilevel+1, 0);
+	    ensure_level_slab_meta_(ilevel);
+
+	    // detach the rank-0 source full so allocate_union_slab_at doesn't free it
+	    MeshvarBnd<T> * src_full = NULL;
+	    if( rk == 0 ) {
+	        src_full = m_pgrids[ilevel];
+	        if( !src_full ) {
+	            LOGERR("convert_level_full_to_slab: rank 0 has no m_pgrids[%u]", ilevel);
+	            throw std::runtime_error("convert_level_full_to_slab: missing source full");
+	        }
+	        m_pgrids[ilevel] = NULL;
+	    }
+
+	    // every rank now allocates its slab
+	    allocate_union_slab_at(ilevel, gnx, gny, gnz, oax, oay, oaz);
+	    MeshvarBnd<T> * new_slab = m_pgrids[ilevel];
+
+	    // gather per-rank slab geometry on rank 0
+	    long long my_loc[2] = { (long long)new_slab->local_x_start(),
+	                            (long long)new_slab->local_nx() };
+	    std::vector<long long> all_loc(2*nproc, 0);
+	    MPI_Gather(my_loc, 2, MPI_LONG_LONG, all_loc.data(), 2, MPI_LONG_LONG,
+	               0, MUSIC::mpi::world());
+
+	    if( rk == 0 ) {
+	        // rank-0 own strip
+	        {
+	            const long long s_lx = all_loc[0];
+	            const long long s_nx = all_loc[1];
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        (*new_slab)((int)i,(int)j,(int)k)
+	                            = (*src_full)((int)(s_lx+i),(int)j,(int)k);
+	        }
+	        // pack + send each worker's strip
+	        for( int r=1; r<nproc; ++r ) {
+	            const long long s_lx = all_loc[2*r+0];
+	            const long long s_nx = all_loc[2*r+1];
+	            if( s_nx <= 0 ) continue;
+	            const size_t cnt = (size_t)s_nx * gny * gnz;
+	            std::vector<T> buf(cnt);
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        buf[(size_t)((i*(long long)gny+j)*(long long)gnz+k)]
+	                            = (*src_full)((int)(s_lx+i),(int)j,(int)k);
+	            MPI_Send(buf.data(), (int)cnt, dtype, r, tag_base+r,
+	                     MUSIC::mpi::world());
+	        }
+	        delete src_full;
+	    } else {
+	        const long long s_nx = my_loc[1];
+	        if( s_nx > 0 ) {
+	            const size_t cnt = (size_t)s_nx * gny * gnz;
+	            std::vector<T> buf(cnt);
+	            MPI_Recv(buf.data(), (int)cnt, dtype, 0, tag_base+rk,
+	                     MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        (*new_slab)((int)i,(int)j,(int)k)
+	                            = buf[(size_t)((i*(long long)gny+j)*(long long)gnz+k)];
+	        }
+	    }
+#else
+	    (void)ilevel; (void)gnx; (void)gny; (void)gnz; (void)oax; (void)oay; (void)oaz;
+#endif
+	}
+
+	//! Collective. Inverse of convert_level_full_to_slab. Gathers slabs
+	//! back to a rank-0 full MeshvarBnd<T>; workers drop their slab.
+	//!
+	//! Preconditions on all ranks: m_pgrids[L] is a slab (is_level_slab(L) == true).
+	//!
+	//! Postconditions:
+	//!   - rank 0: m_pgrids[L] is a full MeshvarBnd<T> with extent (gnx,gny,gnz)
+	//!     (taken from m_level_gnx_/gny_/gnz_); is_level_slab(L) == false.
+	//!   - workers: m_pgrids[L] == NULL; is_level_slab(L) == false.
+	//!
+	//! Must run OUTSIDE phase_scope. On serial builds: flips metadata only.
+	void convert_level_slab_to_full( unsigned ilevel )
+	{
+#ifdef USE_MPI
+	    const int nproc = MUSIC::mpi::size();
+	    if( nproc <= 1 ) {
+	        if( ilevel < m_level_is_slab_.size() ) m_level_is_slab_[ilevel] = false;
+	        return;
+	    }
+	    if( !is_level_slab(ilevel) ) return;
+	    if( m_level_tenant_[ilevel] ) {
+	        LOGERR("convert_level_slab_to_full: tenant active at L=%u; release first", ilevel);
+	        throw std::runtime_error("convert_level_slab_to_full: tenant active");
+	    }
+	    const int rk = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+	    const int tag_base = 2300; // E.2.1b distinct from full->slab (2100)
+
+	    const size_t gnx = m_level_gnx_[ilevel];
+	    const size_t gny = m_level_gny_[ilevel];
+	    const size_t gnz = m_level_gnz_[ilevel];
+
+	    MeshvarBnd<T> * slab = m_pgrids[ilevel];
+	    long long my_loc[2] = { slab ? (long long)slab->local_x_start() : 0,
+	                            slab ? (long long)slab->local_nx()      : 0 };
+	    std::vector<long long> all_loc(2*nproc, 0);
+	    MPI_Gather(my_loc, 2, MPI_LONG_LONG, all_loc.data(), 2, MPI_LONG_LONG,
+	               0, MUSIC::mpi::world());
+
+	    if( rk == 0 ) {
+	        MeshvarBnd<T> * full = new MeshvarBnd<T>(
+	            m_nbnd, gnx, gny, gnz, 0, 0, 0 );
+	        full->zero();
+	        // rank-0 own slab -> full
+	        {
+	            const long long s_lx = all_loc[0];
+	            const long long s_nx = all_loc[1];
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        (*full)((int)(s_lx+i),(int)j,(int)k)
+	                            = (*slab)((int)i,(int)j,(int)k);
+	        }
+	        // workers' slabs -> full
+	        for( int r=1; r<nproc; ++r ) {
+	            const long long s_lx = all_loc[2*r+0];
+	            const long long s_nx = all_loc[2*r+1];
+	            if( s_nx <= 0 ) continue;
+	            const size_t cnt = (size_t)s_nx * gny * gnz;
+	            std::vector<T> buf(cnt);
+	            MPI_Recv(buf.data(), (int)cnt, dtype, r, tag_base+r,
+	                     MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        (*full)((int)(s_lx+i),(int)j,(int)k)
+	                            = buf[(size_t)((i*(long long)gny+j)*(long long)gnz+k)];
+	        }
+	        // replace slab with full
+	        delete slab;
+	        m_pgrids[ilevel] = full;
+	        m_level_is_slab_[ilevel] = false;
+	        m_level_gnx_[ilevel] = 0;
+	        m_level_gny_[ilevel] = 0;
+	        m_level_gnz_[ilevel] = 0;
+	    } else {
+	        const long long s_nx = my_loc[1];
+	        if( s_nx > 0 ) {
+	            const size_t cnt = (size_t)s_nx * gny * gnz;
+	            std::vector<T> buf(cnt);
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        buf[(size_t)((i*(long long)gny+j)*(long long)gnz+k)]
+	                            = (*slab)((int)i,(int)j,(int)k);
+	            MPI_Send(buf.data(), (int)cnt, dtype, 0, tag_base+rk,
+	                     MUSIC::mpi::world());
+	        }
+	        delete slab;
+	        m_pgrids[ilevel] = NULL;
+	        m_level_is_slab_[ilevel] = false;
+	        m_level_gnx_[ilevel] = 0;
+	        m_level_gny_[ilevel] = 0;
+	        m_level_gnz_[ilevel] = 0;
+	        // Phase E.2.1b: workers had size==0 pre-flip; restore so levelmax()
+	        // underflows to UINT_MAX again and downstream code (which only sees
+	        // workers' GridHierarchy as an empty shell) is unchanged.
+	        if( m_pgrids.size() == (size_t)ilevel + 1 ) {
+	            bool all_null_below = true;
+	            for( unsigned k = 0; k < ilevel; ++k )
+	                if( m_pgrids[k] != NULL ) { all_null_below = false; break; }
+	            if( all_null_below ) {
+	                m_pgrids.resize(0);
+	                m_xoffabs.resize(0);
+	                m_yoffabs.resize(0);
+	                m_zoffabs.resize(0);
+	            }
+	        }
+	    }
+#else
+	    (void)ilevel;
+#endif
+	}
+	//---------------------------------------------------------------------
+
     // meaning of the mask:
     //  -1  =  outside of mask
     //  0.5 =  in mask and refined (i.e. cell exists also on finer level)

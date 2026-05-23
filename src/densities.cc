@@ -959,6 +959,19 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 			delta.test_slab_roundtrip_at((unsigned)levelmin,
 			                              (size_t)nbase, (size_t)nbase, (size_t)nbase);
 		}
+
+		// Phase E.2.1b: opt-in storage flip. After rank 0 has the union populated
+		// from top->copy, scatter to per-rank slabs (workers' delta gets the slot
+		// allocated), then immediately gather back to a rank-0 full union before
+		// proceeding. Smoke-tests the real storage round-trip in the production
+		// data path; future E.2.x widens the slab-active span between the converts.
+		if (MUSIC::mpi::size() > 1 && cf.getValueSafe<bool>("setup", "slab_levelmin", false)) {
+			LOGINFO("E.2.1b: levelmin storage flip full->slab->full (L=%u, %zu^3)",
+			        (unsigned)levelmin, (size_t)nbase);
+			delta.convert_level_full_to_slab((unsigned)levelmin,
+			                                  (size_t)nbase, (size_t)nbase, (size_t)nbase);
+			delta.convert_level_slab_to_full((unsigned)levelmin);
+		}
 #endif
 
 		for (int i = 1; i < nlevels; ++i)

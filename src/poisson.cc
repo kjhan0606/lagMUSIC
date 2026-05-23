@@ -550,31 +550,29 @@ double fft_poisson_plugin::solve( grid_hierarchy& f, grid_hierarchy& u )
 	}
 	
 	if( verbosity > 0 )
-	{	
+	{
 		std::cout << "-------------------------------------------------------------\n";
 		std::cout << " - Invoking unigrid FFT Poisson solver..." << std::endl;
 	}
-	
 	int nx,ny,nz,nzp;
 	nx = f.get_grid(f.levelmax())->size(0);
 	ny = f.get_grid(f.levelmax())->size(1);
 	nz = f.get_grid(f.levelmax())->size(2);
 	nzp = 2*(nz/2+1);
-	
-	
+
 	//... copy data ..................................................
 	fftw_real *data = new fftw_real[(size_t)nx*(size_t)ny*(size_t)nzp];
 	fftw_complex *cdata = reinterpret_cast<fftw_complex*> (data);
-	
+
 	#pragma omp parallel for
 	for( int i=0; i<nx; ++i )
-		for( int j=0; j<ny; ++j )	
+		for( int j=0; j<ny; ++j )
 			for( int k=0; k<nz; ++k )
 			{
 				size_t idx = (size_t)(i*ny+j)*(size_t)nzp+(size_t)k;
 				data[idx] = (*f.get_grid(f.levelmax()))(i,j,k);
 			}
-	
+
 	//... perform FFT and Poisson solve................................
 #ifdef USE_MPI
 	if( MUSIC::mpi::size() > 1 ){

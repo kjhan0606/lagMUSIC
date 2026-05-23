@@ -170,6 +170,97 @@ inline void slab_solve_unigrid( GH& f, GH& u,
 }
 // ----- end Phase E.2.2b ----------------------------------------------------
 
+// ----- Phase E.2.4: combined solve + per-coord gradient span ---------------
+// Like slab_solve_unigrid but does NOT convert u back to full at the end.
+// Caller must subsequently call slab_gradient_unigrid_existing_u (which also
+// leaves u in slab) for each direction, then convert u back via
+// u.convert_level_slab_to_full(ilevel) + apply_periodic_bc_unigrid_rank0.
+//
+// f is restored to full at the end (downstream baryon path may need it).
+// Use this to widen the slab span over solve + all three gradients so rank-0
+// no longer holds a full u between the calls.
+template<typename GH>
+inline void slab_solve_unigrid_keep_u_slab( GH& f, GH& u,
+                                             unsigned ilevel,
+                                             size_t gnx, size_t gny, size_t gnz )
+{
+#ifdef USE_MPI
+    if( MUSIC::mpi::size() <= 1 ) return;
+
+    typedef typename GH::real_t real_t;
+
+    f.convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+    u.convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+
+    set_slab_solve_inout<real_t>( f.get_grid(ilevel), u.get_grid(ilevel) );
+    {
+        phase_scope _ps;
+        if( MUSIC::mpi::is_root() )
+            rank0_dist_solve_slab<real_t>( gnx, gny, gnz );
+    }
+    set_slab_solve_inout<real_t>( (::MeshvarBnd<real_t>*)NULL,
+                                   (::MeshvarBnd<real_t>*)NULL );
+
+    f.convert_level_slab_to_full( ilevel ); // restore f for downstream gradient_add
+    // u stays in slab; caller converts back after gradient loop.
+#else
+    (void)f; (void)u; (void)ilevel; (void)gnx; (void)gny; (void)gnz;
+#endif
+}
+
+// Like slab_gradient_unigrid but assumes u is ALREADY in slab form (caller
+// invoked slab_solve_unigrid_keep_u_slab earlier). Du goes full→slab→full
+// per call. u remains in slab.
+template<typename GH>
+inline void slab_gradient_unigrid_existing_u( int dir, GH& u, GH& Du,
+                                               unsigned ilevel,
+                                               size_t gnx, size_t gny, size_t gnz,
+                                               bool deconvolve_cic )
+{
+#ifdef USE_MPI
+    if( MUSIC::mpi::size() <= 1 ) return;
+
+    typedef typename GH::real_t real_t;
+
+    // u already slab; only convert Du.
+    Du.convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+
+    set_slab_solve_inout<real_t>( u.get_grid(ilevel), Du.get_grid(ilevel) );
+    {
+        phase_scope _ps;
+        if( MUSIC::mpi::is_root() )
+            rank0_dist_gradient_slab<real_t>( dir, gnx, gny, gnz, deconvolve_cic );
+    }
+    set_slab_solve_inout<real_t>( (::MeshvarBnd<real_t>*)NULL,
+                                   (::MeshvarBnd<real_t>*)NULL );
+
+    Du.convert_level_slab_to_full( ilevel );
+    // u still slab; do not convert.
+#else
+    (void)dir; (void)u; (void)Du; (void)ilevel; (void)gnx; (void)gny; (void)gnz;
+    (void)deconvolve_cic;
+#endif
+}
+
+// Convert a slab-form u back to full on rank 0 and re-apply periodic BC.
+// Use this after the gradient loop completes.
+template<typename GH>
+inline void slab_restore_u_full( GH& u, unsigned ilevel,
+                                  size_t gnx, size_t gny, size_t gnz )
+{
+#ifdef USE_MPI
+    if( MUSIC::mpi::size() <= 1 ) return;
+    typedef typename GH::real_t real_t;
+    u.convert_level_slab_to_full( ilevel );
+    if( MUSIC::mpi::is_root() )
+        apply_periodic_bc_unigrid_rank0<real_t>(
+            *u.get_grid(ilevel), (int)gnx, (int)gny, (int)gnz );
+#else
+    (void)u; (void)ilevel; (void)gnx; (void)gny; (void)gnz;
+#endif
+}
+// ----- end Phase E.2.4 -----------------------------------------------------
+
 // ----- Phase E.2.3: production slab-gradient wrapper for unigrid FFT path --
 // All-ranks SPMD wrapper around the E.2.3 slab-gradient primitive. Bypasses
 // fft_poisson_plugin::gradient (rank 0 plugin call is replaced by the SPMD

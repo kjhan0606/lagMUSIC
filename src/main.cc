@@ -1149,13 +1149,20 @@ int main (int argc, const char * argv[])
 			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_density(f);
 
 			grid_hierarchy u( f );	u.zero();
+			// E.2.4: pre-allocate data_forIO while u is still full so per-rank
+			// MeshvarBnd shapes are full (copy ctor reads u's current shapes).
+			// The slab path keeps u in slab form across solve+gradients; the
+			// existing_u helper assumes Du enters full and exits full per call.
+			grid_hierarchy data_forIO( u );
+			bool u_in_slab = false;
 			{
 				const bool use_slab_solve = kspace && (lbase==lmax)
 					&& cf.getValueSafe<bool>("setup", "slab_solve_unigrid", false)
 					&& MUSIC::mpi::size() > 1;
 				if( use_slab_solve ){
 					const size_t ng = (size_t)1 << lmax;
-					MUSIC::poisson::slab_solve_unigrid( f, u, lmax, ng, ng, ng );
+					MUSIC::poisson::slab_solve_unigrid_keep_u_slab( f, u, lmax, ng, ng, ng );
+					u_in_slab = true;
 					err = 0.0;
 				} else {
 					MUSIC::poisson::with_pbox_distributed([&]{
@@ -1167,23 +1174,26 @@ int main (int argc, const char * argv[])
 			if(!bdefd)
 				f.deallocate();
 
-			LOGUSER("Writing CDM potential");
-			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_potential(u);
+			// In slab path u is per-rank slab; defer write_dm_potential until
+			// slab_restore_u_full at the end of the gradient loop.
+			if( !u_in_slab ){
+				LOGUSER("Writing CDM potential");
+				if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_potential(u);
+			}
 
 
 			//------------------------------------------------------------------------------
 			//... DM displacements
 			//------------------------------------------------------------------------------
 			{
-				grid_hierarchy data_forIO(u);
 				const bool use_slab_grad = kspace && (lbase==lmax)
 					&& cf.getValueSafe<bool>("setup", "slab_solve_unigrid", false)
 					&& MUSIC::mpi::size() > 1;
 				if( use_slab_grad ){
 					const size_t ng = (size_t)1 << lmax;
 					for( int icoord = 0; icoord < 3; ++icoord ){
-						MUSIC::poisson::slab_gradient_unigrid( icoord, u, data_forIO,
-						                                       lmax, ng, ng, ng, decic_DM );
+						MUSIC::poisson::slab_gradient_unigrid_existing_u( icoord, u, data_forIO,
+						                                                   lmax, ng, ng, ng, decic_DM );
 						if( MUSIC::mpi::is_root() ){
 							double dispmax = compute_finest_max( data_forIO );
 							LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
@@ -1192,6 +1202,11 @@ int main (int argc, const char * argv[])
 							the_output_plugin->write_dm_position(icoord, data_forIO );
 						}
 					}
+					// E.2.4: restore u to full + emit deferred CDM potential write.
+					MUSIC::poisson::slab_restore_u_full( u, lmax, ng, ng, ng );
+					u_in_slab = false;
+					LOGUSER("Writing CDM potential");
+					if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_potential(u);
 				} else {
 					MUSIC::poisson::with_pbox_distributed([&]{
 						for( int icoord = 0; icoord < 3; ++icoord )
@@ -1217,7 +1232,6 @@ int main (int argc, const char * argv[])
 						}
 					}, u, data_forIO);
 				}
-				// data_forIO falls out of SPMD scope below
 			}
 			if( do_baryons )
 				u.deallocate();

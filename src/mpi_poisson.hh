@@ -19,6 +19,7 @@
 // fft_poisson_plugin falls through to its serial code path.
 
 #include "general.hh"
+#include "mpi_helper.hh"
 
 namespace MUSIC { namespace poisson {
 
@@ -59,6 +60,31 @@ void rank0_dist_solve( real_t* root_buf, size_t gnx, size_t gny, size_t gnz );
 template<typename real_t>
 void rank0_dist_gradient( int dir, real_t* root_buf, size_t gnx, size_t gny, size_t gnz,
                           bool deconvolve_cic );
+
+// Phase E.1b helper. Brackets a rank-0 Poisson compute block with collective
+// per-box gather (before) and scatter (after) so the rank-0 body sees full
+// per-box meshes for every hierarchy in `hs`. Workers participate in the
+// gather/scatter and then idle inside the phase_scope's worker_pump until
+// rank 0 broadcasts OP_DONE. The callable runs ONLY on rank 0.
+//
+// Usage:
+//   MUSIC::poisson::with_pbox_distributed([&]{
+//       err = the_poisson_solver->solve(f, u);
+//   }, f, u);
+//
+// Under default_owner_of_box==0 the gather/scatter calls are no-ops, so
+// existing single-rank/owner=0 runs stay bit-identical.
+template<typename Callable, typename... Hs>
+inline void with_pbox_distributed( Callable&& c, Hs&... hs )
+{
+    using swallow = int[];
+    (void)swallow{ 0, (hs.gather_per_box_to_root(), 0)... };
+    {
+        phase_scope _ps;
+        if( MUSIC::mpi::is_root() ) c();
+    }
+    (void)swallow{ 0, (hs.scatter_per_box_from_root(), 0)... };
+}
 
 }} // namespace MUSIC::poisson
 

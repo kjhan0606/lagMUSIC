@@ -1149,9 +1149,9 @@ int main (int argc, const char * argv[])
 			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_density(f);
 
 			grid_hierarchy u( f );	u.zero();
-			{ MUSIC::poisson::phase_scope _ps;
-			if( MUSIC::mpi::is_root() ) err = the_poisson_solver->solve(f, u);
-			}
+			MUSIC::poisson::with_pbox_distributed([&]{
+				err = the_poisson_solver->solve(f, u);
+			}, f, u);
 
 			if(!bdefd)
 				f.deallocate();
@@ -1163,36 +1163,35 @@ int main (int argc, const char * argv[])
 			//------------------------------------------------------------------------------
 			//... DM displacements
 			//------------------------------------------------------------------------------
-			{ MUSIC::poisson::phase_scope _ps;
-			if( MUSIC::mpi::is_root() )
 			{
 				grid_hierarchy data_forIO(u);
-				for( int icoord = 0; icoord < 3; ++icoord )
-				{
-					if( bdefd )
+				MUSIC::poisson::with_pbox_distributed([&]{
+					for( int icoord = 0; icoord < 3; ++icoord )
 					{
-						data_forIO.zero();
-						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
-						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-						the_poisson_solver->gradient_add(icoord, u, data_forIO );
+						if( bdefd )
+						{
+							data_forIO.zero();
+							*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+							poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+								       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
+							*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+							the_poisson_solver->gradient_add(icoord, u, data_forIO );
 
+						}
+						else
+							//... displacement
+							the_poisson_solver->gradient(icoord, u, data_forIO );
+						double dispmax = compute_finest_max( data_forIO );
+						LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
+						coarsen_density( rh_Poisson, data_forIO, false );
+						LOGUSER("Writing CDM displacements");
+						the_output_plugin->write_dm_position(icoord, data_forIO );
 					}
-					else
-						//... displacement
-					        the_poisson_solver->gradient(icoord, u, data_forIO );
-					double dispmax = compute_finest_max( data_forIO );
-					LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
-					coarsen_density( rh_Poisson, data_forIO, false );
-					LOGUSER("Writing CDM displacements");
-					the_output_plugin->write_dm_position(icoord, data_forIO );
-				}
-				if( do_baryons )
-					u.deallocate();
-				data_forIO.deallocate();
+				}, u, data_forIO);
+				// data_forIO falls out of SPMD scope below
 			}
-			}
+			if( do_baryons )
+				u.deallocate();
 			
 			
 			//------------------------------------------------------------------------------
@@ -1205,68 +1204,70 @@ int main (int argc, const char * argv[])
 				std::cout << "-------------------------------------------------------------\n";
 				LOGUSER("Computing baryon density...");
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, false, bbshift );
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
-				{
-				coarsen_density(rh_Poisson, f, bspectral_sampling);
-                f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-				normalize_density(f);
+				MUSIC::poisson::with_pbox_distributed([&]{
+				    coarsen_density(rh_Poisson, f, bspectral_sampling);
+				    f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				    normalize_density(f);
 
-				if( !do_LLA )
-				{
-					LOGUSER("Writing baryon density");
-					the_output_plugin->write_gas_density(f);
-				}
+				    if( !do_LLA )
+				    {
+				        LOGUSER("Writing baryon density");
+				        the_output_plugin->write_gas_density(f);
+				    }
+				}, f);
 
 				if( bsph )
 				{
-					u = f;	u.zero();
-					err = the_poisson_solver->solve(f, u);
+				    MUSIC::poisson::with_pbox_distributed([&]{
+				        u = f;	u.zero();
+				        err = the_poisson_solver->solve(f, u);
+				    }, f, u);
+				    if(!bdefd)
+				        f.deallocate();  // SPMD
+				    {
+				        grid_hierarchy data_forIO(u);
+				        MUSIC::poisson::with_pbox_distributed([&]{
+				            for( int icoord = 0; icoord < 3; ++icoord )
+				            {
+				                if( bdefd )
+				                {
+				                    data_forIO.zero();
+				                    *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                    poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+				                               data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons);
+				                    *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                    the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				                }
+				                else
+				                    //... displacement
+				                    the_poisson_solver->gradient(icoord, u, data_forIO );
 
-					if(!bdefd)
-						f.deallocate();
-
-					grid_hierarchy data_forIO(u);
-					for( int icoord = 0; icoord < 3; ++icoord )
-					{
-						if( bdefd )
-						{
-							data_forIO.zero();
-							*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-							poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-								       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons);
-							*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-							the_poisson_solver->gradient_add(icoord, u, data_forIO );
-
-						}
-						else
-							//... displacement
-							the_poisson_solver->gradient(icoord, u, data_forIO );
-
-						coarsen_density( rh_Poisson, data_forIO, false );
-                        LOGUSER("Writing baryon displacements");
-						the_output_plugin->write_gas_position(icoord, data_forIO );
-
-					}
-					u.deallocate();
-					data_forIO.deallocate();
-					if( bdefd )
-						f.deallocate();
+				                coarsen_density( rh_Poisson, data_forIO, false );
+				                LOGUSER("Writing baryon displacements");
+				                the_output_plugin->write_gas_position(icoord, data_forIO );
+				            }
+				        }, u, data_forIO);
+				    }
+				    u.deallocate();  // SPMD
+				    if( bdefd )
+				        f.deallocate();  // SPMD (idempotent)
 				}
 				else if( do_LLA )
 				{
-					u = f;	u.zero();
-					err = the_poisson_solver->solve(f, u);
-					compute_LLA_density( u, f,grad_order );
-					u.deallocate();
-					normalize_density(f);
-					LOGUSER("Writing baryon density");
-					the_output_plugin->write_gas_density(f);
+				    MUSIC::poisson::with_pbox_distributed([&]{
+				        u = f;	u.zero();
+				        err = the_poisson_solver->solve(f, u);
+				        compute_LLA_density( u, f,grad_order );
+				    }, f, u);
+				    u.deallocate();  // SPMD
+				    if( MUSIC::mpi::is_root() ) {
+				        normalize_density(f);
+				        LOGUSER("Writing baryon density");
+				        the_output_plugin->write_gas_density(f);
+				    }
 				}
 
-				f.deallocate();
-				} // end is_root() — baryon density
-				}
+				f.deallocate();  // SPMD
 			}
 			
 			
@@ -1285,66 +1286,54 @@ int main (int argc, const char * argv[])
 				{
 				  LOGUSER("Generating velocity perturbations...");
 				  GenerateDensityHierarchy( cf, the_transfer_function_plugin, vtotal , rh_TF, rand, f, false, false );
-				  { MUSIC::poisson::phase_scope _ps;
-				  if( MUSIC::mpi::is_root() )
-				  {
-				  coarsen_density(rh_Poisson, f, bspectral_sampling);
-				  f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-				  normalize_density(f);
-				  u = f;
-				  u.zero();
-				  err = the_poisson_solver->solve(f, u);
-
+				  MUSIC::poisson::with_pbox_distributed([&]{
+				    coarsen_density(rh_Poisson, f, bspectral_sampling);
+				    f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				    normalize_density(f);
+				    u = f;
+				    u.zero();
+				    err = the_poisson_solver->solve(f, u);
+				  }, f, u);
 				  if(!bdefd)
-				    f.deallocate();
-				  }
-				  }
+				    f.deallocate();  // SPMD
 				}
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
 				{
-				grid_hierarchy data_forIO(u);
-				for( int icoord = 0; icoord < 3; ++icoord )
-				{
-					//... displacement
-					if(bdefd)
-					{
-						data_forIO.zero();
-						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
-						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-						the_poisson_solver->gradient_add(icoord, u, data_forIO );
-					}
-					else
-						the_poisson_solver->gradient(icoord, u, data_forIO );
+				    grid_hierarchy data_forIO(u);
+				    MUSIC::poisson::with_pbox_distributed([&]{
+				        for( int icoord = 0; icoord < 3; ++icoord )
+				        {
+				            //... displacement
+				            if(bdefd)
+				            {
+				                data_forIO.zero();
+				                *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+				                           data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
+				                *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				            }
+				            else
+				                the_poisson_solver->gradient(icoord, u, data_forIO );
 
+				            //... multiply to get velocity
+				            data_forIO *= cosmo.vfact;
 
+				            double sigv = compute_finest_sigma( data_forIO );
+				            LOGINFO("sigma of %c-velocity of high-res particles is %f",'x'+icoord, sigv);
 
-					//... multiply to get velocity
-					data_forIO *= cosmo.vfact;
+				            coarsen_density( rh_Poisson, data_forIO, false );
+				            LOGUSER("Writing CDM velocities");
+				            the_output_plugin->write_dm_velocity(icoord, data_forIO);
 
-					//... velocity kick to keep refined region centered?
-
-					double sigv = compute_finest_sigma( data_forIO );
-					LOGINFO("sigma of %c-velocity of high-res particles is %f",'x'+icoord, sigv);
-
-					coarsen_density( rh_Poisson, data_forIO, false );
-					LOGUSER("Writing CDM velocities");
-					the_output_plugin->write_dm_velocity(icoord, data_forIO);
-
-					if( do_baryons )
-					{
-						LOGUSER("Writing baryon velocities");
-						the_output_plugin->write_gas_velocity(icoord, data_forIO);
-					}
-
+				            if( do_baryons )
+				            {
+				                LOGUSER("Writing baryon velocities");
+				                the_output_plugin->write_gas_velocity(icoord, data_forIO);
+				            }
+				        }
+				    }, u, data_forIO);
 				}
-
-				u.deallocate();
-				data_forIO.deallocate();
-				} // end is_root() — vtotal post-density
-				}
+				u.deallocate();  // SPMD
 
 			}
 			else
@@ -1358,51 +1347,47 @@ int main (int argc, const char * argv[])
 				//... we do baryons and have velocity transfer functions, or we do SPH and not to shift
 				//... do DM first
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vcdm , rh_TF, rand, f, false, false );
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
-				{
-				coarsen_density(rh_Poisson, f, bspectral_sampling);
-				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-				normalize_density(f);
-
-				u = f;	u.zero();
-
-				err = the_poisson_solver->solve(f, u);
-
+				MUSIC::poisson::with_pbox_distributed([&]{
+				    coarsen_density(rh_Poisson, f, bspectral_sampling);
+				    f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				    normalize_density(f);
+				    u = f;	u.zero();
+				    err = the_poisson_solver->solve(f, u);
+				}, f, u);
 				if(!bdefd)
-				  f.deallocate();
-
-				grid_hierarchy data_forIO(u);
-				for( int icoord = 0; icoord < 3; ++icoord )
+				    f.deallocate();  // SPMD
 				{
-					//... displacement
-					if(bdefd)
-					{
-						data_forIO.zero();
-						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
-						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-						the_poisson_solver->gradient_add(icoord, u, data_forIO );
-					}
-					else
-						the_poisson_solver->gradient(icoord, u, data_forIO );
+				    grid_hierarchy data_forIO(u);
+				    MUSIC::poisson::with_pbox_distributed([&]{
+				        for( int icoord = 0; icoord < 3; ++icoord )
+				        {
+				            //... displacement
+				            if(bdefd)
+				            {
+				                data_forIO.zero();
+				                *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+				                           data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
+				                *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				            }
+				            else
+				                the_poisson_solver->gradient(icoord, u, data_forIO );
 
-					//... multiply to get velocity
-					data_forIO *= cosmo.vfact;
+				            //... multiply to get velocity
+				            data_forIO *= cosmo.vfact;
 
-					double sigv = compute_finest_sigma( data_forIO );
-					LOGINFO("sigma of %c-velocity of high-res DM is %f",'x'+icoord, sigv);
+				            double sigv = compute_finest_sigma( data_forIO );
+				            LOGINFO("sigma of %c-velocity of high-res DM is %f",'x'+icoord, sigv);
 
-					coarsen_density( rh_Poisson, data_forIO, false );
-					LOGUSER("Writing CDM velocities");
-					the_output_plugin->write_dm_velocity(icoord, data_forIO);
+				            coarsen_density( rh_Poisson, data_forIO, false );
+				            LOGUSER("Writing CDM velocities");
+				            the_output_plugin->write_dm_velocity(icoord, data_forIO);
+				        }
+				    }, u, data_forIO);
 				}
-				u.deallocate();
-				data_forIO.deallocate();
-				f.deallocate();
-				} // end is_root() — vcdm post-density
-				}
+				u.deallocate();  // SPMD
+				f.deallocate();  // SPMD (idempotent w.r.t. earlier conditional)
 
 
 				std::cout << "=============================================================\n";
@@ -1411,51 +1396,47 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon velocitites...");
 				//... do baryons
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vbaryon , rh_TF, rand, f, false, bbshift );
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
-				{
-				coarsen_density(rh_Poisson, f, bspectral_sampling);
-				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-                normalize_density(f);
-
-				u = f;	u.zero();
-
-				err = the_poisson_solver->solve(f, u);
-
+				MUSIC::poisson::with_pbox_distributed([&]{
+				    coarsen_density(rh_Poisson, f, bspectral_sampling);
+				    f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				    normalize_density(f);
+				    u = f;	u.zero();
+				    err = the_poisson_solver->solve(f, u);
+				}, f, u);
 				if(!bdefd)
-					f.deallocate();
-
-				grid_hierarchy data_forIO(u);
-				for( int icoord = 0; icoord < 3; ++icoord )
+				    f.deallocate();  // SPMD
 				{
-					//... displacement
-					if(bdefd)
-					{
-						data_forIO.zero();
-						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-							       data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
-						*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-						the_poisson_solver->gradient_add(icoord, u, data_forIO );
-					}
-					else
-						the_poisson_solver->gradient(icoord, u, data_forIO );
+				    grid_hierarchy data_forIO(u);
+				    MUSIC::poisson::with_pbox_distributed([&]{
+				        for( int icoord = 0; icoord < 3; ++icoord )
+				        {
+				            //... displacement
+				            if(bdefd)
+				            {
+				                data_forIO.zero();
+				                *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+				                           data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
+				                *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				            }
+				            else
+				                the_poisson_solver->gradient(icoord, u, data_forIO );
 
-					//... multiply to get velocity
-					data_forIO *= cosmo.vfact;
+				            //... multiply to get velocity
+				            data_forIO *= cosmo.vfact;
 
-					double sigv = compute_finest_sigma( data_forIO );
-					LOGINFO("sigma of %c-velocity of high-res baryons is %f",'x'+icoord, sigv);
+				            double sigv = compute_finest_sigma( data_forIO );
+				            LOGINFO("sigma of %c-velocity of high-res baryons is %f",'x'+icoord, sigv);
 
-					coarsen_density( rh_Poisson, data_forIO, false );
-					LOGUSER("Writing baryon velocities");
-					the_output_plugin->write_gas_velocity(icoord, data_forIO);
+				            coarsen_density( rh_Poisson, data_forIO, false );
+				            LOGUSER("Writing baryon velocities");
+				            the_output_plugin->write_gas_velocity(icoord, data_forIO);
+				        }
+				    }, u, data_forIO);
 				}
-				u.deallocate();
-				f.deallocate();
-				data_forIO.deallocate();
-				} // end is_root() — vbaryon post-density
-				}
+				u.deallocate();  // SPMD
+				f.deallocate();  // SPMD
 			}
 		/*********************************************************************************************/
 		/*********************************************************************************************/

@@ -19,6 +19,7 @@
 
 #include "mesh.hh"
 #include "mg_dist.hh"
+#include "mg_profile.hh"
 
 #define BEGIN_MULTIGRID_NAMESPACE namespace multigrid {
 #define END_MULTIGRID_NAMESPACE }
@@ -249,8 +250,11 @@ void solver<S,I,O,T>::twoGrid( unsigned ilevel )
 		ny = uf->size(1),
 		nz = uf->size(2);
 
-	if( m_bperiodic && ilevel <= m_ilevelmin)
+	if( m_bperiodic && ilevel <= m_ilevelmin) {
+		double _tp = MUSIC::mg_profile::tic();
 		make_periodic( uf );
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_PERIODIC, _tp);
+	}
 	else if(!m_bperiodic)
 		setBC( ilevel );
 
@@ -261,42 +265,72 @@ void solver<S,I,O,T>::twoGrid( unsigned ilevel )
 	                            && (m_smoother == opt::sm_gauss_seidel);
 	const int  mg_dist_order  = S::order;
 
-	if( mg_dist_active )
+	if( mg_dist_active ){
+		double _tb = MUSIC::mg_profile::tic();
 		MUSIC::mg::mg_begin<T>( mg_dist_order, (int)ilevel, *uf, *ff );
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_MG_BEGIN_END, _tb);
+	}
 
 	//... do smoothing sweeps with specified solver
 	for( unsigned i=0; i<m_npresmooth; ++i ){
 
-		if( ilevel > m_ilevelmin )
+		if( ilevel > m_ilevelmin ){
+			double _ti = MUSIC::mg_profile::tic();
 			interp().interp_coarse_fine(ilevel,*uc,*uf);
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_INTERP_CF, _ti);
+		}
 
 		if( mg_dist_active ){
+			double _ts = MUSIC::mg_profile::tic();
 			MUSIC::mg::mg_scatter_uf<T>( *uf );
 			MUSIC::mg::mg_gs_sweep();
 			MUSIC::mg::mg_gather_uf<T>( *uf );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_DIST, _ts);
 		}
-		else if( m_smoother == opt::sm_gauss_seidel )
+		else if( m_smoother == opt::sm_gauss_seidel ){
+			double _ts = MUSIC::mg_profile::tic();
 			GaussSeidel( h, uf, ff );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_LOCAL, _ts);
+		}
 
-		else if( m_smoother == opt::sm_jacobi )
+		else if( m_smoother == opt::sm_jacobi ){
+			double _ts = MUSIC::mg_profile::tic();
 			Jacobi( h, uf, ff);
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_LOCAL, _ts);
+		}
 
-		else if( m_smoother == opt::sm_sor )
+		else if( m_smoother == opt::sm_sor ){
+			double _ts = MUSIC::mg_profile::tic();
 			SOR( h, uf, ff );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_LOCAL, _ts);
+		}
 
-		if( m_bperiodic && ilevel <= m_ilevelmin )
+		if( m_bperiodic && ilevel <= m_ilevelmin ){
+			double _tp = MUSIC::mg_profile::tic();
 			make_periodic( uf );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_PERIODIC, _tp);
+		}
 	}
 
 
-	m_gridop.restrict( *uf, *uc );
+	{
+		double _tr = MUSIC::mg_profile::tic();
+		m_gridop.restrict( *uf, *uc );
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_RESTRICT_U, _tr);
+	}
 	
 	//... essential!!
-	if( m_bperiodic && ilevel <= m_ilevelmin )
+	if( m_bperiodic && ilevel <= m_ilevelmin ){
+		double _tp = MUSIC::mg_profile::tic();
 		make_periodic( uc );
-	else if( ilevel > m_ilevelmin )
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_PERIODIC, _tp);
+	}
+	else if( ilevel > m_ilevelmin ){
+		double _ti = MUSIC::mg_profile::tic();
 		interp().interp_coarse_fine(ilevel,*uc,*uf);
-		
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_INTERP_CF, _ti);
+	}
+
 	
 	//....................................................................
 	//... we now use hard-coded restriction+operatore app, see below
@@ -328,10 +362,13 @@ void solver<S,I,O,T>::twoGrid( unsigned ilevel )
 		// share of tLu (via on_apply_restrict) and rank-0 gathers + writes into
 		// tLu at offset (oxp, oyp, ozp). The required pre-scatter of *uf is
 		// done inside mg_apply_restrict via mg_scatter_uf.
+		double _ta = MUSIC::mg_profile::tic();
 		MUSIC::mg::mg_apply_restrict<T>( *uf, tLu, oxp, oyp, ozp );
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_APPLY_REST_DIST, _ta);
 	}
 	else
 	{
+	double _ta = MUSIC::mg_profile::tic();
 	#pragma omp parallel for
 	for( int ix=0; ix<nx/2; ++ix )
 	{
@@ -351,22 +388,27 @@ void solver<S,I,O,T>::twoGrid( unsigned ilevel )
 							+m_scheme.apply( (*uf), iix+1, iiy+1, iiz+1 )
 						)/h2;
 	}
+	MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_APPLY_REST_LOCAL, _ta);
 	}
-	
+
 	//... restrict source term
-	m_gridop.restrict( *ff, *fc );
-	
-	int oi, oj, ok;
-	oi = ff->offset(0);
-	oj = ff->offset(1);
-	ok = ff->offset(2);
-	
-	#pragma omp parallel for 
-	for( int ix=oi; ix<oi+(int)ff->size(0)/2; ++ix )
-		for( int iy=oj; iy<oj+(int)ff->size(1)/2; ++iy )
-			for( int iz=ok; iz<ok+(int)ff->size(2)/2; ++iz )
-				(*fc)(ix,iy,iz) += ((tLu( ix, iy, iz ) - (m_scheme.apply( *uc, ix, iy, iz )/(4.0*h2))));
-									
+	{
+		double _trf = MUSIC::mg_profile::tic();
+		m_gridop.restrict( *ff, *fc );
+
+		int oi, oj, ok;
+		oi = ff->offset(0);
+		oj = ff->offset(1);
+		ok = ff->offset(2);
+
+		#pragma omp parallel for
+		for( int ix=oi; ix<oi+(int)ff->size(0)/2; ++ix )
+			for( int iy=oj; iy<oj+(int)ff->size(1)/2; ++iy )
+				for( int iz=ok; iz<ok+(int)ff->size(2)/2; ++iz )
+					(*fc)(ix,iy,iz) += ((tLu( ix, iy, iz ) - (m_scheme.apply( *uc, ix, iy, iz )/(4.0*h2))));
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_RESTRICT_F, _trf);
+	}
+
 	tLu.deallocate();
 	
 	meshvar_bnd ucsave(*uc,true);
@@ -381,55 +423,81 @@ void solver<S,I,O,T>::twoGrid( unsigned ilevel )
 		twoGrid( ilevel-1 );
 	
 	meshvar_bnd cc(*uc,false);
-	
-		
-	//... compute correction on coarse grid
-	#pragma omp parallel for
-	for( int ix=0; ix<(int)cc.size(0); ++ix )
-		for( int iy=0; iy<(int)cc.size(1); ++iy )
-			for( int iz=0; iz<(int)cc.size(2); ++iz )
-				cc(ix,iy,iz) = (*uc)(ix,iy,iz) - ucsave(ix,iy,iz);	
-		
-	ucsave.deallocate();
 
-	if( m_bperiodic && ilevel <= m_ilevelmin )
-		make_periodic( &cc );
+	{
+		double _tc = MUSIC::mg_profile::tic();
+		//... compute correction on coarse grid
+		#pragma omp parallel for
+		for( int ix=0; ix<(int)cc.size(0); ++ix )
+			for( int iy=0; iy<(int)cc.size(1); ++iy )
+				for( int iz=0; iz<(int)cc.size(2); ++iz )
+					cc(ix,iy,iz) = (*uc)(ix,iy,iz) - ucsave(ix,iy,iz);
 
-	m_gridop.prolong_add( cc, *uf );
-	
+		ucsave.deallocate();
+
+		if( m_bperiodic && ilevel <= m_ilevelmin )
+			make_periodic( &cc );
+
+		m_gridop.prolong_add( cc, *uf );
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_PROLONG_CC, _tc);
+	}
+
 	//... interpolate and apply coarse-fine boundary conditions on fine level
-	if( m_bperiodic && ilevel <= m_ilevelmin )
+	if( m_bperiodic && ilevel <= m_ilevelmin ){
+		double _tp = MUSIC::mg_profile::tic();
 		make_periodic( uf );
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_PERIODIC, _tp);
+	}
 	else if(!m_bperiodic)
 		setBC( ilevel );
-	
+
 	//... do smoothing sweeps with specified solver
 	for( unsigned i=0; i<m_npostsmooth; ++i ){
 
-		if( ilevel > m_ilevelmin )
+		if( ilevel > m_ilevelmin ){
+			double _ti = MUSIC::mg_profile::tic();
 			interp().interp_coarse_fine(ilevel,*uc,*uf);
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_INTERP_CF, _ti);
+		}
 
 		if( mg_dist_active ){
+			double _ts = MUSIC::mg_profile::tic();
 			MUSIC::mg::mg_scatter_uf<T>( *uf );
 			MUSIC::mg::mg_gs_sweep();
 			MUSIC::mg::mg_gather_uf<T>( *uf );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_DIST, _ts);
 		}
-		else if( m_smoother == opt::sm_gauss_seidel )
+		else if( m_smoother == opt::sm_gauss_seidel ){
+			double _ts = MUSIC::mg_profile::tic();
 			GaussSeidel( h, uf, ff );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_LOCAL, _ts);
+		}
 
-		else if( m_smoother == opt::sm_jacobi )
+		else if( m_smoother == opt::sm_jacobi ){
+			double _ts = MUSIC::mg_profile::tic();
 			Jacobi( h, uf, ff);
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_LOCAL, _ts);
+		}
 
-		else if( m_smoother == opt::sm_sor )
+		else if( m_smoother == opt::sm_sor ){
+			double _ts = MUSIC::mg_profile::tic();
 			SOR( h, uf, ff );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_SMOOTH_LOCAL, _ts);
+		}
 
-		if( m_bperiodic && ilevel <= m_ilevelmin )
+		if( m_bperiodic && ilevel <= m_ilevelmin ){
+			double _tp = MUSIC::mg_profile::tic();
 			make_periodic( uf );
+			MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_PERIODIC, _tp);
+		}
 
 	}
 
-	if( mg_dist_active )
+	if( mg_dist_active ){
+		double _tb = MUSIC::mg_profile::tic();
 		MUSIC::mg::mg_end<T>( *uf );
+		MUSIC::mg_profile::add(ilevel, MUSIC::mg_profile::P_MG_BEGIN_END, _tb);
+	}
 
 }
 
@@ -810,29 +878,40 @@ double solver<S,I,O,T>::solve( GridHierarchy<T>& uh, double acc, double h, bool 
 
 	//err = compute_RMS_resid( *m_pu, *m_pf, fullverbose );
 
+	MUSIC::mg_profile::reset();
+	double _tsolve = MUSIC::mg_profile::tic();
+
 	//... iterate ...//
 	while (true)
 	{
-		
+
 		LOGUSER("Performing multi-grid V-cycle...");
 		twoGrid( uh.levelmax() );
-		
+
 		//err = compute_RMS_resid( *m_pu, *m_pf, fullverbose );
 		err = compute_error( *m_pu, *m_pf, fullverbose );
 		++niter;
-		
+
 		if( fullverbose ){
 			LOGUSER("  multigrid iteration %3d, maximum RMS residual = %g", niter, err );
 			std::cout << "   - Step No. " << std::setw(3) << niter << ", Max Err = " << err << std::endl;
 			std::cout << "     ---------------------------------------------------\n";
 		}
-		
+
 		if( err < maxerr )
 			maxerr = err;
-			
+
 		if( (niter > 1) && ((err < acc) || (niter > 20)) )
 			break;
-	}		
+	}
+
+	{
+		double _tw = MUSIC::mg_profile::tic() - _tsolve;
+		char tag[64];
+		snprintf(tag, sizeof(tag), "solve niter=%u wall=%.4fs", niter, _tw);
+		MUSIC::mg_profile::report(tag, uh.levelmin(), uh.levelmax());
+		MUSIC::mg_profile::reset();
+	}
 	
 	if( err > acc )
 	{

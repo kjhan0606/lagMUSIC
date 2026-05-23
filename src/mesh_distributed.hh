@@ -112,7 +112,7 @@ inline Meshvar<real_t>* make_slab_meshvar( size_t gnx, size_t gny, size_t gnz,
 template<typename real_t>
 inline MeshvarBnd<real_t>* make_slab_meshvarbnd( int nbnd,
                                                  size_t gnx, size_t gny, size_t gnz,
-                                                 int offx=0, int offy=0, int offz=0 )
+                                                 int offx, int offy, int offz )
 {
 	// MeshvarBnd uses no FFTW padding (caller does FFTs via a separate Meshvar).
 	slab_layout s = compute_slab_layout(gnx, gny, gnz, /*fftw_inplace_pad=*/false);

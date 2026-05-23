@@ -949,6 +949,18 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 			top->copy(*delta.get_grid(levelmin));
 		}
 
+#ifdef USE_MPI
+		// Phase E.2.1a smoke test: verify the E.2.0 slab gather/scatter plumbing
+		// round-trips bit-identical on real density data. Opt-in via config
+		// (default off so production runs are unchanged). Runs only on the
+		// kspaceTF=true SPMD path because that's the first consumer site we
+		// plan to migrate to slab storage in E.2.1b.
+		if (MUSIC::mpi::size() > 1 && cf.getValueSafe<bool>("setup", "test_slab_roundtrip", false)) {
+			delta.test_slab_roundtrip_at((unsigned)levelmin,
+			                              (size_t)nbase, (size_t)nbase, (size_t)nbase);
+		}
+#endif
+
 		for (int i = 1; i < nlevels; ++i)
 		{
 			if (is_root) {
@@ -1335,17 +1347,20 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 
 	delete the_tf_kernel;
 
-	// Phase D.2b: allocate per-box MeshvarBnd sub-meshes alongside the union
-	// meshes. This is bookkeeping/verification only — the union meshes still
-	// carry all density data consumed by the Poisson solver and output
-	// plugins. D.3 will migrate compute paths to read per-box meshes.
+	// Phase D.2b/E.1b: allocate per-box MeshvarBnd sub-meshes alongside the
+	// union meshes. populate is SPMD (every rank allocs only the boxes it
+	// owns per m_pbox_owner_). The union mesh lives on rank 0, so initial
+	// sync runs there: rank 0 alloc_root_tenants -> sync_per_box_from_union
+	// fills both owned slots and tenants -> collective scatter ships tenants
+	// to their owners and frees the rank-0 tenants. Under owner=0 the alloc
+	// and scatter helpers are no-ops (every box is already on rank 0).
+	delta.populate_per_box_meshes(refh.get_level_boxes());
 	if( MUSIC::mpi::is_root() ){
-		delta.populate_per_box_meshes(refh.get_level_boxes());
-		// Phase D.3.1: copy density data from union mesh into per-box meshes
-		// so downstream consumers (D.4 output) can read per-cluster slices.
+		delta.alloc_root_tenants();
 		delta.sync_per_box_from_union();
 		delta.log_per_box_stats("density");
 	}
+	delta.scatter_per_box_from_root();
 
 #ifndef SINGLETHREAD_FFTW
 	tend = omp_get_wtime();

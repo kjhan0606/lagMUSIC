@@ -27,10 +27,11 @@ namespace MUSIC { namespace poisson {
 
 // Op codes broadcast from rank 0 to workers in worker_pump().
 enum Op {
-	OP_DONE       = 0,
-	OP_SOLVE      = 1,
-	OP_GRADIENT   = 2,
-	OP_SOLVE_SLAB = 3  // Phase E.2.2a: solve with per-rank slab in/out registered via set_slab_solve_inout
+	OP_DONE          = 0,
+	OP_SOLVE         = 1,
+	OP_GRADIENT      = 2,
+	OP_SOLVE_SLAB    = 3,  // Phase E.2.2a: solve with per-rank slab in/out registered via set_slab_solve_inout
+	OP_GRADIENT_SLAB = 4   // Phase E.2.3: gradient with per-rank slab in/out (reuses set_slab_solve_inout plumbing)
 };
 
 // Workers (non-root) call this between SPMD phases to wait for fft_poisson
@@ -78,6 +79,15 @@ void set_slab_solve_inout( ::MeshvarBnd<real_t>* src, ::MeshvarBnd<real_t>* dst 
 template<typename real_t>
 void rank0_dist_solve_slab( size_t gnx, size_t gny, size_t gnz );
 // ----- end Phase E.2.2a ----------------------------------------------------
+
+// ----- Phase E.2.3: SPMD slab-direct gradient ------------------------------
+// Same plumbing as the slab solve (set_slab_solve_inout registers src/dst
+// pointers before phase_scope). rank 0 broadcasts OP_GRADIENT_SLAB; both
+// ranks 0 and workers run run_dist_fft_op_slab via the worker dispatch.
+template<typename real_t>
+void rank0_dist_gradient_slab( int dir, size_t gnx, size_t gny, size_t gnz,
+                                bool deconvolve_cic );
+// ----- end Phase E.2.3 -----------------------------------------------------
 
 // Phase E.1b helper. Brackets a rank-0 Poisson compute block with collective
 // per-box gather (before) and scatter (after) so the rank-0 body sees full
@@ -159,6 +169,60 @@ inline void slab_solve_unigrid( GH& f, GH& u,
 #endif
 }
 // ----- end Phase E.2.2b ----------------------------------------------------
+
+// ----- Phase E.2.3: production slab-gradient wrapper for unigrid FFT path --
+// All-ranks SPMD wrapper around the E.2.3 slab-gradient primitive. Bypasses
+// fft_poisson_plugin::gradient (rank 0 plugin call is replaced by the SPMD
+// slab gradient, which is bit-identical to the full-path serial gradient on
+// the interior cells).
+//
+// Preconditions:
+//   - levelmin==levelmax (k-space FFT poisson/gradient is unigrid-only)
+//   - u (potential) has full storage populated on rank 0; workers' u may be
+//     an empty shell.
+//   - Du is constructed from u (e.g. data_forIO(u)) so it has matching shape;
+//     interior cells will be overwritten with the gradient.
+//
+// Postconditions on rank 0:
+//   - Du.get_grid(ilevel)'s INTERIOR cells hold the displacement field; halos
+//     are whatever convert_level_full_to_slab+slab_to_full produces (not BC'd,
+//     matching the serial fft_poisson_plugin::gradient which also leaves
+//     halos as the initial Du=u copy).
+//
+// Must run OUTSIDE phase_scope (the convert helpers are collective).
+template<typename GH>
+inline void slab_gradient_unigrid( int dir, GH& u, GH& Du,
+                                    unsigned ilevel,
+                                    size_t gnx, size_t gny, size_t gnz,
+                                    bool deconvolve_cic )
+{
+#ifdef USE_MPI
+    if( MUSIC::mpi::size() <= 1 ) return; // caller falls through to serial path
+
+    typedef typename GH::real_t real_t;
+
+    u.convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+    Du.convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+
+    set_slab_solve_inout<real_t>( u.get_grid(ilevel), Du.get_grid(ilevel) );
+    {
+        phase_scope _ps;
+        if( MUSIC::mpi::is_root() )
+            rank0_dist_gradient_slab<real_t>( dir, gnx, gny, gnz, deconvolve_cic );
+    }
+    set_slab_solve_inout<real_t>( (::MeshvarBnd<real_t>*)NULL,
+                                   (::MeshvarBnd<real_t>*)NULL );
+
+    Du.convert_level_slab_to_full( ilevel );
+    u.convert_level_slab_to_full( ilevel );
+    // No periodic BC on Du: serial fft_poisson_plugin::gradient leaves Du
+    // halos as the initial Du=u copy and downstream code only reads interior.
+#else
+    (void)dir; (void)u; (void)Du; (void)ilevel; (void)gnx; (void)gny; (void)gnz;
+    (void)deconvolve_cic;
+#endif
+}
+// ----- end Phase E.2.3 -----------------------------------------------------
 
 }} // namespace MUSIC::poisson
 

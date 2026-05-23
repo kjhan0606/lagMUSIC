@@ -215,6 +215,36 @@ static void run_dist_fft_op_slab( int op, int dir,
 				}
 			}
 		}
+	} else if( op == OP_GRADIENT_SLAB ){
+		// multiply by i*k_dir, with optional CIC deconvolution
+		// (matches kernel in run_dist_fft_op / fft_poisson_plugin::gradient)
+		#pragma omp parallel for
+		for( size_t lix = 0; lix < local_nx; ++lix ){
+			const int gix = (int)(local_x_off + lix);
+			int ii = gix; if( ii > (int)gnx/2 ) ii -= (int)gnx;
+			for( int j = 0; j < (int)gny; ++j ){
+				int jj = j; if( jj > (int)gny/2 ) jj -= (int)gny;
+				for( int k = 0; k < (int)nz_complex; ++k ){
+					double ki = (double)ii, kj = (double)jj, kk = (double)k;
+					double kkdir[3] = { kfac*ki, kfac*kj, kfac*kk };
+					double kdir = kkdir[dir];
+					size_t idx = (lix*gny + (size_t)j) * nz_complex + (size_t)k;
+					double re = RE(cdata[idx]);
+					double im = IM(cdata[idx]);
+					RE(cdata[idx]) =  fac*im*kdir;
+					IM(cdata[idx]) = -fac*re*kdir;
+					if( deconvolve_cic ){
+						double dfx, dfy, dfz;
+						dfx = M_PI*ki/(double)gnx; dfx = (gix!=0) ? sin(dfx)/dfx : 1.0;
+						dfy = M_PI*kj/(double)gny; dfy = (j  !=0) ? sin(dfy)/dfy : 1.0;
+						dfz = M_PI*kk/(double)gnz; dfz = (k  !=0) ? sin(dfz)/dfz : 1.0;
+						double w = 1.0/(dfx*dfy*dfz); w = w*w;
+						RE(cdata[idx]) *= w;
+						IM(cdata[idx]) *= w;
+					}
+				}
+			}
+		}
 	}
 
 	if( local_x_off == 0 && local_nx > 0 ){
@@ -238,7 +268,6 @@ static void run_dist_fft_op_slab( int op, int dir,
 	}
 
 	delete scratch;
-	(void)dir; (void)deconvolve_cic;
 #else
 	(void)op; (void)dir; (void)src_slab; (void)dst_slab; (void)gnx; (void)gny; (void)gnz; (void)deconvolve_cic;
 #endif
@@ -270,7 +299,7 @@ void worker_pump()
 		const bool   dec = (meta[5] != 0);
 		if( op == OP_SOLVE || op == OP_GRADIENT ){
 			run_dist_fft_op<fftw_real>(op, dir, NULL, gnx, gny, gnz, dec);
-		} else if( op == OP_SOLVE_SLAB ){
+		} else if( op == OP_SOLVE_SLAB || op == OP_GRADIENT_SLAB ){
 			run_dist_fft_op_slab<fftw_real>(op, dir, g_slab_solve_src, g_slab_solve_dst,
 			                                gnx, gny, gnz, dec);
 		} else if( op >= MUSIC::mg::OP_MG_BEGIN && op <= MUSIC::mg::OP_MG_INTERP_CF ){
@@ -371,17 +400,43 @@ void rank0_dist_solve_slab( size_t gnx, size_t gny, size_t gnz )
 #endif
 }
 
+// ----- Phase E.2.3 public API ----------------------------------------------
+// Reuses g_slab_solve_src/dst (the in/out plumbing is shared across slab
+// ops; caller calls set_slab_solve_inout before each phase_scope).
+template<typename real_t>
+void rank0_dist_gradient_slab( int dir, size_t gnx, size_t gny, size_t gnz,
+                                bool deconvolve_cic )
+{
+#ifdef USE_MPI
+	if( MUSIC::mpi::size() <= 1 ){
+		LOGERR("MUSIC::poisson::rank0_dist_gradient_slab called with size<=1");
+		throw std::runtime_error("rank0_dist_gradient_slab called outside MPI");
+	}
+	int meta[META_LEN] = { OP_GRADIENT_SLAB, (int)gnx, (int)gny, (int)gnz,
+	                        dir, deconvolve_cic ? 1 : 0 };
+	MPI_Bcast(meta, META_LEN, MPI_INT, 0, MUSIC::mpi::world());
+	run_dist_fft_op_slab<real_t>(OP_GRADIENT_SLAB, dir,
+	                              reinterpret_cast<MeshvarBnd<real_t>*>(g_slab_solve_src),
+	                              reinterpret_cast<MeshvarBnd<real_t>*>(g_slab_solve_dst),
+	                              gnx, gny, gnz, deconvolve_cic);
+#else
+	(void)dir; (void)gnx; (void)gny; (void)gnz; (void)deconvolve_cic;
+#endif
+}
+
 // explicit instantiations for the build's precision (matches the FFTW plans)
 #ifdef SINGLE_PRECISION
 template void rank0_dist_solve<float >(float *, size_t, size_t, size_t);
 template void rank0_dist_gradient<float >(int, float *, size_t, size_t, size_t, bool);
 template void set_slab_solve_inout<float >(MeshvarBnd<float >*, MeshvarBnd<float >*);
 template void rank0_dist_solve_slab<float >(size_t, size_t, size_t);
+template void rank0_dist_gradient_slab<float >(int, size_t, size_t, size_t, bool);
 #else
 template void rank0_dist_solve<double>(double*, size_t, size_t, size_t);
 template void rank0_dist_gradient<double>(int, double*, size_t, size_t, size_t, bool);
 template void set_slab_solve_inout<double>(MeshvarBnd<double>*, MeshvarBnd<double>*);
 template void rank0_dist_solve_slab<double>(size_t, size_t, size_t);
+template void rank0_dist_gradient_slab<double>(int, size_t, size_t, size_t, bool);
 #endif
 
 }} // namespace MUSIC::poisson

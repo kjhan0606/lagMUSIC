@@ -1176,29 +1176,47 @@ int main (int argc, const char * argv[])
 			//------------------------------------------------------------------------------
 			{
 				grid_hierarchy data_forIO(u);
-				MUSIC::poisson::with_pbox_distributed([&]{
-					for( int icoord = 0; icoord < 3; ++icoord )
-					{
-						if( bdefd )
-						{
-							data_forIO.zero();
-							*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-							poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-								       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
-							*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-							the_poisson_solver->gradient_add(icoord, u, data_forIO );
-
+				const bool use_slab_grad = kspace && (lbase==lmax)
+					&& cf.getValueSafe<bool>("setup", "slab_solve_unigrid", false)
+					&& MUSIC::mpi::size() > 1;
+				if( use_slab_grad ){
+					const size_t ng = (size_t)1 << lmax;
+					for( int icoord = 0; icoord < 3; ++icoord ){
+						MUSIC::poisson::slab_gradient_unigrid( icoord, u, data_forIO,
+						                                       lmax, ng, ng, ng, decic_DM );
+						if( MUSIC::mpi::is_root() ){
+							double dispmax = compute_finest_max( data_forIO );
+							LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
+							coarsen_density( rh_Poisson, data_forIO, false );
+							LOGUSER("Writing CDM displacements");
+							the_output_plugin->write_dm_position(icoord, data_forIO );
 						}
-						else
-							//... displacement
-							the_poisson_solver->gradient(icoord, u, data_forIO );
-						double dispmax = compute_finest_max( data_forIO );
-						LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
-						coarsen_density( rh_Poisson, data_forIO, false );
-						LOGUSER("Writing CDM displacements");
-						the_output_plugin->write_dm_position(icoord, data_forIO );
 					}
-				}, u, data_forIO);
+				} else {
+					MUSIC::poisson::with_pbox_distributed([&]{
+						for( int icoord = 0; icoord < 3; ++icoord )
+						{
+							if( bdefd )
+							{
+								data_forIO.zero();
+								*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+								poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+									       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
+								*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+								the_poisson_solver->gradient_add(icoord, u, data_forIO );
+
+							}
+							else
+								//... displacement
+								the_poisson_solver->gradient(icoord, u, data_forIO );
+							double dispmax = compute_finest_max( data_forIO );
+							LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
+							coarsen_density( rh_Poisson, data_forIO, false );
+							LOGUSER("Writing CDM displacements");
+							the_output_plugin->write_dm_position(icoord, data_forIO );
+						}
+					}, u, data_forIO);
+				}
 				// data_forIO falls out of SPMD scope below
 			}
 			if( do_baryons )

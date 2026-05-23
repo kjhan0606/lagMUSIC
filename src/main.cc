@@ -1149,9 +1149,20 @@ int main (int argc, const char * argv[])
 			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_density(f);
 
 			grid_hierarchy u( f );	u.zero();
-			MUSIC::poisson::with_pbox_distributed([&]{
-				err = the_poisson_solver->solve(f, u);
-			}, f, u);
+			{
+				const bool use_slab_solve = kspace && (lbase==lmax)
+					&& cf.getValueSafe<bool>("setup", "slab_solve_unigrid", false)
+					&& MUSIC::mpi::size() > 1;
+				if( use_slab_solve ){
+					const size_t ng = (size_t)1 << lmax;
+					MUSIC::poisson::slab_solve_unigrid( f, u, lmax, ng, ng, ng );
+					err = 0.0;
+				} else {
+					MUSIC::poisson::with_pbox_distributed([&]{
+						err = the_poisson_solver->solve(f, u);
+					}, f, u);
+				}
+			}
 
 			if(!bdefd)
 				f.deallocate();

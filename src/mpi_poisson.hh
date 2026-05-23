@@ -104,6 +104,62 @@ inline void with_pbox_distributed( Callable&& c, Hs&... hs )
     (void)swallow{ 0, (hs.scatter_per_box_from_root(), 0)... };
 }
 
+// ----- Phase E.2.2b: production slab-solve wrapper for unigrid FFT path ----
+// All-ranks SPMD wrapper around the E.2.2a slab-solve primitive. Bypasses
+// fft_poisson_plugin::solve entirely (the rank-0 plugin call is replaced by
+// the SPMD slab solve, which gives the same answer bit-identical).
+//
+// Preconditions:
+//   - levelmin==levelmax (k-space FFT poisson is unigrid-only)
+//   - f has the density populated on rank 0 (full storage); workers' f may
+//     be an empty shell.
+//   - u was constructed from f and zero'd on rank 0.
+//
+// Postconditions on rank 0:
+//   - u.get_grid(ilevel) holds the Poisson solution as a full MeshvarBnd
+//     with periodic halos applied. f is restored to full storage with the
+//     original density. Downstream code (gradient_add / write_dm_potential)
+//     sees the same shape as the rank-0-only fft_poisson_plugin::solve path.
+//
+// Must run OUTSIDE phase_scope (the convert helpers and gather are collective
+// and cannot run while workers are parked in worker_pump).
+template<typename real_t>
+void apply_periodic_bc_unigrid_rank0( ::MeshvarBnd<real_t>& u, int nx, int ny, int nz );
+
+template<typename GH>
+inline void slab_solve_unigrid( GH& f, GH& u,
+                                 unsigned ilevel,
+                                 size_t gnx, size_t gny, size_t gnz )
+{
+#ifdef USE_MPI
+    if( MUSIC::mpi::size() <= 1 ) return; // caller falls through to serial path
+
+    typedef typename GH::real_t real_t;
+
+    f.convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+    u.convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+
+    set_slab_solve_inout<real_t>( f.get_grid(ilevel), u.get_grid(ilevel) );
+    {
+        phase_scope _ps;
+        if( MUSIC::mpi::is_root() )
+            rank0_dist_solve_slab<real_t>( gnx, gny, gnz );
+    }
+    set_slab_solve_inout<real_t>( (::MeshvarBnd<real_t>*)NULL,
+                                   (::MeshvarBnd<real_t>*)NULL );
+
+    u.convert_level_slab_to_full( ilevel );
+    f.convert_level_slab_to_full( ilevel ); // restore f for downstream gradient_add
+
+    if( MUSIC::mpi::is_root() )
+        apply_periodic_bc_unigrid_rank0<real_t>(
+            *u.get_grid(ilevel), (int)gnx, (int)gny, (int)gnz );
+#else
+    (void)f; (void)u; (void)ilevel; (void)gnx; (void)gny; (void)gnz;
+#endif
+}
+// ----- end Phase E.2.2b ----------------------------------------------------
+
 }} // namespace MUSIC::poisson
 
 #endif // __MPI_POISSON_HH

@@ -14,6 +14,57 @@
 #include "Numerics.hh"
 #include "mpi_helper.hh"
 #include "mpi_poisson.hh"
+#include "mesh.hh"
+
+// Rank-0 periodic wrap on a full unigrid MeshvarBnd. Lives in MUSIC::poisson
+// so the SPMD slab path in mpi_poisson.hh can call it after gathering the
+// slab back to rank 0. Existing fft_poisson_plugin::solve still calls it
+// from the full-path branch (extracted from the original inline BC loops).
+namespace MUSIC { namespace poisson {
+
+template<typename real_t>
+void apply_periodic_bc_unigrid_rank0( MeshvarBnd<real_t>& u, int nx, int ny, int nz )
+{
+    const int nb = u.m_nbnd;
+    for( int iy=-nb; iy<ny+nb; ++iy )
+        for( int iz=-nb; iz<nz+nb; ++iz )
+        {
+            const int iiy( (iy+ny)%ny ), iiz( (iz+nz)%nz );
+            for( int i=-nb; i<0; ++i )
+            {
+                u(i,iy,iz)       = u(nx+i,iiy,iiz);
+                u(nx-1-i,iy,iz)  = u(-1-i,iiy,iiz);
+            }
+        }
+    for( int ix=-nb; ix<nx+nb; ++ix )
+        for( int iz=-nb; iz<nz+nb; ++iz )
+        {
+            const int iix( (ix+nx)%nx ), iiz( (iz+nz)%nz );
+            for( int i=-nb; i<0; ++i )
+            {
+                u(ix,i,iz)       = u(iix,ny+i,iiz);
+                u(ix,ny-1-i,iz)  = u(iix,-1-i,iiz);
+            }
+        }
+    for( int ix=-nb; ix<nx+nb; ++ix )
+        for( int iy=-nb; iy<ny+nb; ++iy )
+        {
+            const int iix( (ix+nx)%nx ), iiy( (iy+ny)%ny );
+            for( int i=-nb; i<0; ++i )
+            {
+                u(ix,iy,i)       = u(iix,iiy,nz+i);
+                u(ix,iy,nz-1-i)  = u(iix,iiy,-1-i);
+            }
+        }
+}
+
+#ifdef SINGLE_PRECISION
+template void apply_periodic_bc_unigrid_rank0<float >( MeshvarBnd<float >&, int, int, int );
+#else
+template void apply_periodic_bc_unigrid_rank0<double>( MeshvarBnd<double>&, int, int, int );
+#endif
+
+}} // namespace MUSIC::poisson
 
 std::map< std::string, poisson_plugin_creator *>& 
 get_poisson_plugin_map()
@@ -679,48 +730,9 @@ double fft_poisson_plugin::solve( grid_hierarchy& f, grid_hierarchy& u )
 	delete[] data;
 	
 	//... set boundary values ................................
-	int nb = u.get_grid(u.levelmax())->m_nbnd;
-	for( int iy=-nb; iy<ny+nb; ++iy )
-		for( int iz=-nb; iz<nz+nb; ++iz )
-		{
-			int iiy( (iy+ny)%ny ), iiz( (iz+nz)%nz );
-			
-			for( int i=-nb; i<0; ++i )
-			{
-				(*u.get_grid(u.levelmax()))(i,iy,iz) = (*u.get_grid(u.levelmax()))(nx+i,iiy,iiz);
-				(*u.get_grid(u.levelmax()))(nx-1-i,iy,iz) = (*u.get_grid(u.levelmax()))(-1-i,iiy,iiz);	
-			}
-			
-		}
-		
-	for( int ix=-nb; ix<nx+nb; ++ix )
-		for( int iz=-nb; iz<nz+nb; ++iz )
-		{
-			int iix( (ix+nx)%nx ), iiz( (iz+nz)%nz );
-			
-			for( int i=-nb; i<0; ++i )
-			{
-				(*u.get_grid(u.levelmax()))(ix,i,iz) = (*u.get_grid(u.levelmax()))(iix,ny+i,iiz);
-				(*u.get_grid(u.levelmax()))(ix,ny-1-i,iz) = (*u.get_grid(u.levelmax()))(iix,-1-i,iiz);
-			}
-		}
-		
-	for( int ix=-nb; ix<nx+nb; ++ix )
-		for( int iy=-nb; iy<ny+nb; ++iy )
-		{
-			int iix( (ix+nx)%nx ), iiy( (iy+ny)%ny );
-			
-			for( int i=-nb; i<0; ++i )
-			{
-				(*u.get_grid(u.levelmax()))(ix,iy,i) = (*u.get_grid(u.levelmax()))(iix,iiy,nz+i);
-				(*u.get_grid(u.levelmax()))(ix,iy,nz-1-i) = (*u.get_grid(u.levelmax()))(iix,iiy,-1-i);
-			}
-		}
-		
-		
+	MUSIC::poisson::apply_periodic_bc_unigrid_rank0<fftw_real>(
+	    *u.get_grid(u.levelmax()), nx, ny, nz );
 
-	
-	
 	LOGUSER("Done with k-space Poisson solver.");
 	return 0.0;
 }

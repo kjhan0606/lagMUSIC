@@ -634,7 +634,9 @@ template< typename T >
 class GridHierarchy
 {
 public:
-	
+
+	typedef T real_t;
+
 	//! number of ghost cells on boundary
 	size_t m_nbnd;
 	

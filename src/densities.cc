@@ -972,6 +972,15 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 			                                  (size_t)nbase, (size_t)nbase, (size_t)nbase);
 			delta.convert_level_slab_to_full((unsigned)levelmin);
 		}
+
+		// Phase E.2.2a smoke test: verify the SPMD slab-solve primitive matches
+		// the existing Scatterv/FFT/Gatherv full-path solve bit-by-bit. Opt-in
+		// (default off). Internally flips storage full→slab, runs the slab
+		// solve, gathers, compares, then flips slab→full so delta is restored.
+		if (MUSIC::mpi::size() > 1 && cf.getValueSafe<bool>("setup", "test_slab_solve", false)) {
+			delta.test_slab_solve_at((unsigned)levelmin,
+			                          (size_t)nbase, (size_t)nbase, (size_t)nbase);
+		}
 #endif
 
 		for (int i = 1; i < nlevels; ++i)

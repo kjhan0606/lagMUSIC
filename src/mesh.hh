@@ -25,6 +25,12 @@
 
 #include "region_generator.hh"
 
+// mpi_poisson.hh forward-declares MeshvarBnd (the full template is defined
+// later in this file), so this include is non-circular. We need it for
+// MUSIC::poisson::{phase_scope, rank0_dist_solve, rank0_dist_solve_slab,
+// set_slab_solve_inout} used by test_slab_solve_at below.
+#include "mpi_poisson.hh"
+
 class refinement_mask
 {
 protected:
@@ -1774,6 +1780,149 @@ public:
 	                     MUSIC::mpi::world());
 	        }
 	    }
+#else
+	    (void)ilevel; (void)gnx; (void)gny; (void)gnz;
+#endif
+	}
+	//---------------------------------------------------------------------
+
+	//-------- Phase E.2.2a: SPMD slab-solve validation test --------------
+	//! Standalone smoke test. Computes the Poisson solve two ways and
+	//! checks bit-identical:
+	//!   A) "expected": rank 0 snapshots delta union → padded buffer →
+	//!      rank0_dist_solve (existing Scatterv/FFT/Gatherv path).
+	//!   B) "computed": flip level L to slab storage → allocate dst slab →
+	//!      register pointers → rank0_dist_solve_slab (E.2.2a SPMD path
+	//!      with no Scatterv/Gatherv) → gather dst back to rank 0.
+	//! Then convert_level_slab_to_full restores delta to its original full
+	//! storage on rank 0 so callers can continue unchanged.
+	//!
+	//! Must run OUTSIDE phase_scope (the convert helpers and gather are
+	//! collective and cannot run while workers are parked in worker_pump).
+	void test_slab_solve_at( unsigned ilevel,
+	                          size_t gnx, size_t gny, size_t gnz )
+	{
+#ifdef USE_MPI
+	    const int nproc = MUSIC::mpi::size();
+	    if( nproc <= 1 ) return;
+	    const int rk = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+	    const int tag_gather = 2500; // distinct from 1500/1700/1800/1900/2100/2300
+
+	    // ---- compute slab layout via factory ----
+	    MeshvarBnd<T> * tmp_slab = MUSIC::dist::make_slab_meshvarbnd<T>(
+	        (int)m_nbnd, gnx, gny, gnz, 0, 0, 0 );
+	    const size_t lx_start = (size_t)tmp_slab->local_x_start();
+	    const size_t lx_nx    = (size_t)tmp_slab->local_nx();
+	    delete tmp_slab;
+
+	    long long my_loc[2] = { (long long)lx_start, (long long)lx_nx };
+	    std::vector<long long> all_loc(2*nproc, 0);
+	    MPI_Gather(my_loc, 2, MPI_LONG_LONG, all_loc.data(), 2, MPI_LONG_LONG,
+	               0, MUSIC::mpi::world());
+
+	    const size_t nz_complex = gnz/2 + 1;
+	    const size_t nz_padded  = 2*nz_complex;
+
+	    // ---- Phase A: rank-0 builds "expected" via full-path solve --------
+	    std::vector<T> expected; // rank 0 only: gnx*gny*nz_padded layout
+	    if( rk == 0 ) {
+	        if( ilevel >= m_pgrids.size() || m_pgrids[ilevel] == NULL ) {
+	            LOGERR("test_slab_solve_at: rank 0 has no m_pgrids[%u]", ilevel);
+	            throw std::runtime_error("test_slab_solve_at: missing union");
+	        }
+	        MeshvarBnd<T> * U = m_pgrids[ilevel];
+	        expected.assign( gnx*gny*nz_padded, T(0) );
+	        for( size_t i=0; i<gnx; ++i )
+	            for( size_t j=0; j<gny; ++j )
+	                for( size_t k=0; k<gnz; ++k )
+	                    expected[(i*gny+j)*nz_padded+k] = (*U)((int)i,(int)j,(int)k);
+	    }
+	    {
+	        MUSIC::poisson::phase_scope _ps;
+	        if( rk == 0 ) {
+	            MUSIC::poisson::rank0_dist_solve<T>( expected.data(), gnx, gny, gnz );
+	        }
+	    } // phase_scope dtor on rank 0 broadcasts OP_DONE → workers exit pump
+
+	    // ---- Phase B: flip storage to slab; allocate dst slab; register ---
+	    convert_level_full_to_slab( ilevel, gnx, gny, gnz );
+
+	    MeshvarBnd<T> * dst_slab = MUSIC::dist::make_slab_meshvarbnd<T>(
+	        (int)m_nbnd, gnx, gny, gnz, 0, 0, 0 );
+
+	    // src slab is now m_pgrids[ilevel] (on every rank, allocated by convert)
+	    MUSIC::poisson::set_slab_solve_inout<T>( m_pgrids[ilevel], dst_slab );
+
+	    {
+	        MUSIC::poisson::phase_scope _ps;
+	        if( rk == 0 ) {
+	            MUSIC::poisson::rank0_dist_solve_slab<T>( gnx, gny, gnz );
+	        }
+	    }
+
+	    // ---- Phase C: gather dst_slab back to rank 0 "computed" buffer ----
+	    std::vector<T> my_slab( (lx_nx>0 ? lx_nx*gny*gnz : 0) );
+	    if( lx_nx > 0 ) {
+	        for( size_t i=0; i<lx_nx; ++i )
+	            for( size_t j=0; j<gny; ++j )
+	                for( size_t k=0; k<gnz; ++k )
+	                    my_slab[(i*gny+j)*gnz+k] = (*dst_slab)((int)i,(int)j,(int)k);
+	    }
+	    if( rk == 0 ) {
+	        std::vector<T> computed( gnx*gny*gnz, T(0) );
+	        {
+	            const long long s_lx = all_loc[0];
+	            const long long s_nx = all_loc[1];
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        computed[(size_t)(((s_lx+i)*(long long)gny+j)*(long long)gnz+k)]
+	                            = my_slab[(size_t)((i*(long long)gny+j)*(long long)gnz+k)];
+	        }
+	        for( int r=1; r<nproc; ++r ) {
+	            const long long s_lx = all_loc[2*r+0];
+	            const long long s_nx = all_loc[2*r+1];
+	            if( s_nx <= 0 ) continue;
+	            const size_t cnt = (size_t)s_nx * gny * gnz;
+	            std::vector<T> buf(cnt);
+	            MPI_Recv(buf.data(), (int)cnt, dtype, r, tag_gather+r,
+	                     MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+	            for( long long i=0; i<s_nx; ++i )
+	                for( long long j=0; j<(long long)gny; ++j )
+	                    for( long long k=0; k<(long long)gnz; ++k )
+	                        computed[(size_t)(((s_lx+i)*(long long)gny+j)*(long long)gnz+k)]
+	                            = buf[(size_t)((i*(long long)gny+j)*(long long)gnz+k)];
+	        }
+	        // compare (only k ∈ [0..gnz); skip nz_padded leftover in expected)
+	        size_t mismatches = 0;
+	        T max_diff = T(0);
+	        for( size_t i=0; i<gnx; ++i )
+	            for( size_t j=0; j<gny; ++j )
+	                for( size_t k=0; k<gnz; ++k ) {
+	                    const T a = expected[(i*gny+j)*nz_padded+k];
+	                    const T b = computed[(i*gny+j)*gnz+k];
+	                    const T d = (a > b) ? (a-b) : (b-a);
+	                    if( d != T(0) ) { ++mismatches; if( d > max_diff ) max_diff = d; }
+	                }
+	        if( mismatches > 0 ) {
+	            LOGERR("test_slab_solve_at L=%u FAILED: %zu mismatches, max_diff=%.6e",
+	                   ilevel, mismatches, (double)max_diff);
+	            throw std::runtime_error("test_slab_solve_at: slab-solve != full-solve");
+	        }
+	        LOGINFO("E.2.2a slab-solve test L=%u PASSED: %zu cells, bit-identical vs full-path across %d ranks",
+	                ilevel, gnx*gny*gnz, nproc);
+	    } else {
+	        if( lx_nx > 0 ) {
+	            MPI_Send(my_slab.data(), (int)(lx_nx*gny*gnz), dtype, 0, tag_gather+rk,
+	                     MUSIC::mpi::world());
+	        }
+	    }
+
+	    // ---- Phase D: cleanup --------------------------------------------
+	    MUSIC::poisson::set_slab_solve_inout<T>( (MeshvarBnd<T>*)NULL, (MeshvarBnd<T>*)NULL );
+	    delete dst_slab;
+	    convert_level_slab_to_full( ilevel );
 #else
 	    (void)ilevel; (void)gnx; (void)gny; (void)gnz;
 #endif

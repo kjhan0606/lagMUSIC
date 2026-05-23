@@ -21,13 +21,16 @@
 #include "general.hh"
 #include "mpi_helper.hh"
 
+template<typename T> class MeshvarBnd;  // declared in mesh.hh (global scope)
+
 namespace MUSIC { namespace poisson {
 
 // Op codes broadcast from rank 0 to workers in worker_pump().
 enum Op {
-	OP_DONE     = 0,
-	OP_SOLVE    = 1,
-	OP_GRADIENT = 2
+	OP_DONE       = 0,
+	OP_SOLVE      = 1,
+	OP_GRADIENT   = 2,
+	OP_SOLVE_SLAB = 3  // Phase E.2.2a: solve with per-rank slab in/out registered via set_slab_solve_inout
 };
 
 // Workers (non-root) call this between SPMD phases to wait for fft_poisson
@@ -60,6 +63,21 @@ void rank0_dist_solve( real_t* root_buf, size_t gnx, size_t gny, size_t gnz );
 template<typename real_t>
 void rank0_dist_gradient( int dir, real_t* root_buf, size_t gnx, size_t gny, size_t gnz,
                           bool deconvolve_cic );
+
+// ----- Phase E.2.2a: SPMD slab-direct solve --------------------------------
+// Caller (all ranks) supplies their own per-rank slab in/out MeshvarBnd<real_t>*
+// via set_slab_solve_inout BEFORE entering phase_scope. Workers in worker_pump
+// dispatch OP_SOLVE_SLAB by reading the registered pointers; rank 0 broadcasts
+// OP_SOLVE_SLAB inside rank0_dist_solve_slab. Both src and dst slabs must
+// already exist on every rank with extent (local_nx, gny, gnz) matching FFTW
+// MPI decomposition for (gnx,gny,gnz). (Type ::MeshvarBnd is forward-declared
+// at file scope below to avoid namespace lookup pulling MUSIC::poisson::...)
+template<typename real_t>
+void set_slab_solve_inout( ::MeshvarBnd<real_t>* src, ::MeshvarBnd<real_t>* dst );
+
+template<typename real_t>
+void rank0_dist_solve_slab( size_t gnx, size_t gny, size_t gnz );
+// ----- end Phase E.2.2a ----------------------------------------------------
 
 // Phase E.1b helper. Brackets a rank-0 Poisson compute block with collective
 // per-box gather (before) and scatter (after) so the rank-0 body sees full

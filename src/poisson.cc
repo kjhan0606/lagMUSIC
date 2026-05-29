@@ -15,6 +15,8 @@
 #include "mpi_helper.hh"
 #include "mpi_poisson.hh"
 #include "mesh.hh"
+#include "zoom_slab.hh"
+#include "poisson_hybrid_kernel.hh"
 
 // Rank-0 periodic wrap on a full unigrid MeshvarBnd. Lives in MUSIC::poisson
 // so the SPMD slab path in mpi_poisson.hh can call it after gathering the
@@ -133,6 +135,47 @@ double multigrid_poisson_plugin::solve( grid_hierarchy& f, grid_hierarchy& u )
 	ps_postsmooth		= cf_.getValueSafe<unsigned>("poisson","post_smooth",3);
 	ps_smoother_name	= cf_.getValueSafe<std::string>("poisson","smoother","gs");
 	order				= cf_.getValueSafe<unsigned>( "poisson", "laplace_order", 4 );
+
+	// Phase G.2b A': opt-in toggle for the z-slab bridge GS smoother in
+	// multigrid::solver::twoGrid_multibox (per-box GS sites). Default false →
+	// production GaussSeidel path unchanged. Bridge is only invoked when also
+	// S::order==2 (stencil_7P) and the GridHierarchy has z-slabs populated.
+	{
+		bool zsm = cf_.getValueSafe<bool>("setup", "zoom_slab_smoother", false);
+		MUSIC::zoom_slab::set_smoother_enabled(zsm);
+		if( zsm )
+			LOGINFO("G.2b: zoom_slab_smoother=yes order=%u (bridge fires at multibox levels when order==2 and (np==1 or zoom_slab_subcomm==self))",
+			        order);
+	}
+
+	// Phase G.2b B.2b.2: opt-in toggle for the SPMD composite-MG path inside
+	// twoGrid_multibox. Default false (current rank-0-only V-cycle preserved).
+	{
+		bool zsmg = cf_.getValueSafe<bool>("setup", "zoom_slab_spmd_multigrid", false);
+		MUSIC::zoom_slab::set_spmd_multigrid_enabled(zsmg);
+		if( zsmg )
+			LOGINFO("G.2b B.2b.2: zoom_slab_spmd_multigrid=yes (twoGrid_multibox routes through SPMD path with B.2b.1 parent broadcast/accumulate)");
+	}
+
+	// Phase G.2b B.5.4.a: opt-in toggle for keep-in-slab pre/post smoothing.
+	// Default false. When yes, each pre/post-smooth phase scatters uf+ff once
+	// per box and runs N×(interp_cf + gs) on a shared (size+4)^3 slab buffer.
+	{
+		bool kss = cf_.getValueSafe<bool>("setup", "zoom_slab_keep_slab_smooth", false);
+		MUSIC::zoom_slab::set_keep_slab_smooth_enabled(kss);
+		if( kss )
+			LOGINFO("G.2b B.5.4.a: zoom_slab_keep_slab_smooth=yes (pre/post smoothing keeps uf/ff in z-slab across N iters)");
+	}
+
+	// Phase G.2b B.5.4.b: opt-in toggle for keep-in-slab u-restrict (chains the
+	// padded-cluster slab from B.5.4.a's pre-smooth into u-restrict via
+	// restrict_meshvarbnd_from_padded_slab). Requires B.5.4.a to also be on.
+	{
+		bool ksu = cf_.getValueSafe<bool>("setup", "zoom_slab_keep_slab_urestrict", false);
+		MUSIC::zoom_slab::set_keep_slab_urestrict_enabled(ksu);
+		if( ksu )
+			LOGINFO("G.2b B.5.4.b: zoom_slab_keep_slab_urestrict=yes (pre-smooth → u-restrict shares padded-cluster slab; saves 1 gather+scatter per box per V-cycle)");
+	}
 	
 	multigrid::opt::smtype ps_smtype = multigrid::opt::sm_gauss_seidel;
 	
@@ -920,124 +963,6 @@ double fft_poisson_plugin::gradient( int dir, grid_hierarchy& u, grid_hierarchy&
 /**************************************************************************************/
 
 
-template<int order>
-double poisson_hybrid_kernel( int idir, int i, int j, int k, int n )
-{
-	return 1.0;
-}
-
-template<>
-inline double poisson_hybrid_kernel<2>(int idir, int i, int j, int k, int n )
-{
-	if(i==0&&j==0&&k==0)
-		return 0.0;
-	
-	double 
-	ki(M_PI*(double)i/(double)n), 
-	kj(M_PI*(double)j/(double)n), 
-	kk(M_PI*(double)k/(double)n), 
-	kr(sqrt(ki*ki+kj*kj+kk*kk));
-	
-	double grad = 1.0, laplace = 1.0;
-	
-	if( idir==0 )
-		grad = sin(ki);
-	else if( idir==1 )
-		grad = sin(kj);
-	else 
-		grad = sin(kk);
-	
-	laplace = 2.0*((-cos(ki)+1.0)+(-cos(kj)+1.0)+(-cos(kk)+1.0));
-	
-	double kgrad = 1.0;
-	if( idir==0 )
-		kgrad = ki;
-	else if( idir ==1)
-		kgrad = kj;
-	else if( idir ==2)
-		kgrad = kk;
-	
-	return kgrad/kr/kr-grad/laplace;
-}
-
-template<>
-inline double poisson_hybrid_kernel<4>(int idir, int i, int j, int k, int n )
-{
-	
-	if(i==0&&j==0&&k==0)
-	return 0.0;
-
-	double 
-	ki(M_PI*(double)i/(double)n), 
-	kj(M_PI*(double)j/(double)n), 
-	kk(M_PI*(double)k/(double)n), 
-	kr(sqrt(ki*ki+kj*kj+kk*kk));
-
-	double grad = 1.0, laplace = 1.0;
-
-	if( idir==0 )
-	   grad = 0.166666666667*(-sin(2.*ki)+8.*sin(ki));
-	else if( idir==1 )
-	   grad = 0.166666666667*(-sin(2.*kj)+8.*sin(kj));
-	else if( idir==2 )
-	   grad = 0.166666666667*(-sin(2.*kk)+8.*sin(kk));
-
-	laplace = 0.1666666667*((cos(2*ki)-16.*cos(ki)+15.)
-						   +(cos(2*kj)-16.*cos(kj)+15.)
-						   +(cos(2*kk)-16.*cos(kk)+15.));
-
-	double kgrad = 1.0;
-	if( idir==0 )
-	kgrad = ki;
-	else if( idir ==1)
-	kgrad = kj;
-	else if( idir ==2)
-	kgrad = kk;
-
-	return kgrad/kr/kr-grad/laplace;
-}
-	   
-template<>
-inline double poisson_hybrid_kernel<6>(int idir, int i, int j, int k, int n )
-{
-	double 
-	ki(M_PI*(double)i/(double)n), 
-	kj(M_PI*(double)j/(double)n), 
-	kk(M_PI*(double)k/(double)n), 
-	kr(sqrt(ki*ki+kj*kj+kk*kk));
-
-	if(i==0&&j==0&&k==0)
-		return 0.0;
-
-	double grad = 1.0, laplace = 1.0;
-
-	if( idir==0 )
-		grad = 0.0333333333333*(sin(3.*ki)-9.*sin(2.*ki)+45.*sin(ki));
-	else if( idir==1 )
-		grad = 0.0333333333333*(sin(3.*kj)-9.*sin(2.*kj)+45.*sin(kj));
-	else if( idir==2 )
-		grad = 0.0333333333333*(sin(3.*kk)-9.*sin(2.*kk)+45.*sin(kk));
-
-	laplace = 0.01111111111111*(
-								(-2.*cos(3.0*ki)+27.*cos(2.*ki)-270.*cos(ki)+245.)
-								+(-2.*cos(3.0*kj)+27.*cos(2.*kj)-270.*cos(kj)+245.)
-								+(-2.*cos(3.0*kk)+27.*cos(2.*kk)-270.*cos(kk)+245.));
-
-	double kgrad = 1.0;
-	if( idir==0 )
-		kgrad = ki;
-	else if( idir ==1)
-		kgrad = kj;
-	else if( idir ==2)
-		kgrad = kk;
-
-//	if( i*i+j*j+k*k >= n*n )
-//		kgrad = 0.0;
-	
-	return kgrad/kr/kr-grad/laplace;
-}
-	   
-	   
 template<int order>
 void do_poisson_hybrid( fftw_real* data, int idir, int nxp, int nyp, int nzp, bool periodic, bool deconvolve_cic )
 {

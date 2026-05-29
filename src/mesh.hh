@@ -14,6 +14,9 @@
 #include <iostream>
 #include <iomanip>
 #include <vector>
+#include <map>
+#include <set>
+#include <algorithm>
 #include <stdexcept>
 
 #include <math.h>
@@ -30,6 +33,7 @@
 // MUSIC::poisson::{phase_scope, rank0_dist_solve, rank0_dist_solve_slab,
 // set_slab_solve_inout} used by test_slab_solve_at below.
 #include "mpi_poisson.hh"
+#include "zoom_slab.hh"
 
 class refinement_mask
 {
@@ -139,7 +143,7 @@ public:
 	  m_is_distributed(false), m_global_nx(n), m_global_ny(n), m_global_nz(n),
 	  m_local_x_start(0), m_local_nx(n)
 	{
-		m_pdata = new real_t[m_nx*m_ny*m_nz];
+		m_pdata = new real_t[m_nx*m_ny*m_nz]();
 	}
 
 	//! constructor for rectangular mesh
@@ -148,7 +152,7 @@ public:
 	  m_is_distributed(false), m_global_nx(nx), m_global_ny(ny), m_global_nz(nz),
 	  m_local_x_start(0), m_local_nx(nx)
 	{
-		m_pdata = new real_t[m_nx*m_ny*m_nz];
+		m_pdata = new real_t[m_nx*m_ny*m_nz]();
 	}
 	
 	//! variant copy constructor with optional copying of the actual data
@@ -169,11 +173,13 @@ public:
 		m_local_x_start = m.m_local_x_start;
 		m_local_nx = m.m_local_nx;
 
-		m_pdata = new real_t[m_nx*m_ny*m_nz];
-
-		if( copy_over )
+		if( copy_over ) {
+			m_pdata = new real_t[m_nx*m_ny*m_nz];
 			for( size_t i=0; i<m_nx*m_ny*m_nz; ++i )
 				m_pdata[i] = m.m_pdata[i];
+		} else {
+			m_pdata = new real_t[m_nx*m_ny*m_nz]();
+		}
 	}
 
 	//! standard copy constructor
@@ -687,6 +693,29 @@ public:
     std::vector< std::vector<bool> > m_pbox_tenant_;
     //---------------------------------------------------------------------
 
+    //-------- per-cluster z-slab storage (Phase G.1) --------------------
+    //! True after populate_per_box_zslabs() has been called. Default false.
+    //! When false, the m_zslab_* vectors are empty and zslab_* accessors
+    //! throw / return 0 / return NULL — every consumer path is gated by
+    //! has_zslabs() OR the opt-in flag at the call site.
+    bool m_zslab_enabled_ = false;
+    //! Halo width used to allocate the local-with-halo z-slab buffers.
+    //! Stored separately from m_nbnd because G.2+ may use a larger halo for
+    //! restriction stencils that cross z-faces.
+    int  m_zslab_halo_w_  = 0;
+    //! Per-cluster z-slab layout (Phase G.0 primitive). One per (L, b).
+    //! Built by populate_per_box_zslabs() over MPI_COMM_WORLD as sub_comm.
+    //! When G.1+ adds true per-cluster sub-comms (round-robin or cluster
+    //! groups), the sub_comm field changes but the layout footprint stays.
+    std::vector< std::vector< MUSIC::zoom_slab::ZoomSlabLayout > > m_zslab_layouts_;
+    //! Per-cluster z-slab data buffer (local-with-halo) on this rank.
+    //! Size matches MUSIC::zoom_slab::local_with_halo_size(layout); contents follow
+    //! the (i,j,k)-row-major layout described in zoom_slab.hh. Allocated on
+    //! every rank in sub_comm; consumed by sync_zslab_from_per_box() and
+    //! produced by sync_per_box_from_zslab().
+    std::vector< std::vector< std::vector<T> > > m_zslab_data_;
+    //---------------------------------------------------------------------
+
     //-------- per-level slab-distributed union mesh (Phase E.2.0) --------
     //! Per-level flag: true when m_pgrids[L] is a slab-distributed
     //! MeshvarBnd<T> (each rank holds only its x-slab of the global level
@@ -714,6 +743,17 @@ public:
     std::vector<size_t> m_level_gnx_, m_level_gny_, m_level_gnz_;
     //---------------------------------------------------------------------
 
+    //-------- per-level parent replicas (Phase G.2b B.2b.1) --------------
+    //! Transient cross-rank replicas of parent boxes, indexed by [child_level]
+    //! and keyed by parent_idx (∈ m_pgrids_per_box_[L-1]).
+    //! Populated by broadcast_parents_to_child_owners(L) on every rank that
+    //! owns at least one child of a remote parent at level L. Drained by
+    //! accumulate_children_to_parents(L) or release_parent_replicas(L).
+    //! Replicas are full deep-copies of the parent MeshvarBnd<T> (data + halo,
+    //! same fine-cell coordinate system). NULL/empty otherwise.
+    std::vector< std::map<size_t, MeshvarBnd<T>*> > m_parent_replicas_;
+    //---------------------------------------------------------------------
+
 public:
     //! Phase E.1: ownership policy. Returns the rank that should hold the
     //! per-box mesh for level L, box b given a total of nboxes at that level
@@ -732,12 +772,20 @@ protected:
 	//! check whether a given grid has identical hierarchy, dimensions to this 
 	bool is_consistent( const GridHierarchy<T>& gh )
 	{
+		// SPMD-light: an empty hierarchy (m_pgrids.size() == 0) has
+		// levelmax() == UINT_MAX (size_t underflow) and size(i,j) deref
+		// is UB. Always take the inconsistent (rebuild) path when either
+		// side is empty — even both-empty must rebuild because per-box
+		// layout (m_pgrids_per_box_) may differ.
+		if( m_pgrids.empty() || gh.m_pgrids.empty() )
+			return false;
+
 		if( gh.levelmax()!=levelmax() )
 			return false;
-		
+
 		if( gh.levelmin()!=levelmin() )
 			return false;
-		
+
 		for( unsigned i=levelmin(); i<=levelmax(); ++i )
 			for( int j=0; j<3; ++j )
 			{
@@ -746,7 +794,7 @@ protected:
 				if( offset(i,j) != gh.offset(i,j) )
 					return false;
 			}
-		
+
 		return true;
 	}
 	
@@ -794,8 +842,14 @@ public:
 		// Guard against copying an empty hierarchy: levelmax() returns
 		// m_pgrids.size()-1 which underflows to UINT_MAX when empty (MPI
 		// workers carry empty hierarchies under SPMD-light).
+		// H.4: workers can hold a mixed shell where m_pgrids[0..L-1] are
+		// full meshes (from create_base_hierarchy_slab) but m_pgrids[L]==NULL
+		// after convert_level_slab_to_full. Skip NULL slots; downstream code
+		// already tolerates NULL via get_grid().
 		for( size_t i=0; i<gh.m_pgrids.size(); ++i )
-			m_pgrids.push_back( new MeshvarBnd<T>( *gh.m_pgrids[i] ) );
+			m_pgrids.push_back( gh.m_pgrids[i]
+			    ? new MeshvarBnd<T>( *gh.m_pgrids[i] )
+			    : (MeshvarBnd<T>*)NULL );
 
 		m_nbnd = gh.m_nbnd;
 		m_levelmin = gh.m_levelmin;
@@ -881,6 +935,12 @@ public:
         m_ref_masks.clear();
 
         deallocate_per_box_meshes();
+
+        // Phase G.2b B.2b.1: drop any lingering parent replicas. Normally
+        // accumulate_children_to_parents / release_parent_replicas drain
+        // them within a single V-cycle, but a thrown exception mid-cycle
+        // could leave them allocated.
+        release_all_parent_replicas();
 
         // Phase E.2.0: clear per-level slab metadata.
         m_level_is_slab_.clear();
@@ -1199,12 +1259,16 @@ public:
 	    if( MUSIC::mpi::size() <= 1 ) return;
 	    if( m_pgrids_per_box_.empty() ) return;
 	    const int rk = MUSIC::mpi::rank();
+	    const bool trace = (std::getenv("MUSIC_TRACE_PHASE")!=NULL);
+	    if(trace){ std::fprintf(stderr,"[trace rk=%d] gather enter (this=%p)\n", rk, (void*)this); std::fflush(stderr); }
 	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
 	    int tag = 1100; // distinct from other point-to-point tags in the codebase
 	    for( size_t L=0; L<m_pgrids_per_box_.size(); ++L ){
 	        for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b, ++tag ){
 	            const int owner = m_pbox_owner_[L][b];
 	            if( owner == 0 ) continue;
+	            if(trace){ std::fprintf(stderr,"[trace rk=%d] gather L=%zu b=%zu owner=%d tag=%d %s\n",
+	                       rk,L,b,owner,tag, (rk==owner?"SEND":(rk==0?"RECV":"skip"))); std::fflush(stderr); }
 	            const size_t cnt = (size_t)(m_nx_per_box_[L][b] + 2*m_nbnd)
 	                             * (size_t)(m_ny_per_box_[L][b] + 2*m_nbnd)
 	                             * (size_t)(m_nz_per_box_[L][b] + 2*m_nbnd);
@@ -1235,6 +1299,7 @@ public:
 	            }
 	        }
 	    }
+	    if(trace){ std::fprintf(stderr,"[trace rk=%d] gather exit\n", rk); std::fflush(stderr); }
 #endif
 	}
 
@@ -1248,12 +1313,16 @@ public:
 	    if( MUSIC::mpi::size() <= 1 ) return;
 	    if( m_pgrids_per_box_.empty() ) return;
 	    const int rk = MUSIC::mpi::rank();
+	    const bool trace = (std::getenv("MUSIC_TRACE_PHASE")!=NULL);
+	    if(trace){ std::fprintf(stderr,"[trace rk=%d] scatter enter (this=%p)\n", rk, (void*)this); std::fflush(stderr); }
 	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
 	    int tag = 1300; // distinct tag space from gather
 	    for( size_t L=0; L<m_pgrids_per_box_.size(); ++L ){
 	        for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b, ++tag ){
 	            const int owner = m_pbox_owner_[L][b];
 	            if( owner == 0 ) continue;
+	            if(trace){ std::fprintf(stderr,"[trace rk=%d] scatter L=%zu b=%zu owner=%d tag=%d %s\n",
+	                       rk,L,b,owner,tag, (rk==0?"SEND":(rk==owner?"RECV":"skip"))); std::fflush(stderr); }
 	            const size_t cnt = (size_t)(m_nx_per_box_[L][b] + 2*m_nbnd)
 	                             * (size_t)(m_ny_per_box_[L][b] + 2*m_nbnd)
 	                             * (size_t)(m_nz_per_box_[L][b] + 2*m_nbnd);
@@ -1279,6 +1348,7 @@ public:
 	            }
 	        }
 	    }
+	    if(trace){ std::fprintf(stderr,"[trace rk=%d] scatter exit\n", rk); std::fflush(stderr); }
 #endif
 	}
 
@@ -1338,6 +1408,708 @@ public:
 	    }
 	}
 
+	//-------- Phase G.2b B.2b.1: cross-rank parent replicas ----------------
+	//! Local accessor: returns the parent MeshvarBnd that the per-box op for
+	//! (level, box) should read. Returns the locally-owned parent if
+	//! owner_of_box(level-1, parent_idx) == my_rank, else the transient
+	//! replica from m_parent_replicas_[level][parent_idx], else NULL (caller
+	//! is non-owner of every child of this parent and broadcast hasn't been
+	//! called, or this rank doesn't participate in the parent's data at all).
+	//! Safe to call when level==0 (returns NULL — no parent).
+	MeshvarBnd<T> * parent_for_box( unsigned level, size_t box_id )
+	{
+	    if( level == 0 ) return NULL;
+	    if( level >= m_pgrids_per_box_.size() ) return NULL;
+	    if( box_id >= m_parent_idx_per_box_[level].size() ) return NULL;
+	    const size_t p = m_parent_idx_per_box_[level][box_id];
+	    const unsigned Lp = level - 1;
+	    if( Lp < m_pgrids_per_box_.size()
+	        && p < m_pgrids_per_box_[Lp].size()
+	        && m_pgrids_per_box_[Lp][p] != NULL )
+	        return m_pgrids_per_box_[Lp][p];
+	    if( level < m_parent_replicas_.size() ){
+	        auto it = m_parent_replicas_[level].find(p);
+	        if( it != m_parent_replicas_[level].end() ) return it->second;
+	    }
+	    return NULL;
+	}
+
+	const MeshvarBnd<T> * parent_for_box( unsigned level, size_t box_id ) const
+	{
+	    if( level == 0 ) return NULL;
+	    if( level >= m_pgrids_per_box_.size() ) return NULL;
+	    if( box_id >= m_parent_idx_per_box_[level].size() ) return NULL;
+	    const size_t p = m_parent_idx_per_box_[level][box_id];
+	    const unsigned Lp = level - 1;
+	    if( Lp < m_pgrids_per_box_.size()
+	        && p < m_pgrids_per_box_[Lp].size()
+	        && m_pgrids_per_box_[Lp][p] != NULL )
+	        return m_pgrids_per_box_[Lp][p];
+	    if( level < m_parent_replicas_.size() ){
+	        auto it = m_parent_replicas_[level].find(p);
+	        if( it != m_parent_replicas_[level].end() ) return it->second;
+	    }
+	    return NULL;
+	}
+
+	//! True when the replica map at `level` has been populated for parent
+	//! index `parent_idx`. Useful for assertions.
+	bool has_parent_replica( unsigned level, size_t parent_idx ) const
+	{
+	    if( level >= m_parent_replicas_.size() ) return false;
+	    return m_parent_replicas_[level].find(parent_idx) != m_parent_replicas_[level].end();
+	}
+
+	//! Phase G.2b B.2b.1: at child-level `level` (>= 1), for every parent box
+	//! p at level-1 whose owner differs from at least one child's owner, the
+	//! parent owner MPI_Isends a full deep copy of m_pgrids_per_box_[level-1][p]
+	//! to each distinct child-owner rank, which MPI_Irecvs into a freshly
+	//! allocated MeshvarBnd<T> stored in m_parent_replicas_[level][p].
+	//!
+	//! Post-call invariant on every rank: parent_for_box(level, b) returns a
+	//! non-NULL pointer for every locally-owned child box b. The replica is
+	//! a deep copy at this instant; the parent owner's MeshvarBnd is not
+	//! aliased.
+	//!
+	//! Must be called OUTSIDE phase_scope (workers cannot service MPI_Send
+	//! while parked in worker_pump). Idempotent only if release_parent_replicas
+	//! is called first — a second broadcast without release will leak.
+	//!
+	//! Tag layout: 1900 + level*1000 + parent_idx (parent_idx is unique within
+	//! its level, so collisions across (level, parent_idx) tuples are avoided
+	//! provided num_boxes(level-1) ≤ 1000).
+	void broadcast_parents_to_child_owners( unsigned level )
+	{
+#ifdef USE_MPI
+	    if( MUSIC::mpi::size() <= 1 ) return;
+	    if( level == 0 ) return;
+	    if( level >= m_pgrids_per_box_.size() ) return;
+	    const unsigned Lp = level - 1;
+	    if( Lp >= m_pgrids_per_box_.size() ) return;
+	    if( m_pgrids_per_box_[level].empty() ) return;
+	    if( m_pgrids_per_box_[Lp].empty() ) return;
+
+	    if( m_parent_replicas_.size() < (size_t)level+1 )
+	        m_parent_replicas_.resize( (size_t)level+1 );
+	    if( !m_parent_replicas_[level].empty() ){
+	        LOGERR("broadcast_parents_to_child_owners: replicas already exist at level=%u (missed release?)", level);
+	        throw std::runtime_error("broadcast_parents_to_child_owners: replicas not released");
+	    }
+
+	    const int my_rank = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	    // For each parent p, build the set of child-owner ranks (excluding the
+	    // parent's own owner, since that rank already has the data locally).
+	    const size_t Np = m_pgrids_per_box_[Lp].size();
+	    std::vector< std::set<int> > child_owners_per_parent( Np );
+	    for( size_t b=0; b<m_pgrids_per_box_[level].size(); ++b ){
+	        const size_t p = m_parent_idx_per_box_[level][b];
+	        if( p >= Np ) continue;  // single-parent fallback returns 0; safe
+	        const int co = m_pbox_owner_[level][b];
+	        const int po = m_pbox_owner_[Lp][p];
+	        if( co != po ) child_owners_per_parent[p].insert(co);
+	    }
+
+	    std::vector<MPI_Request> reqs;
+	    reqs.reserve(32);
+
+	    for( size_t p=0; p<Np; ++p ){
+	        const auto & co_set = child_owners_per_parent[p];
+	        if( co_set.empty() ) continue;
+	        const int po = m_pbox_owner_[Lp][p];
+	        const int tag = 1900 + (int)level*1000 + (int)p;
+	        const size_t cnt = (size_t)(m_nx_per_box_[Lp][p] + 2*m_nbnd)
+	                         * (size_t)(m_ny_per_box_[Lp][p] + 2*m_nbnd)
+	                         * (size_t)(m_nz_per_box_[Lp][p] + 2*m_nbnd);
+
+	        if( my_rank == po ){
+	            MeshvarBnd<T>* parent = m_pgrids_per_box_[Lp][p];
+	            if( !parent ){
+	                LOGERR("broadcast_parents_to_child_owners: parent owner rk=%d missing mesh L=%u p=%zu",
+	                       my_rank, Lp, p);
+	                throw std::runtime_error("broadcast_parents_to_child_owners: parent NULL on owner");
+	            }
+	            for( int dest : co_set ){
+	                reqs.emplace_back();
+	                MPI_Isend( parent->get_ptr(), (int)cnt, dtype, dest, tag,
+	                           MUSIC::mpi::world(), &reqs.back() );
+	            }
+	        } else if( co_set.count(my_rank) ){
+	            MeshvarBnd<T>* rep = new MeshvarBnd<T>(
+	                m_nbnd,
+	                m_nx_per_box_[Lp][p], m_ny_per_box_[Lp][p], m_nz_per_box_[Lp][p],
+	                (size_t)m_oxrel_per_box_[Lp][p],
+	                (size_t)m_oyrel_per_box_[Lp][p],
+	                (size_t)m_ozrel_per_box_[Lp][p] );
+	            m_parent_replicas_[level][p] = rep;
+	            reqs.emplace_back();
+	            MPI_Irecv( rep->get_ptr(), (int)cnt, dtype, po, tag,
+	                       MUSIC::mpi::world(), &reqs.back() );
+	        }
+	    }
+
+	    if( !reqs.empty() )
+	        MPI_Waitall( (int)reqs.size(), reqs.data(), MPI_STATUSES_IGNORE );
+#else
+	    (void)level;
+#endif
+	}
+
+	//! Phase G.2b B.2b.1: reverse of broadcast_parents_to_child_owners.
+	//! Each child-owner ships its (potentially modified) replica back to
+	//! the parent owner via MPI_Isend; the parent owner MPI_Irecvs into a
+	//! staging buffer (one per sender) and ADDS the received data into the
+	//! authoritative parent mesh. Used after per-box ops that contribute to
+	//! the parent (restrict, FAS source update). Replicas are then freed.
+	//!
+	//! Tag layout: 2100 + level*1000 + parent_idx (distinct from broadcast).
+	//!
+	//! The accumulation order across child-owners is deterministic by sender
+	//! rank ascending. For exact bit-reproducibility across runs, all
+	//! contributors must produce the same floating-point bits in each cell
+	//! they touch — caller guarantees this by gating each per-box op to its
+	//! owner.
+	void accumulate_children_to_parents( unsigned level )
+	{
+#ifdef USE_MPI
+	    if( MUSIC::mpi::size() <= 1 ) return;
+	    if( level == 0 ) return;
+	    if( level >= m_pgrids_per_box_.size() ) return;
+	    const unsigned Lp = level - 1;
+	    if( Lp >= m_pgrids_per_box_.size() ) return;
+	    if( level >= m_parent_replicas_.size() ) return;
+
+	    const int my_rank = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	    const size_t Np = m_pgrids_per_box_[Lp].size();
+	    std::vector< std::set<int> > child_owners_per_parent( Np );
+	    for( size_t b=0; b<m_pgrids_per_box_[level].size(); ++b ){
+	        const size_t p = m_parent_idx_per_box_[level][b];
+	        if( p >= Np ) continue;
+	        const int co = m_pbox_owner_[level][b];
+	        const int po = m_pbox_owner_[Lp][p];
+	        if( co != po ) child_owners_per_parent[p].insert(co);
+	    }
+
+	    // Parent-owner side: receive into a per-sender staging buffer.
+	    // child-owner side: send the replica buffer.
+	    std::vector< std::vector<T> > recv_bufs;  // owned by parent_owner
+	    struct RecvSlot { size_t parent_idx; int source_rank; size_t cnt; size_t buf_idx; };
+	    std::vector<RecvSlot> recv_slots;
+	    std::vector<MPI_Request> reqs;
+	    reqs.reserve(32);
+	    recv_bufs.reserve(32);
+	    recv_slots.reserve(32);
+
+	    for( size_t p=0; p<Np; ++p ){
+	        const auto & co_set = child_owners_per_parent[p];
+	        if( co_set.empty() ) continue;
+	        const int po = m_pbox_owner_[Lp][p];
+	        const int tag_base = 2100 + (int)level*1000 + (int)p;
+	        const size_t cnt = (size_t)(m_nx_per_box_[Lp][p] + 2*m_nbnd)
+	                         * (size_t)(m_ny_per_box_[Lp][p] + 2*m_nbnd)
+	                         * (size_t)(m_nz_per_box_[Lp][p] + 2*m_nbnd);
+
+	        if( my_rank == po ){
+	            // Receive once per distinct child-owner rank.
+	            for( int src : co_set ){
+	                const int tag = tag_base;  // single tag; source rank disambiguates
+	                recv_bufs.emplace_back( cnt, T(0) );
+	                recv_slots.push_back( RecvSlot{ p, src, cnt, recv_bufs.size()-1 } );
+	                reqs.emplace_back();
+	                MPI_Irecv( recv_bufs.back().data(), (int)cnt, dtype, src, tag,
+	                           MUSIC::mpi::world(), &reqs.back() );
+	            }
+	        } else if( co_set.count(my_rank) ){
+	            auto it = m_parent_replicas_[level].find(p);
+	            if( it == m_parent_replicas_[level].end() || it->second == NULL ){
+	                LOGERR("accumulate_children_to_parents: rk=%d missing replica L=%u p=%zu",
+	                       my_rank, level, p);
+	                throw std::runtime_error("accumulate_children_to_parents: replica NULL");
+	            }
+	            const int tag = tag_base;
+	            reqs.emplace_back();
+	            MPI_Isend( it->second->get_ptr(), (int)cnt, dtype, po, tag,
+	                       MUSIC::mpi::world(), &reqs.back() );
+	        }
+	    }
+
+	    if( !reqs.empty() )
+	        MPI_Waitall( (int)reqs.size(), reqs.data(), MPI_STATUSES_IGNORE );
+
+	    // Parent owner: sort recv_slots by (parent_idx, source_rank) ascending
+	    // for deterministic accumulation order, then add into the parent mesh.
+	    if( !recv_slots.empty() ){
+	        std::sort( recv_slots.begin(), recv_slots.end(),
+	            []( const RecvSlot & a, const RecvSlot & b ){
+	                if( a.parent_idx != b.parent_idx ) return a.parent_idx < b.parent_idx;
+	                return a.source_rank < b.source_rank;
+	            } );
+	        for( const auto & s : recv_slots ){
+	            MeshvarBnd<T>* parent = m_pgrids_per_box_[Lp][s.parent_idx];
+	            if( !parent ){
+	                LOGERR("accumulate_children_to_parents: parent rk=%d L=%u p=%zu NULL",
+	                       my_rank, Lp, s.parent_idx);
+	                throw std::runtime_error("accumulate_children_to_parents: parent NULL");
+	            }
+	            T * dst = parent->get_ptr();
+	            const T * src = recv_bufs[s.buf_idx].data();
+	            for( size_t i=0; i<s.cnt; ++i ) dst[i] += src[i];
+	        }
+	    }
+
+	    release_parent_replicas( level );
+#else
+	    (void)level;
+#endif
+	}
+
+	//! Free all replica buffers at `level` without contributing them back to
+	//! the parent. Used when (a) the per-box ops were read-only on the parent,
+	//! or (b) after accumulate_children_to_parents has consumed them.
+	void release_parent_replicas( unsigned level )
+	{
+	    if( level >= m_parent_replicas_.size() ) return;
+	    for( auto & kv : m_parent_replicas_[level] )
+	        delete kv.second;
+	    m_parent_replicas_[level].clear();
+	}
+
+	//! Free replicas at every level; convenience for end-of-V-cycle cleanup.
+	void release_all_parent_replicas()
+	{
+	    for( size_t L=0; L<m_parent_replicas_.size(); ++L )
+	        for( auto & kv : m_parent_replicas_[L] )
+	            delete kv.second;
+	    m_parent_replicas_.clear();
+	}
+
+	//! Phase G.2b B.2b.2.2.1.a: broadcast m_pgrids[level] body from
+	//! owner_of_box(level, 0) to all other ranks. Intended for single-box
+	//! parent levels in twoGrid_multibox_spmd: after only the box owner runs
+	//! `twoGrid(level)` serially, non-owners' m_pgrids[level] is stale and
+	//! must be refreshed before the SPMD function reads it as `ucs[b]` at
+	//! the next-finer level.
+	//!
+	//! Preconditions: m_pgrids[level] exists on every rank with identical
+	//! geometry (nx, ny, nz, nbnd). create_base_hierarchy + add_patch
+	//! guarantee this on every rank at construction time; later code paths
+	//! that resize m_pgrids (Phase E.2.1b slab flip) must restore the full
+	//! mesh before this primitive runs. Throws on mismatch.
+	//!
+	//! np<=1: no-op. Must be called OUTSIDE phase_scope (workers must be in
+	//! the function body, not parked in worker_pump).
+	void broadcast_union_mesh_from_owner( unsigned level )
+	{
+#ifdef USE_MPI
+	    if( MUSIC::mpi::size() <= 1 ) return;
+	    if( level >= m_pgrids.size() ) return;
+
+	    MeshvarBnd<T>* um = m_pgrids[level];
+	    if( !um ){
+	        LOGERR("broadcast_union_mesh_from_owner: m_pgrids[%u] NULL on rk=%d",
+	               level, MUSIC::mpi::rank());
+	        throw std::runtime_error("broadcast_union_mesh_from_owner: union mesh NULL");
+	    }
+
+	    const int owner = owner_of_box( level, 0 );
+	    const int my_rank = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	    const int nbnd = um->m_nbnd;
+	    const size_t nx = um->size(0) + 2*nbnd;
+	    const size_t ny = um->size(1) + 2*nbnd;
+	    const size_t nz = um->size(2) + 2*nbnd;
+	    const size_t cnt = nx * ny * nz;
+
+	    // Sanity: broadcast the owner's geometry as 4 ints and have everyone
+	    // confirm it matches their local mesh. Cheap insurance against
+	    // silent corruption when callers violate the equal-geometry invariant.
+	    int hdr[4];
+	    if( my_rank == owner ){
+	        hdr[0] = (int)nbnd;
+	        hdr[1] = (int)nx;
+	        hdr[2] = (int)ny;
+	        hdr[3] = (int)nz;
+	    }
+	    MPI_Bcast( hdr, 4, MPI_INT, owner, MUSIC::mpi::world() );
+	    if( hdr[0] != (int)nbnd || hdr[1] != (int)nx ||
+	        hdr[2] != (int)ny || hdr[3] != (int)nz ){
+	        LOGERR("broadcast_union_mesh_from_owner: geometry mismatch rk=%d L=%u "
+	               "owner(nbnd,nx,ny,nz)=(%d,%d,%d,%d) mine=(%d,%zu,%zu,%zu)",
+	               my_rank, level, hdr[0], hdr[1], hdr[2], hdr[3],
+	               nbnd, nx, ny, nz);
+	        throw std::runtime_error("broadcast_union_mesh_from_owner: geometry mismatch");
+	    }
+
+	    MPI_Bcast( um->get_ptr(), (int)cnt, dtype, owner, MUSIC::mpi::world() );
+#else
+	    (void)level;
+#endif
+	}
+
+	//! Phase G.2b B.2b.2.2.1.d: consolidate per-child write contributions on a
+	//! UNION mesh (m_pgrids[child_level-1]) to the parent box owner.
+	//!
+	//! Context: in twoGrid_multibox_spmd at a single-box-parent level, each
+	//! child's restrict and FAS source update writes into the parent's UNION
+	//! mesh (since num_boxes(child_level-1) == 1, parent == union). At np>1
+	//! the per-box loop runs each child write on its OWN rank, so different
+	//! ranks see different child contributions on their LOCAL union mesh. The
+	//! parent box owner then runs the serial twoGrid(child_level-1) recurse;
+	//! it needs every child's contribution gathered into its own local union
+	//! mesh first.
+	//!
+	//! Semantics: for each child b at child_level, the OWNER of b packs the
+	//! parent-footprint interior cells of m_pgrids[child_level-1] (origin =
+	//! (m_oxrel_per_box_, m_oyrel_per_box_, m_ozrel_per_box_)[child_level][b],
+	//! extent = (nx/2, ny/2, nz/2)) and sends them to the parent box owner.
+	//! The parent box owner OVERWRITES those interior cells in its own copy
+	//! of m_pgrids[child_level-1] with the received values. Child-footprints
+	//! are disjoint by D.1 construction, so OVERWRITE is correct (each cell
+	//! belongs to at most one child).
+	//!
+	//! No-ops when:
+	//!   - MUSIC::mpi::size() <= 1
+	//!   - child_level == 0 (no parent)
+	//!   - num_boxes(child_level-1) != 1 (multi-box parent uses the
+	//!     accumulate_children_to_parents replica machinery instead)
+	//!   - owner_of_box(child_level, b) == parent_owner (already in place)
+	//!
+	//! Must be called OUTSIDE phase_scope (workers must be in the function,
+	//! not parked in worker_pump).
+	void consolidate_child_writes_to_parent_owner( unsigned child_level )
+	{
+#ifdef USE_MPI
+	    if( MUSIC::mpi::size() <= 1 ) return;
+	    if( child_level == 0 ) return;
+	    if( child_level >= m_pgrids.size() ) return;
+
+	    const size_t nb = num_boxes(child_level);
+	    if( nb == 0 ) return;
+	    if( num_boxes(child_level - 1) != 1 ) return;
+
+	    MeshvarBnd<T>* parent_um = m_pgrids[child_level - 1];
+	    if( !parent_um ){
+	        LOGERR("consolidate_child_writes_to_parent_owner: parent union NULL at L=%u rk=%d",
+	               child_level - 1, MUSIC::mpi::rank());
+	        throw std::runtime_error("consolidate_child_writes_to_parent_owner: parent union NULL");
+	    }
+
+	    const int parent_owner = owner_of_box(child_level - 1, 0);
+	    const int my_rank = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	    for( size_t b = 0; b < nb; ++b ){
+	        const int owner_b = owner_of_box(child_level, b);
+	        if( owner_b == parent_owner ) continue;
+
+	        const int oxc = m_oxrel_per_box_[child_level][b];
+	        const int oyc = m_oyrel_per_box_[child_level][b];
+	        const int ozc = m_ozrel_per_box_[child_level][b];
+	        const int sxc = (int)m_nx_per_box_[child_level][b] / 2;
+	        const int syc = (int)m_ny_per_box_[child_level][b] / 2;
+	        const int szc = (int)m_nz_per_box_[child_level][b] / 2;
+	        if( sxc <= 0 || syc <= 0 || szc <= 0 ) continue;
+
+	        const size_t cnt = (size_t)sxc * (size_t)syc * (size_t)szc;
+	        const int tag = 17000 + (int)(b & 0x7FFF);
+
+	        if( my_rank == owner_b ){
+	            std::vector<T> buf(cnt);
+	            for( int ix = 0; ix < sxc; ++ix )
+	                for( int iy = 0; iy < syc; ++iy )
+	                    for( int iz = 0; iz < szc; ++iz )
+	                        buf[((size_t)ix * syc + iy) * szc + iz] =
+	                            (*parent_um)(oxc + ix, oyc + iy, ozc + iz);
+	            MPI_Send(buf.data(), (int)cnt, dtype, parent_owner, tag, MUSIC::mpi::world());
+	        } else if( my_rank == parent_owner ){
+	            std::vector<T> buf(cnt);
+	            MPI_Recv(buf.data(), (int)cnt, dtype, owner_b, tag,
+	                     MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+	            for( int ix = 0; ix < sxc; ++ix )
+	                for( int iy = 0; iy < syc; ++iy )
+	                    for( int iz = 0; iz < szc; ++iz )
+	                        (*parent_um)(oxc + ix, oyc + iy, ozc + iz) =
+	                            buf[((size_t)ix * syc + iy) * szc + iz];
+	        }
+	    }
+#else
+	    (void)child_level;
+#endif
+	}
+
+	//! Phase G.2b B.2b.1: standalone smoke test for the cross-rank parent
+	//! replica primitives. Constructs a small 2-level multibox hierarchy
+	//! (parent at L=0 with `n_children` children at L=1), populates it,
+	//! exercises broadcast/accumulate, and verifies bit-identical replicas
+	//! and correct ADD accumulation. Returns true on success.
+	//!
+	//! At np=1 the test is trivially correct: no cross-owner pairs exist,
+	//! broadcast/accumulate are no-ops, parent stays at initial pattern.
+	//!
+	//! At np>=2 with default owner=b%np: parent owner = 0, child owners
+	//! ∈ {0..n_children-1} % np. Distinct cross-owners receive replicas.
+	//!
+	//! Must be called outside phase_scope. SPMD (all ranks call).
+	static bool test_b2b1_replica_roundtrip( unsigned n_children = 2,
+	                                          int box_nx = 8,
+	                                          int verbose = 0 )
+	{
+#ifdef USE_MPI
+	    const int my_rank = MUSIC::mpi::rank();
+	    const int np      = MUSIC::mpi::size();
+
+	    GridHierarchy<T> gh( /*nbnd=*/2 );
+	    // Per populate_per_box_meshes contract: m_pgrids is independent
+	    // bookkeeping; we don't allocate union meshes here, only per-box.
+	    std::vector< std::vector<LevelBox> > lb(2);
+
+	    // L=0: one parent box, size = (n_children*box_nx) along x, box_nx along y/z.
+	    {
+	        LevelBox p{};
+	        p.oax = 0; p.oay = 0; p.oaz = 0;
+	        p.nx = (unsigned)(n_children * box_nx);
+	        p.ny = (unsigned)box_nx;
+	        p.nz = (unsigned)box_nx;
+	        p.ox = 0; p.oy = 0; p.oz = 0;
+	        p.x0 = 0; p.y0 = 0; p.z0 = 0;
+	        p.xl = 1; p.yl = 1; p.zl = 1;
+	        p.parent_idx = 0;
+	        lb[0].push_back(p);
+	    }
+	    // L=1: n_children children, tiling along x.
+	    for( unsigned c=0; c<n_children; ++c ){
+	        LevelBox cbx{};
+	        cbx.oax = c * (unsigned)box_nx;
+	        cbx.oay = 0; cbx.oaz = 0;
+	        cbx.nx = (unsigned)box_nx;
+	        cbx.ny = (unsigned)box_nx;
+	        cbx.nz = (unsigned)box_nx;
+	        cbx.ox = (int)(c * box_nx); cbx.oy = 0; cbx.oz = 0;
+	        cbx.x0 = 0; cbx.y0 = 0; cbx.z0 = 0;
+	        cbx.xl = 1; cbx.yl = 1; cbx.zl = 1;
+	        cbx.parent_idx = 0;
+	        lb[1].push_back(cbx);
+	    }
+
+	    gh.populate_per_box_meshes(lb);
+
+	    const int parent_owner = gh.owner_of_box(0, 0);
+
+	    // Phase 1: parent owner fills parent mesh with a deterministic pattern
+	    // (including halo). All other ranks have NULL parent slot.
+	    auto pattern = []( int i, int j, int k ) -> T {
+	        return (T)(i * 1000.0 + j * 100.0 + k * 10.0 + 1.0);
+	    };
+	    if( my_rank == parent_owner ){
+	        MeshvarBnd<T>* pm = gh.get_grid(0, 0);
+	        int nbnd = pm->m_nbnd;
+	        int nx = (int)pm->size(0), ny = (int)pm->size(1), nz = (int)pm->size(2);
+	        for( int i=-nbnd; i<nx+nbnd; ++i )
+	            for( int j=-nbnd; j<ny+nbnd; ++j )
+	                for( int k=-nbnd; k<nz+nbnd; ++k )
+	                    (*pm)(i,j,k) = pattern(i, j, k);
+	    }
+
+	    // Phase 2: broadcast.
+	    gh.broadcast_parents_to_child_owners(1);
+
+	    // Phase 3: verify replica byte-match on every cross-rank child owner.
+	    int local_fail = 0;
+	    {
+	        std::set<int> child_owners;
+	        for( unsigned c=0; c<n_children; ++c )
+	            child_owners.insert( gh.owner_of_box(1, c) );
+	        // Determine if my_rank is a cross-rank child owner needing a replica.
+	        bool need_replica = (my_rank != parent_owner) && child_owners.count(my_rank);
+	        if( need_replica ){
+	            MeshvarBnd<T>* rep = NULL;
+	            // Find via parent_for_box on any owned child.
+	            for( unsigned c=0; c<n_children; ++c ){
+	                if( gh.owner_of_box(1, c) == my_rank ){
+	                    rep = gh.parent_for_box(1, c);
+	                    break;
+	                }
+	            }
+	            if( !rep ){ ++local_fail; LOGERR("B.2b.1 smoke: rk=%d expected replica missing", my_rank); }
+	            else {
+	                int nbnd = rep->m_nbnd;
+	                int nx = (int)rep->size(0), ny = (int)rep->size(1), nz = (int)rep->size(2);
+	                for( int i=-nbnd; i<nx+nbnd && !local_fail; ++i )
+	                    for( int j=-nbnd; j<ny+nbnd && !local_fail; ++j )
+	                        for( int k=-nbnd; k<nz+nbnd && !local_fail; ++k ){
+	                            T got = (*rep)(i,j,k);
+	                            T exp = pattern(i, j, k);
+	                            if( got != exp ){
+	                                ++local_fail;
+	                                LOGERR("B.2b.1 smoke: rk=%d replica mismatch at (%d,%d,%d): got=%.6e exp=%.6e",
+	                                       my_rank, i, j, k, (double)got, (double)exp);
+	                            }
+	                        }
+	            }
+	        }
+	    }
+
+	    int g_fail_1 = 0;
+	    MPI_Allreduce(&local_fail, &g_fail_1, 1, MPI_INT, MPI_SUM, MUSIC::mpi::world());
+
+	    // Phase 4: release. (Avoids accumulate-on-untouched-replica which would
+	    // double the parent pattern. Tests broadcast in isolation.)
+	    gh.release_parent_replicas(1);
+
+	    // Phase 5: re-broadcast and modify replicas with a known constant.
+	    gh.broadcast_parents_to_child_owners(1);
+
+	    const T fill_value = (T)7.0;
+	    std::set<int> cross_owners;
+	    {
+	        std::set<int> child_owners;
+	        for( unsigned c=0; c<n_children; ++c )
+	            child_owners.insert( gh.owner_of_box(1, c) );
+	        for( int co : child_owners )
+	            if( co != parent_owner ) cross_owners.insert(co);
+	    }
+	    if( cross_owners.count(my_rank) ){
+	        for( unsigned c=0; c<n_children; ++c ){
+	            if( gh.owner_of_box(1, c) != my_rank ) continue;
+	            MeshvarBnd<T>* rep = gh.parent_for_box(1, c);
+	            if( !rep ) continue;
+	            int nbnd = rep->m_nbnd;
+	            int nx = (int)rep->size(0), ny = (int)rep->size(1), nz = (int)rep->size(2);
+	            for( int i=-nbnd; i<nx+nbnd; ++i )
+	                for( int j=-nbnd; j<ny+nbnd; ++j )
+	                    for( int k=-nbnd; k<nz+nbnd; ++k )
+	                        (*rep)(i,j,k) = fill_value;
+	            break;  // same replica for any owned child of this parent
+	        }
+	    }
+
+	    // Phase 6: accumulate. parent receives fill_value from each distinct
+	    // cross-owner once.
+	    gh.accumulate_children_to_parents(1);
+
+	    // Phase 7: verify parent on parent_owner: pattern(i,j,k) + n_cross * fill_value.
+	    int local_fail_2 = 0;
+	    if( my_rank == parent_owner ){
+	        MeshvarBnd<T>* pm = gh.get_grid(0, 0);
+	        int nbnd = pm->m_nbnd;
+	        int nx = (int)pm->size(0), ny = (int)pm->size(1), nz = (int)pm->size(2);
+	        T expected_add = (T)((double)cross_owners.size() * (double)fill_value);
+	        for( int i=-nbnd; i<nx+nbnd && local_fail_2 < 8; ++i )
+	            for( int j=-nbnd; j<ny+nbnd && local_fail_2 < 8; ++j )
+	                for( int k=-nbnd; k<nz+nbnd && local_fail_2 < 8; ++k ){
+	                    T got = (*pm)(i,j,k);
+	                    T exp = pattern(i,j,k) + expected_add;
+	                    if( got != exp ){
+	                        ++local_fail_2;
+	                        LOGERR("B.2b.1 smoke: rk=%d accumulate mismatch at (%d,%d,%d): got=%.6e exp=%.6e (n_cross=%zu fill=%.3f)",
+	                               my_rank, i, j, k, (double)got, (double)exp,
+	                               cross_owners.size(), (double)fill_value);
+	                    }
+	                }
+	    }
+	    int g_fail_2 = 0;
+	    MPI_Allreduce(&local_fail_2, &g_fail_2, 1, MPI_INT, MPI_SUM, MUSIC::mpi::world());
+
+	    const bool ok = (g_fail_1 == 0) && (g_fail_2 == 0);
+	    if( verbose > 0 && my_rank == 0 ){
+	        LOGINFO("B.2b.1 smoke (n_children=%u, np=%d): broadcast %s, accumulate %s [cross_owners=%zu]",
+	                n_children, np,
+	                (g_fail_1==0 ? "OK" : "FAIL"),
+	                (g_fail_2==0 ? "OK" : "FAIL"),
+	                cross_owners.size());
+	    }
+	    return ok;
+#else
+	    (void)n_children; (void)box_nx; (void)verbose;
+	    return true;
+#endif
+	}
+
+	//! Phase G.2b B.2b.2.2.1.a: standalone smoke test for
+	//! broadcast_union_mesh_from_owner. Builds a flat hierarchy of
+	//! (lmax+1) single-box union levels via create_base_hierarchy. On
+	//! rank 0 (the default owner_of_box(_,0)), fills m_pgrids[level] with
+	//! a deterministic pattern (including halo). All other ranks fill
+	//! their m_pgrids[level] with a sentinel that does NOT match the
+	//! pattern. After broadcast, every rank's m_pgrids[level] must match
+	//! the pattern bit-for-bit. Returns true on success.
+	//!
+	//! At np=1 the broadcast is a no-op; rank 0 already has the pattern,
+	//! so the test trivially passes.
+	static bool test_b2b221a_broadcast_union( unsigned lmax = 3,
+	                                          unsigned target_level = 2,
+	                                          int verbose = 0 )
+	{
+#ifdef USE_MPI
+	    const int my_rank = MUSIC::mpi::rank();
+	    const int np      = MUSIC::mpi::size();
+
+	    if( target_level > lmax ){
+	        if( my_rank == 0 ) LOGERR("B.2b.2.2.1.a smoke: target_level=%u > lmax=%u",
+	                                    target_level, lmax);
+	        return false;
+	    }
+
+	    GridHierarchy<T> gh( /*nbnd=*/2 );
+	    gh.create_base_hierarchy( lmax );  // every rank holds m_pgrids[0..lmax]
+
+	    MeshvarBnd<T>* um = gh.get_grid( target_level );
+	    if( !um ){
+	        LOGERR("B.2b.2.2.1.a smoke: rk=%d missing m_pgrids[%u]", my_rank, target_level);
+	        return false;
+	    }
+	    const int nbnd = um->m_nbnd;
+	    const int nx = (int)um->size(0), ny = (int)um->size(1), nz = (int)um->size(2);
+
+	    auto pattern = []( int i, int j, int k ) -> T {
+	        return (T)(i * 1000.0 + j * 100.0 + k * 10.0 + 1.0);
+	    };
+	    const T sentinel = (T)(-999.0);
+
+	    // Owner: pattern. Others: sentinel (must be overwritten by broadcast).
+	    const int owner = gh.owner_of_box( target_level, 0 );
+	    for( int i=-nbnd; i<nx+nbnd; ++i )
+	        for( int j=-nbnd; j<ny+nbnd; ++j )
+	            for( int k=-nbnd; k<nz+nbnd; ++k )
+	                (*um)(i,j,k) = (my_rank == owner) ? pattern(i,j,k) : sentinel;
+
+	    gh.broadcast_union_mesh_from_owner( target_level );
+
+	    int local_fail = 0;
+	    for( int i=-nbnd; i<nx+nbnd && local_fail < 8; ++i )
+	        for( int j=-nbnd; j<ny+nbnd && local_fail < 8; ++j )
+	            for( int k=-nbnd; k<nz+nbnd && local_fail < 8; ++k ){
+	                T got = (*um)(i,j,k);
+	                T exp = pattern(i,j,k);
+	                if( got != exp ){
+	                    ++local_fail;
+	                    LOGERR("B.2b.2.2.1.a smoke: rk=%d mismatch at (%d,%d,%d): got=%.6e exp=%.6e",
+	                           my_rank, i, j, k, (double)got, (double)exp);
+	                }
+	            }
+	    int g_fail = 0;
+	    MPI_Allreduce(&local_fail, &g_fail, 1, MPI_INT, MPI_SUM, MUSIC::mpi::world());
+
+	    const bool ok = (g_fail == 0);
+	    if( verbose > 0 && my_rank == 0 ){
+	        LOGINFO("B.2b.2.2.1.a smoke (lmax=%u target=%u np=%d): broadcast %s [owner=%d, mesh=(%d,%d,%d) nbnd=%d]",
+	                lmax, target_level, np,
+	                (ok ? "OK" : "FAIL"),
+	                owner, nx, ny, nz, nbnd);
+	    }
+	    return ok;
+#else
+	    (void)lmax; (void)target_level; (void)verbose;
+	    return true;
+#endif
+	}
+
+	//---------------------------------------------------------------------
+
 	//! Phase D.3.1: per-cluster mean/sigma over the interior (no halo) of
 	//! each per-box mesh, plus the corresponding union sub-window mean/sigma
 	//! for cross-check. Logged only at multi-box levels. Diagnostic only.
@@ -1366,6 +2138,292 @@ public:
 	                    tag, L, b, bnx, bny, bnz, mean, sd);
 	        }
 	    }
+	}
+	//---------------------------------------------------------------------
+
+	//-------- Phase G.1 per-cluster z-slab API ---------------------------
+	bool has_zslabs() const { return m_zslab_enabled_; }
+	int  zslab_halo_w() const { return m_zslab_halo_w_; }
+	size_t num_zslabs( unsigned ilevel ) const {
+	    if( !m_zslab_enabled_ || ilevel >= m_zslab_layouts_.size() ) return 0;
+	    return m_zslab_layouts_[ilevel].size();
+	}
+	const MUSIC::zoom_slab::ZoomSlabLayout & zslab_layout( unsigned ilevel, size_t b ) const {
+	    return m_zslab_layouts_.at(ilevel).at(b);
+	}
+	T*       zslab_data( unsigned ilevel, size_t b ){
+	    return m_zslab_data_.at(ilevel).at(b).data();
+	}
+	const T* zslab_data( unsigned ilevel, size_t b ) const {
+	    return m_zslab_data_.at(ilevel).at(b).data();
+	}
+
+	//! Phase G.1: free per-cluster z-slab layouts and data buffers.
+	void deallocate_per_box_zslabs(){
+	    m_zslab_layouts_.clear();
+	    m_zslab_data_.clear();
+	    m_zslab_enabled_ = false;
+	    m_zslab_halo_w_  = 0;
+	}
+
+	//! Phase G.1: allocate per-cluster z-slab layouts + local-with-halo
+	//! data buffers for every (L, b) in m_pgrids_per_box_. Uses
+	//! MPI_COMM_WORLD as the per-cluster sub-comm (every rank participates
+	//! in every cluster). G.2+ will introduce true per-cluster sub-comms;
+	//! the layout footprint here will not change.
+	//!
+	//! Requires populate_per_box_meshes() to have run (so per-box geometry
+	//! vectors are filled). halo_w is the z-direction halo cell count; for
+	//! G.1 it should match m_nbnd so the z-slab footprint mirrors the
+	//! per-box MeshvarBnd footprint along z.
+	void populate_per_box_zslabs( int halo_w ){
+	    deallocate_per_box_zslabs();
+	    const size_t Lmax = m_pgrids_per_box_.size();
+	    if( Lmax == 0 ) return;
+	    if( halo_w < 0 ) halo_w = 0;
+	    m_zslab_halo_w_ = halo_w;
+	    m_zslab_layouts_.assign(Lmax, std::vector<MUSIC::zoom_slab::ZoomSlabLayout>());
+	    m_zslab_data_.assign   (Lmax, std::vector<std::vector<T> >());
+
+#ifdef USE_MPI
+	    MPI_Comm sub = MUSIC::mpi::world();
+#else
+	    MPI_Comm sub = 0;
+#endif
+	    const int sub_size = MUSIC::mpi::size();
+
+	    size_t multi_levels = 0;
+	    size_t total_local_cells = 0;
+	    for( size_t L = 0; L < Lmax; ++L ){
+	        const size_t nb = m_pgrids_per_box_[L].size();
+	        for( size_t b = 0; b < nb; ++b ){
+	            const int cnx = (int)m_nx_per_box_[L][b];
+	            const int cny = (int)m_ny_per_box_[L][b];
+	            const int cnz = (int)m_nz_per_box_[L][b];
+	            // Skip levels where the slab decomposition would leave a rank
+	            // empty (low levels with cnz < sub_size, or any cluster too
+	            // small to halo-exchange). Caller can still inspect num_zslabs
+	            // and zslab_layout per level to detect skipped levels.
+	            if( sub_size > cnz || cnz < halo_w * sub_size ){
+	                continue;
+	            }
+	            MUSIC::zoom_slab::ZoomSlabLayout lyt = MUSIC::zoom_slab::make_layout(
+	                sub, /*cluster_id=*/b, /*level=*/(unsigned)L,
+	                m_xoffabs_per_box_[L][b], m_yoffabs_per_box_[L][b], m_zoffabs_per_box_[L][b],
+	                cnx, cny, cnz, halo_w);
+	            const size_t cells = MUSIC::zoom_slab::local_with_halo_size(lyt);
+	            m_zslab_layouts_[L].push_back(lyt);
+	            m_zslab_data_[L].emplace_back(cells, T(0));
+	            total_local_cells += cells;
+	        }
+	        if( nb > 1 ) ++multi_levels;
+	    }
+	    m_zslab_enabled_ = true;
+
+	    if( multi_levels > 0 ){
+	        const double mb_local = (double)(total_local_cells * sizeof(T)) / (1024.0*1024.0);
+	        LOGINFO("G.1 populate_per_box_zslabs: enabled (halo_w=%d sub_size=%d) — local z-slab footprint = %.2f MB across %zu multi-box level(s)",
+	                halo_w, sub_size, mb_local, multi_levels);
+	    }
+	}
+
+	//! Phase G.1: owner's per-box MeshvarBnd interior -> all-ranks' z-slab
+	//! interior (then halo-exchange in z). Edge halos in z are zero-filled
+	//! per MUSIC::zoom_slab::halo_exchange policy (clusters are bounded).
+	//!
+	//! Pre: populate_per_box_zslabs() + per-box mesh contents are
+	//! authoritative on the owner rank (e.g., after sync_per_box_from_union).
+	//! Post: every rank's z-slab data buffer holds the correct interior
+	//! + halo for its z-strip of cluster b at level L.
+	void sync_zslab_from_per_box(){
+	    if( !m_zslab_enabled_ ) return;
+	    const int my_rank = MUSIC::mpi::rank();
+	    for( size_t L = 0; L < m_zslab_layouts_.size(); ++L ){
+	        for( size_t b = 0; b < m_zslab_layouts_[L].size(); ++b ){
+	            const MUSIC::zoom_slab::ZoomSlabLayout & lyt = m_zslab_layouts_[L][b];
+	            const int owner = m_pbox_owner_[L][b];
+
+	            // Owner packs its per-box mesh interior into a contiguous
+	            // (i, j, k=0..cnz) row-major buffer; non-owners pass NULL.
+	            std::vector<T> full_pack;
+	            const std::size_t full_cells = MUSIC::zoom_slab::cluster_full_size(lyt);
+	            if( my_rank == owner ){
+	                const MeshvarBnd<T> * bm = m_pgrids_per_box_[L][b];
+	                if( !bm ) throw std::runtime_error("G.1 sync_zslab_from_per_box: owner mesh NULL");
+	                full_pack.assign(full_cells, T(0));
+	                const int bnx = (int)bm->size(0);
+	                const int bny = (int)bm->size(1);
+	                const int bnz = (int)bm->size(2);
+	                for( int i=0; i<bnx; ++i )
+	                    for( int j=0; j<bny; ++j )
+	                        for( int k=0; k<bnz; ++k ){
+	                            full_pack[((std::size_t)i*(std::size_t)bny + (std::size_t)j)
+	                                      * (std::size_t)bnz + (std::size_t)k]
+	                                = (*bm)(i,j,k);
+	                        }
+	            }
+
+	            // Scatter interior into each rank's local-with-halo buffer
+	            // (interior region at k in [halo_w, halo_w+local_nz)).
+	            const int hw = lyt.halo_w;
+	            const int loc_nz = MUSIC::zoom_slab::local_nz(lyt);
+	            std::vector<T> interior((std::size_t)lyt.cluster_nx
+	                                  * (std::size_t)lyt.cluster_ny
+	                                  * (std::size_t)loc_nz, T(0));
+	            MUSIC::zoom_slab::scatter_from(lyt, owner,
+	                                    my_rank == owner ? full_pack.data() : (const T*)NULL,
+	                                    interior.data());
+
+	            // Copy interior into z-slab buffer's interior region.
+	            T* buf = m_zslab_data_[L][b].data();
+	            // Zero the halo first; halo exchange fills the interior-of-
+	            // neighbours portion. Edges stay zero.
+	            std::fill(m_zslab_data_[L][b].begin(), m_zslab_data_[L][b].end(), T(0));
+	            const int kstride = 2*hw + loc_nz;
+	            for( int i=0; i<lyt.cluster_nx; ++i )
+	                for( int j=0; j<lyt.cluster_ny; ++j )
+	                    for( int kl=0; kl<loc_nz; ++kl ){
+	                        const std::size_t dst = ((std::size_t)i * (std::size_t)lyt.cluster_ny
+	                                                 + (std::size_t)j) * (std::size_t)kstride
+	                                              + (std::size_t)(hw + kl);
+	                        const std::size_t src = ((std::size_t)i * (std::size_t)lyt.cluster_ny
+	                                                 + (std::size_t)j) * (std::size_t)loc_nz
+	                                              + (std::size_t)kl;
+	                        buf[dst] = interior[src];
+	                    }
+	            MUSIC::zoom_slab::halo_exchange_z(lyt, buf);
+	        }
+	    }
+	}
+
+	//! Phase G.1: inverse of sync_zslab_from_per_box. Z-slabs -> owner's
+	//! per-box mesh interior. Halo cells in z-slabs are not pushed back
+	//! (the per-box mesh's own halo is fed by sync_per_box_from_union from
+	//! the union mesh, which carries inter-cluster boundary data).
+	//!
+	//! On non-owner ranks the owner's per-box mesh is NULL; this method
+	//! sends slab interior to the owner who unpacks into bm.
+	void sync_per_box_from_zslab(){
+	    if( !m_zslab_enabled_ ) return;
+	    const int my_rank = MUSIC::mpi::rank();
+	    for( size_t L = 0; L < m_zslab_layouts_.size(); ++L ){
+	        for( size_t b = 0; b < m_zslab_layouts_[L].size(); ++b ){
+	            const MUSIC::zoom_slab::ZoomSlabLayout & lyt = m_zslab_layouts_[L][b];
+	            const int owner = m_pbox_owner_[L][b];
+	            const int hw = lyt.halo_w;
+	            const int loc_nz = MUSIC::zoom_slab::local_nz(lyt);
+
+	            // Pack interior from z-slab buffer (drop halos).
+	            std::vector<T> interior((std::size_t)lyt.cluster_nx
+	                                  * (std::size_t)lyt.cluster_ny
+	                                  * (std::size_t)loc_nz, T(0));
+	            const T* buf = m_zslab_data_[L][b].data();
+	            const int kstride = 2*hw + loc_nz;
+	            for( int i=0; i<lyt.cluster_nx; ++i )
+	                for( int j=0; j<lyt.cluster_ny; ++j )
+	                    for( int kl=0; kl<loc_nz; ++kl ){
+	                        const std::size_t src = ((std::size_t)i * (std::size_t)lyt.cluster_ny
+	                                                 + (std::size_t)j) * (std::size_t)kstride
+	                                              + (std::size_t)(hw + kl);
+	                        const std::size_t dst = ((std::size_t)i * (std::size_t)lyt.cluster_ny
+	                                                 + (std::size_t)j) * (std::size_t)loc_nz
+	                                              + (std::size_t)kl;
+	                        interior[dst] = buf[src];
+	                    }
+
+	            // Owner allocates full_recv; non-owners pass NULL.
+	            std::vector<T> full_recv;
+	            if( my_rank == owner ){
+	                full_recv.assign(MUSIC::zoom_slab::cluster_full_size(lyt), T(0));
+	            }
+	            MUSIC::zoom_slab::gather_to(lyt, owner, interior.data(),
+	                                 my_rank == owner ? full_recv.data() : (T*)NULL);
+
+	            // Owner unpacks into per-box mesh interior (halo untouched).
+	            if( my_rank == owner ){
+	                MeshvarBnd<T> * bm = m_pgrids_per_box_[L][b];
+	                if( !bm ) throw std::runtime_error("G.1 sync_per_box_from_zslab: owner mesh NULL");
+	                const int bnx = (int)bm->size(0);
+	                const int bny = (int)bm->size(1);
+	                const int bnz = (int)bm->size(2);
+	                for( int i=0; i<bnx; ++i )
+	                    for( int j=0; j<bny; ++j )
+	                        for( int k=0; k<bnz; ++k ){
+	                            (*bm)(i,j,k) =
+	                                full_recv[((std::size_t)i*(std::size_t)bny + (std::size_t)j)
+	                                          * (std::size_t)bnz + (std::size_t)k];
+	                        }
+	            }
+	        }
+	    }
+	}
+
+	//! Phase G.1 verification: roundtrip per-box -> z-slab -> per-box and
+	//! verify owner's per-box mesh is bit-identical before/after. Returns
+	//! true on success; false (after LOGERR) on mismatch.
+	bool verify_zslab_roundtrip(){
+	    if( !m_zslab_enabled_ ) return true;
+	    const int my_rank = MUSIC::mpi::rank();
+	    // Snapshot owner's per-box mesh contents.
+	    std::vector< std::vector< std::vector<T> > > snap(m_pgrids_per_box_.size());
+	    for( size_t L = 0; L < m_pgrids_per_box_.size(); ++L ){
+	        snap[L].resize(m_pgrids_per_box_[L].size());
+	        for( size_t b = 0; b < m_pgrids_per_box_[L].size(); ++b ){
+	            if( m_pbox_owner_[L][b] != my_rank ) continue;
+	            const MeshvarBnd<T> * bm = m_pgrids_per_box_[L][b];
+	            if( !bm ) continue;
+	            const int bnx = (int)bm->size(0);
+	            const int bny = (int)bm->size(1);
+	            const int bnz = (int)bm->size(2);
+	            snap[L][b].assign((std::size_t)bnx*(std::size_t)bny*(std::size_t)bnz, T(0));
+	            for( int i=0; i<bnx; ++i )
+	                for( int j=0; j<bny; ++j )
+	                    for( int k=0; k<bnz; ++k ){
+	                        snap[L][b][((std::size_t)i*(std::size_t)bny + (std::size_t)j)
+	                                   * (std::size_t)bnz + (std::size_t)k] = (*bm)(i,j,k);
+	                    }
+	        }
+	    }
+	    sync_zslab_from_per_box();
+	    sync_per_box_from_zslab();
+	    // Compare on owner ranks. mismatches counted locally; max via allreduce.
+	    std::size_t local_mismatches = 0;
+	    for( size_t L = 0; L < m_pgrids_per_box_.size(); ++L ){
+	        for( size_t b = 0; b < m_pgrids_per_box_[L].size(); ++b ){
+	            if( m_pbox_owner_[L][b] != my_rank ) continue;
+	            const MeshvarBnd<T> * bm = m_pgrids_per_box_[L][b];
+	            if( !bm ) continue;
+	            const int bnx = (int)bm->size(0);
+	            const int bny = (int)bm->size(1);
+	            const int bnz = (int)bm->size(2);
+	            const auto & ref = snap[L][b];
+	            for( int i=0; i<bnx; ++i )
+	                for( int j=0; j<bny; ++j )
+	                    for( int k=0; k<bnz; ++k ){
+	                        const T want = ref[((std::size_t)i*(std::size_t)bny + (std::size_t)j)
+	                                           * (std::size_t)bnz + (std::size_t)k];
+	                        const T got  = (*bm)(i,j,k);
+	                        if( got != want ){
+	                            if( local_mismatches < 4 )
+	                                LOGERR("G.1 verify_zslab_roundtrip: mismatch L=%zu b=%zu (%d,%d,%d) got=%g want=%g",
+	                                       L, b, i, j, k, (double)got, (double)want);
+	                            ++local_mismatches;
+	                        }
+	                    }
+	        }
+	    }
+#ifdef USE_MPI
+	    std::size_t global_mismatches = 0;
+	    MPI_Allreduce(&local_mismatches, &global_mismatches, 1,
+	                  MPI_UNSIGNED_LONG, MPI_SUM, MUSIC::mpi::world());
+	    local_mismatches = global_mismatches;
+#endif
+	    if( local_mismatches > 0 ){
+	        LOGERR("G.1 verify_zslab_roundtrip: %zu cells differ after roundtrip", local_mismatches);
+	        return false;
+	    }
+	    LOGINFO("G.1 verify_zslab_roundtrip: PASSED — per-box -> z-slab -> per-box bit-identical");
+	    return true;
 	}
 	//---------------------------------------------------------------------
 
@@ -1974,6 +3032,17 @@ public:
 	    if( m_zoffabs.size() <= ilevel ) m_zoffabs.resize(ilevel+1, 0);
 	    ensure_level_slab_meta_(ilevel);
 
+	    // H.4 idempotency: if the level is already slab with matching dims,
+	    // no-op. Lets create_base_hierarchy_slab + slab_solve_unigrid wrappers
+	    // compose without double-converting.
+	    if( m_level_is_slab_[ilevel]
+	        && m_level_gnx_[ilevel] == gnx
+	        && m_level_gny_[ilevel] == gny
+	        && m_level_gnz_[ilevel] == gnz )
+	    {
+	        return;
+	    }
+
 	    // detach the rank-0 source full so allocate_union_slab_at doesn't free it
 	    MeshvarBnd<T> * src_full = NULL;
 	    if( rk == 0 ) {
@@ -2433,31 +3502,78 @@ public:
 	void create_base_hierarchy( unsigned lmax )
 	{
 		size_t n=1;
-		
+
 		this->deallocate();
-		
+
 		m_pgrids.clear();
-		
+
 		m_xoffabs.clear();
 		m_yoffabs.clear();
 		m_zoffabs.clear();
-		
+
 		for( unsigned i=0; i<= lmax; ++i )
 		{
 			//std::cout << "....adding level " << i << " (" << n << ", " << n << ", " << n << ")" << std::endl;
 			m_pgrids.push_back( new MeshvarBnd<T>( m_nbnd, n, n, n, 0, 0, 0 ) );
 			m_pgrids[i]->zero();
      		n *= 2;
-			
+
 			m_xoffabs.push_back( 0 );
 			m_yoffabs.push_back( 0 );
 			m_zoffabs.push_back( 0 );
 		}
-		
+
 		m_levelmin = lmax;
-        
+
         for( unsigned i=0; i<= lmax; ++i )
             m_ref_masks.push_back( new refinement_mask(size(i,0),size(i,1),size(i,2),(short)(i!=lmax)) );
+	}
+
+	//! H.4: like create_base_hierarchy(lmax), but the topmost level (lmax) is
+	//! allocated as a per-rank slab MeshvarBnd instead of a full mesh on every
+	//! rank. Smaller levels 0..lmax-1 stay full (sizes 1,2,...,2^(lmax-1) are
+	//! negligible). Caller is responsible for zeroing the slab (slab ctor
+	//! already zero-inits; this mirrors create_base_hierarchy which calls
+	//! ->zero() explicitly).
+	//!
+	//! Collective. On serial builds (np==1) the slab degenerates to the full
+	//! mesh, so this is observationally equivalent to create_base_hierarchy.
+	void create_base_hierarchy_slab( unsigned lmax )
+	{
+		size_t n=1;
+
+		this->deallocate();
+
+		m_pgrids.clear();
+
+		m_xoffabs.clear();
+		m_yoffabs.clear();
+		m_zoffabs.clear();
+
+		for( unsigned i=0; i< lmax; ++i )
+		{
+			m_pgrids.push_back( new MeshvarBnd<T>( m_nbnd, n, n, n, 0, 0, 0 ) );
+			m_pgrids[i]->zero();
+			n *= 2;
+			m_xoffabs.push_back( 0 );
+			m_yoffabs.push_back( 0 );
+			m_zoffabs.push_back( 0 );
+		}
+
+		// Top level as per-rank slab. allocate_union_slab_at requires the
+		// m_pgrids slot to exist and the offset vectors to be sized to lmax+1.
+		m_pgrids.push_back( (MeshvarBnd<T>*)NULL );
+		m_xoffabs.push_back( 0 );
+		m_yoffabs.push_back( 0 );
+		m_zoffabs.push_back( 0 );
+		ensure_level_slab_meta_(lmax);
+		allocate_union_slab_at( lmax, n, n, n, 0, 0, 0 );
+		m_pgrids[lmax]->zero();
+
+		m_levelmin = lmax;
+
+		for( unsigned i=0; i<= lmax; ++i )
+			m_ref_masks.push_back( new refinement_mask(size(i,0),size(i,1),size(i,2),(short)(i!=lmax)) );
 	}
 	
 	//! multiply entire grid hierarchy by a constant
@@ -2604,9 +3720,12 @@ public:
 				delete m_pgrids[i];
 			m_pgrids.clear();
 
-			// see copy-ctor note: iterate by size() to handle empty source
+			// see copy-ctor note: iterate by size() to handle empty source.
+			// H.4: skip NULL slots (workers in mixed shell w/ m_pgrids[L]==NULL).
 			for( size_t i=0; i<gh.m_pgrids.size(); ++i )
-				m_pgrids.push_back( new MeshvarBnd<T>( *gh.m_pgrids[i] ) );
+				m_pgrids.push_back( gh.m_pgrids[i]
+				    ? new MeshvarBnd<T>( *gh.m_pgrids[i] )
+				    : (MeshvarBnd<T>*)NULL );
 			m_levelmin = gh.levelmin();
 			m_nbnd = gh.m_nbnd;
 
@@ -2647,8 +3766,11 @@ public:
 			return *this;
 		}//throw std::runtime_error("GridHierarchy::operator= : attempt to operate on incompatible data");
 
+		// H.4: workers may carry NULL slots (m_pgrids[L]==NULL after
+		// convert_level_slab_to_full); skip those rather than deref.
 		for( unsigned i=0; i<m_pgrids.size(); ++i )
-			(*m_pgrids[i]) = *gh.get_grid(i);
+			if( m_pgrids[i] && gh.get_grid(i) )
+				(*m_pgrids[i]) = *gh.get_grid(i);
 
 		// Per-box meshes — element-wise assign if sizes match (consistent path).
 		// E.1: skip NULL slots (owner mismatch).

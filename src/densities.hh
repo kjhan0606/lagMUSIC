@@ -37,26 +37,64 @@ void normalize_density( grid_hierarchy& delta );
  * are used when computing the initial density field by convolution with
  * transfer functions.
  */
+// Allocator that skips value-initialization on default-construct, so
+// std::vector<T,no_init_allocator<T>>::resize(N) leaves trivial-type elements
+// uninitialized. Lets us parallel-zero a large buffer ourselves instead of
+// paying for a single-thread zero pass inside std::vector::resize/assign.
+template <typename T, typename A = std::allocator<T>>
+struct no_init_allocator : A {
+	using A::A;
+	no_init_allocator() = default;
+	template <typename U>
+	no_init_allocator(const no_init_allocator<U, typename std::allocator_traits<A>::template rebind_alloc<U>>&) noexcept {}
+	template <typename U>
+	struct rebind {
+		using other = no_init_allocator<U, typename std::allocator_traits<A>::template rebind_alloc<U>>;
+	};
+	template <typename U>
+	void construct(U* p) noexcept(std::is_nothrow_default_constructible<U>::value)
+	{
+		::new (static_cast<void*>(p)) U;  // default-init (uninit for trivial T)
+	}
+	template <typename U, typename... Args>
+	void construct(U* p, Args&&... args)
+	{
+		std::allocator_traits<A>::construct(static_cast<A&>(*this), p, std::forward<Args>(args)...);
+	}
+};
+
 template< typename real_t >
 class DensityGrid
 {
 public:
-	
+
 	size_t nx_;	//!< number of grid cells in x-direction
 	size_t ny_;	//!< number of grid cells in y-direction
 	size_t nz_;	//!< number of grid cells in z-direction
 	size_t nzp_;	//!< number of cells in memory (z-dir), used for Nyquist padding
 
         size_t nv_[3];
-	
+
         int ox_;        //!< offset of grid in x-direction
         int oy_;        //!< offset of grid in y-direction
         int oz_;        //!< offset of grid in z-direction
 
         size_t ov_[3];
 
-	//! the actual data container in the form of a 1D array
-	std::vector< real_t > data_;
+	//! 1D backing storage; uses no_init_allocator so we control zero pass.
+	using data_storage_t = std::vector< real_t, no_init_allocator<real_t> >;
+	data_storage_t data_;
+
+	// Resize to N elements and parallel-zero (OMP). Replaces
+	// data_.assign(N,0) which is single-threaded. For ~4 GB buffers on rank 0
+	// the single-thread version is page-fault bound (~1.4 GB/s).
+	void resize_and_parallel_zero( size_t N )
+	{
+		data_.resize(N);
+		#pragma omp parallel for schedule(static)
+		for( size_t __i = 0; __i < N; ++__i )
+			data_[__i] = 0;
+	}
 	
 	//! constructor
 	/*! constructs an instance given the dimensions of the density field
@@ -67,15 +105,15 @@ public:
 	DensityGrid( unsigned nx, unsigned ny, unsigned nz )
 	  : nx_(nx), ny_(ny), nz_(nz), nzp_( 2*(nz_/2+1) ), ox_(0), oy_(0), oz_(0)
 	{
-		data_.assign((size_t)nx_*(size_t)ny_*(size_t)nzp_,0.0);
+		resize_and_parallel_zero((size_t)nx_*(size_t)ny_*(size_t)nzp_);
 		nv_[0] = nx_; nv_[1] = ny_; nv_[2] = nz_;
 		ov_[0] = ox_; ov_[1] = oy_; ov_[2] = oz_;
 	}
-	
+
         DensityGrid( unsigned nx, unsigned ny, unsigned nz, int ox, int oy, int oz )
 	  : nx_(nx), ny_(ny), nz_(nz), nzp_( 2*(nz_/2+1) ), ox_(ox), oy_(oy), oz_(oz)
 	{
-		data_.assign((size_t)nx_*(size_t)ny_*(size_t)nzp_,0.0);
+		resize_and_parallel_zero((size_t)nx_*(size_t)ny_*(size_t)nzp_);
 		nv_[0] = nx_; nv_[1] = ny_; nv_[2] = nz_;
 		ov_[0] = ox_; ov_[1] = oy_; ov_[2] = oz_;
 	}
@@ -105,7 +143,7 @@ public:
 		ov_[0] = ov_[1] = ov_[2] = 0;
 
 		data_.clear();
-		std::vector<real_t>().swap(data_);
+		data_storage_t().swap(data_);
 	}
 	
 	//! query the 3D array sizes of the density object
@@ -127,7 +165,10 @@ public:
 	 */
 	void zero( void )
 	{
-		data_.assign(data_.size(),0.0);
+		const size_t N = data_.size();
+		#pragma omp parallel for schedule(static)
+		for( size_t i = 0; i < N; ++i )
+			data_[i] = 0;
 	}
 	
 	//! assigns the contents of another DensityGrid to this
@@ -761,28 +802,40 @@ public:
 	template< class array3 >
 	void copy_unpad( array3& v )
 	{
-		for( size_t ix=nx_/4,ixu=0; ix<3*nx_/4; ++ix,++ixu )
-			for( size_t iy=ny_/4,iyu=0; iy<3*ny_/4; ++iy,++iyu )	
-				for( size_t iz=nz_/4,izu=0; iz<3*nz_/4; ++iz,++izu )
-					v(ixu,iyu,izu) = (*this)(ix,iy,iz);
+		const size_t ix0 = nx_/4, ix1 = 3*nx_/4;
+		const size_t iy0 = ny_/4, iy1 = 3*ny_/4;
+		const size_t iz0 = nz_/4, iz1 = 3*nz_/4;
+		#pragma omp parallel for collapse(2) schedule(static)
+		for( size_t ix=ix0; ix<ix1; ++ix )
+			for( size_t iy=iy0; iy<iy1; ++iy )
+				for( size_t iz=iz0; iz<iz1; ++iz )
+					v(ix-ix0,iy-iy0,iz-iz0) = (*this)(ix,iy,iz);
 	}
-	
+
 	template< class array3 >
 	void copy_add_unpad( array3& v )
 	{
-		for( size_t ix=nx_/4,ixu=0; ix<3*nx_/4; ++ix,++ixu )
-			for( size_t iy=ny_/4,iyu=0; iy<3*ny_/4; ++iy,++iyu )	
-				for( size_t iz=nz_/4,izu=0; iz<3*nz_/4; ++iz,++izu )
-					v(ixu,iyu,izu) += (*this)(ix,iy,iz);
+		const size_t ix0 = nx_/4, ix1 = 3*nx_/4;
+		const size_t iy0 = ny_/4, iy1 = 3*ny_/4;
+		const size_t iz0 = nz_/4, iz1 = 3*nz_/4;
+		#pragma omp parallel for collapse(2) schedule(static)
+		for( size_t ix=ix0; ix<ix1; ++ix )
+			for( size_t iy=iy0; iy<iy1; ++iy )
+				for( size_t iz=iz0; iz<iz1; ++iz )
+					v(ix-ix0,iy-iy0,iz-iz0) += (*this)(ix,iy,iz);
 	}
-	
+
 	template< class array3 >
 	void copy_subtract_unpad( array3& v )
 	{
-		for( int ix=nx_/4,ixu=0; ix<3*nx_/4; ++ix,++ixu )
-			for( int iy=ny_/4,iyu=0; iy<3*ny_/4; ++iy,++iyu )	
-				for( int iz=nz_/4,izu=0; iz<3*nz_/4; ++iz,++izu )
-					v(ixu,iyu,izu) -= (*this)(ix,iy,iz);
+		const int ix0 = (int)nx_/4, ix1 = 3*(int)nx_/4;
+		const int iy0 = (int)ny_/4, iy1 = 3*(int)ny_/4;
+		const int iz0 = (int)nz_/4, iz1 = 3*(int)nz_/4;
+		#pragma omp parallel for collapse(2) schedule(static)
+		for( int ix=ix0; ix<ix1; ++ix )
+			for( int iy=iy0; iy<iy1; ++iy )
+				for( int iz=iz0; iz<iz1; ++iz )
+					v(ix-ix0,iy-iy0,iz-iz0) -= (*this)(ix,iy,iz);
 	}
 	
 	

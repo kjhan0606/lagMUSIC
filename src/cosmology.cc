@@ -12,6 +12,8 @@
 #include "mesh.hh"
 #include "mg_operators.hh"
 #include "general.hh"
+#include "mpi_helper.hh"
+#include "mpi_poisson.hh"
 
 #define ACC(i,j,k) ((*u.get_grid((ilevel)))((i),(j),(k)))
 #define SQR(x)	((x)*(x))
@@ -180,14 +182,109 @@ void compute_2LPT_source_FFT( config_file& cf_, const grid_hierarchy& u, grid_hi
 {
 	if( u.levelmin() != u.levelmax() )
 		throw std::runtime_error("FFT 2LPT can only be run in Unigrid mode!");
-	
+
+	// Determine SPMD slab path *before* the rank-0 boost decision below. The
+	// boost (B2-2lpt pattern) assumes workers are idle in their barrier; that's
+	// true only for the rank-0-serial path. On the slab path workers are active
+	// in FFTW3-MPI plans, so boosting rank 0 makes the per-rank plan thread
+	// counts asymmetric and over-subscribes rank 0's cores when multiple ranks
+	// share a node.
+#ifdef USE_MPI
+	const bool use_slab_2lpt = (MUSIC::mpi::size() > 1)
+		&& cf_.getValueSafe<bool>("setup", "slab_2lpt_unigrid", true);
+#else
+	const bool use_slab_2lpt = false;
+#endif
+
+	// B2-2lpt: rank-0-serial path runs on rank-0 only (all 5 call sites in
+	// main.cc are inside `if(MUSIC::mpi::is_root())` blocks; workers idle in
+	// MPI_Barrier after the surrounding GenerateDensityHierarchy returns). 1
+	// r2c + 6 c2r plus the OMP-parallel kernel and copy loops all benefit from
+	// boosting rank-0's thread pool to claim the workers' cores. Mirrors the
+	// random.cc B2/B2-fix pattern (omp_set_num_threads + fftw_plan_with_nthreads
+	// paired). Skipped for slab path (workers active).
+	const int omp_saved = omp_get_max_threads();
+	int omp_boost = omp_saved;
+	if (!use_slab_2lpt) {
+		const std::string boost_mode =
+			cf_.getValueSafe<std::string>("setup", "lpt2_boost_threads",
+			                              std::string("auto"));
+		if (boost_mode != std::string("no")) {
+			if (boost_mode == std::string("auto")) {
+				const int avail = omp_get_num_procs();
+				const int cap   = omp_saved * std::max(1, MUSIC::mpi::size());
+				omp_boost = std::min(avail, cap);
+			} else {
+				try { omp_boost = std::max(1, std::stoi(boost_mode)); }
+				catch(...) { omp_boost = omp_saved; }
+			}
+		}
+		if (omp_boost > omp_saved) {
+			LOGINFO("B2-2lpt: rank-0 2LPT-FFT OMP boost %d -> %d (workers idle in barrier)",
+			        omp_saved, omp_boost);
+			omp_set_num_threads(omp_boost);
+#if defined(FFTW3) && !defined(SINGLETHREAD_FFTW)
+#ifdef SINGLE_PRECISION
+			fftwf_plan_with_nthreads(omp_boost);
+#else
+			fftw_plan_with_nthreads(omp_boost);
+#endif
+#endif
+		}
+	}
+	const double t_lpt2_start = omp_get_wtime();
+
 	fnew = u;
 	size_t nx,ny,nz,nzp;
 	nx = u.get_grid(u.levelmax())->size(0);
 	ny = u.get_grid(u.levelmax())->size(1);
 	nz = u.get_grid(u.levelmax())->size(2);
 	nzp = 2*(nz/2+1);
-	
+
+	// Phase F2LPT.1: SPMD distributed path. Caller wraps this in a phase_scope
+	// (workers parked in worker_pump), so rank 0 can broadcast OP_LPT2_FFT and
+	// participate in the collective r2c/c2r FFTs. The composite (sum of 2x2
+	// Hessian minors) is written to fnew's grid as in the serial path. Allocates
+	// only 1 rank-0 padded buffer (the phi/result transfer staging) — the 6
+	// Hessian-component scratch buffers are per-rank slabs inside rank0_dist_lpt2.
+#ifdef USE_MPI
+	if (use_slab_2lpt) {
+		fftw_real *phi_buf = new fftw_real[nx*ny*nzp];
+		fftw_real *dst_buf = new fftw_real[nx*ny*nzp];
+		#pragma omp parallel for
+		for( int i = 0; i < (int)nx; ++i )
+			for( size_t j = 0; j < ny; ++j )
+				for( size_t k = 0; k < nz; ++k ) {
+					size_t idx = ((size_t)i*ny + j) * nzp + k;
+					phi_buf[idx] = (*u.get_grid(u.levelmax()))(i, (int)j, (int)k);
+				}
+		MUSIC::poisson::rank0_dist_lpt2<fftw_real>(phi_buf, dst_buf, nx, ny, nz);
+		#pragma omp parallel for
+		for( int i = 0; i < (int)nx; ++i )
+			for( size_t j = 0; j < ny; ++j )
+				for( size_t k = 0; k < nz; ++k ) {
+					size_t idx = ((size_t)i*ny + j) * nzp + k;
+					(*fnew.get_grid(u.levelmax()))(i, (int)j, (int)k) = dst_buf[idx];
+				}
+		delete[] phi_buf;
+		delete[] dst_buf;
+		const double t_lpt2_total = omp_get_wtime() - t_lpt2_start;
+		LOGINFO("lpt2-profile compute_2LPT_source_FFT(slab) nx=%zu  wall=%.3fs  np=%d  threads=%d",
+		        nx, t_lpt2_total, MUSIC::mpi::size(), omp_boost);
+		if (omp_boost > omp_saved) {
+			omp_set_num_threads(omp_saved);
+#if defined(FFTW3) && !defined(SINGLETHREAD_FFTW)
+#ifdef SINGLE_PRECISION
+			fftwf_plan_with_nthreads(omp_saved);
+#else
+			fftw_plan_with_nthreads(omp_saved);
+#endif
+#endif
+		}
+		return;
+	}
+#endif
+
 	//... copy data ..................................................
 	fftw_real *data = new fftw_real[nx*ny*nzp];
 	fftw_complex *cdata = reinterpret_cast<fftw_complex*> (data);
@@ -490,13 +587,55 @@ void compute_2LPT_source_FFT( config_file& cf_, const grid_hierarchy& u, grid_hi
 	delete[] data_23;
 	delete[] data_22;
 	delete[] data_33;
+
+	const double t_lpt2_total = omp_get_wtime() - t_lpt2_start;
+	LOGINFO("lpt2-profile compute_2LPT_source_FFT nx=%zu  wall=%.3fs  threads=%d",
+	        nx, t_lpt2_total, omp_boost);
+	if (omp_boost > omp_saved) {
+		omp_set_num_threads(omp_saved);
+#if defined(FFTW3) && !defined(SINGLETHREAD_FFTW)
+#ifdef SINGLE_PRECISION
+		fftwf_plan_with_nthreads(omp_saved);
+#else
+		fftw_plan_with_nthreads(omp_saved);
+#endif
+#endif
+	}
 }
 
-void compute_2LPT_source( const grid_hierarchy& u, grid_hierarchy& fnew, unsigned order )
+void compute_2LPT_source( config_file& cf_, const grid_hierarchy& u, grid_hierarchy& fnew, unsigned order )
 {
+	// B2-2lpt: rank-0 only by call-site gating (same is_root() blocks as the FFT
+	// variant). The level loop is OMP-parallel via the inner #pragma omp parallel
+	// for over ix, so boosting rank-0's pool to claim idle worker cores cuts the
+	// FD stencil cost. No FFTW plans here, so omp_set_num_threads alone suffices.
+	const int omp_saved = omp_get_max_threads();
+	int omp_boost = omp_saved;
+	{
+		const std::string boost_mode =
+			cf_.getValueSafe<std::string>("setup", "lpt2_boost_threads",
+			                              std::string("auto"));
+		if (boost_mode != std::string("no")) {
+			if (boost_mode == std::string("auto")) {
+				const int avail = omp_get_num_procs();
+				const int cap   = omp_saved * std::max(1, MUSIC::mpi::size());
+				omp_boost = std::min(avail, cap);
+			} else {
+				try { omp_boost = std::max(1, std::stoi(boost_mode)); }
+				catch(...) { omp_boost = omp_saved; }
+			}
+		}
+	}
+	if (omp_boost > omp_saved) {
+		LOGINFO("B2-2lpt: rank-0 2LPT-FD OMP boost %d -> %d (workers idle in barrier)",
+		        omp_saved, omp_boost);
+		omp_set_num_threads(omp_boost);
+	}
+	const double t_lpt2_start = omp_get_wtime();
+
 	fnew = u;
     fnew.zero();
-	
+
 	for( unsigned ilevel=u.levelmin(); ilevel<=u.levelmax(); ++ilevel )
 	{
 		double h = pow(2.0,ilevel), h2 = h*h, h2_4 = 0.25*h2;
@@ -615,7 +754,13 @@ void compute_2LPT_source( const grid_hierarchy& u, grid_hierarchy& fnew, unsigne
 		    for( int iz=0; iz<nz; ++iz )
 		      (*fnew.get_grid(i))(ix,iy,iz) -= sum;
 	}
-	
+
+	const double t_lpt2_total = omp_get_wtime() - t_lpt2_start;
+	LOGINFO("lpt2-profile compute_2LPT_source (FD) levels=%u..%u  wall=%.3fs  threads=%d",
+	        u.levelmin(), u.levelmax(), t_lpt2_total, omp_boost);
+	if (omp_boost > omp_saved) {
+		omp_set_num_threads(omp_saved);
+	}
 }
 #undef SQR
 #undef ACC

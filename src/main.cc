@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iomanip>
 #include <math.h>
+#include <unistd.h>
 
 #include <gsl/gsl_rng.h>
 #include <gsl/gsl_randist.h>
@@ -46,6 +47,7 @@
 #include "mesh_distributed.hh"
 #include "mpi_fft.hh"
 #include "mpi_poisson.hh"
+#include "zoom_slab.hh"
 
 #include <vector>
 #include <cstdlib>
@@ -765,7 +767,7 @@ int main (int argc, const char * argv[])
 	// forward-multiply-inverse pipeline with Tk == 1. All ranks must
 	// participate, so these are dispatched after FFTW MPI init but before
 	// the non-root early-return.
-	enum { SMOKE_NONE, SMOKE_FFT, SMOKE_CONV, SMOKE_PERFORM_DIST } smoke_kind = SMOKE_NONE;
+	enum { SMOKE_NONE, SMOKE_FFT, SMOKE_CONV, SMOKE_PERFORM_DIST, SMOKE_B2B1_REPLICA, SMOKE_B2B221A_BROADCAST, SMOKE_H3A_COARSEN, SMOKE_H4_BASE_SLAB } smoke_kind = SMOKE_NONE;
 	bool   smoke_mode = false;
 	size_t smoke_N    = 0;
 	const char* smoke_cfg = NULL;
@@ -774,6 +776,10 @@ int main (int argc, const char * argv[])
 		if( a1 == "--mpi-fft-smoke" )           smoke_kind = SMOKE_FFT;
 		else if( a1 == "--mpi-conv-smoke" )     smoke_kind = SMOKE_CONV;
 		else if( a1 == "--mpi-perform-dist-smoke" ) smoke_kind = SMOKE_PERFORM_DIST;
+		else if( a1 == "--b2b1-replica-smoke" )     smoke_kind = SMOKE_B2B1_REPLICA;
+		else if( a1 == "--b2b221a-broadcast-smoke" ) smoke_kind = SMOKE_B2B221A_BROADCAST;
+		else if( a1 == "--h3a-coarsen-smoke" )      smoke_kind = SMOKE_H3A_COARSEN;
+		else if( a1 == "--h4-base-slab-smoke" )     smoke_kind = SMOKE_H4_BASE_SLAB;
 		smoke_mode = (smoke_kind != SMOKE_NONE);
 	}
 	if( smoke_mode ){
@@ -879,6 +885,44 @@ int main (int argc, const char * argv[])
 			rc = run_mpi_perform_dist_smoke(smoke_cfg, smoke_N);
 		else if( smoke_kind == SMOKE_CONV )
 			rc = run_mpi_conv_smoke(smoke_N);
+		else if( smoke_kind == SMOKE_B2B1_REPLICA ){
+			// Phase G.2b B.2b.1 standalone smoke. Optional args: n_children, box_nx.
+			unsigned n_children = (argc >= 3) ? (unsigned)std::atol(argv[2]) : 2u;
+			int      box_nx     = (argc >= 4) ? std::atoi(argv[3])             : 8;
+			bool ok = GridHierarchy<real_t>::test_b2b1_replica_roundtrip(
+			              n_children, box_nx, /*verbose=*/1);
+			int ok_all = ok ? 0 : 1;
+		#ifdef USE_MPI
+			MPI_Allreduce(MPI_IN_PLACE, &ok_all, 1, MPI_INT, MPI_MAX, MUSIC::mpi::world());
+		#endif
+			rc = ok_all;
+		}
+		else if( smoke_kind == SMOKE_B2B221A_BROADCAST ){
+			// Phase G.2b B.2b.2.2.1.a standalone smoke. Optional args: lmax, target_level.
+			unsigned lmax         = (argc >= 3) ? (unsigned)std::atol(argv[2]) : 3u;
+			unsigned target_level = (argc >= 4) ? (unsigned)std::atol(argv[3]) : 2u;
+			bool ok = GridHierarchy<real_t>::test_b2b221a_broadcast_union(
+			              lmax, target_level, /*verbose=*/1);
+			int ok_all = ok ? 0 : 1;
+		#ifdef USE_MPI
+			MPI_Allreduce(MPI_IN_PLACE, &ok_all, 1, MPI_INT, MPI_MAX, MUSIC::mpi::world());
+		#endif
+			rc = ok_all;
+		}
+		else if( smoke_kind == SMOKE_H3A_COARSEN ){
+			// Phase H.3a standalone smoke. Compares serial fft_coarsen vs SPMD
+			// fft_coarsen_dist on a Nfine³ deterministic separable sin-product.
+			extern int run_h3a_coarsen_smoke(size_t Nfine);
+			rc = run_h3a_coarsen_smoke(smoke_N);
+		}
+		else if( smoke_kind == SMOKE_H4_BASE_SLAB ){
+			// Phase H.4 standalone smoke. Exercises GridHierarchy::
+			// create_base_hierarchy_slab(lmax): each rank fills its
+			// (2^lmax)³ x-strip and the result is gathered + compared
+			// to a serial reference pattern.
+			extern int run_h4_base_slab_smoke(size_t lmax);
+			rc = run_h4_base_slab_smoke(smoke_N);
+		}
 		else
 			rc = run_mpi_fft_smoke(smoke_N);
 #ifdef USE_MPI
@@ -972,6 +1016,219 @@ int main (int argc, const char * argv[])
 	// collective convolution::perform_dist() call inside GenerateDensityHierarchy.
 	// Heavy serial work (Poisson solve, output writes) is gated behind
 	// MUSIC::mpi::is_root() — workers no-op those sections.
+
+	// Phase G.0: zoom-region z-slab decomposition smoke test (opt-in).
+	// Runs entirely on MPI_COMM_WORLD with synthetic geometry; verifies
+	// scatter/halo/gather roundtrip is bit-identical. Exits via throw on
+	// failure. Opt-in via setup.test_zoom_slab=yes; default off.
+	if( MUSIC::mpi::size() > 1
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 2);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.0 smoke test FAILED");
+	        throw std::runtime_error("zoom_slab smoke test failed");
+	    }
+	}
+
+	// Phase G.2: slab residual primitive smoke test (opt-in).
+	// Fills u with sin/cos product, builds analytic f = L u / h^2, scatters
+	// to per-rank z-slabs, exchanges halo, then verifies residual_z returns
+	// ~0 on cells not adjacent to zero-filled edge halos. Default off.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_residual", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 2);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_residual_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2 residual smoke test FAILED");
+	        throw std::runtime_error("zoom_slab residual smoke test failed");
+	    }
+	}
+
+	// Phase G.4: 2LPT FD source slab primitive smoke test (opt-in).
+	// Scatters deterministic u to per-rank z-slabs, runs the 2LPT FD operator
+	// on each slab, gathers result, and verifies bit-identical match against
+	// a serial reference of the same operator. Default off.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_lpt2", false) )
+	{
+	    const unsigned order = cf.getValueSafe<unsigned>("setup", "test_zoom_slab_lpt2_order", 2);
+	    const int default_halo = (order == 2) ? 2 : 4;
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", default_halo);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_lpt2_single_cluster(order, halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.4 lpt2 smoke test FAILED");
+	        throw std::runtime_error("zoom_slab lpt2 smoke test failed");
+	    }
+	}
+
+	// Phase G.2b: slab red-black GS smoother smoke test (opt-in).
+	// Runs N sweeps on a sin-product source from u=0 and verifies monotonic
+	// residual reduction. Default off.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_gs", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const int n_sweeps = cf.getValueSafe<int>("setup", "test_zoom_slab_gs_sweeps", 8);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_gs_single_cluster(halo_w, n_sweeps);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b GS smoke test FAILED");
+	        throw std::runtime_error("zoom_slab GS smoke test failed");
+	    }
+	}
+
+	// Phase G.2b: slab 8-cell restriction smoke test (opt-in).
+	// Scatter fine cluster, restrict to coarse, gather, compare bit-identical
+	// against a serial reference. Default off.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_restrict", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_restrict_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b restrict smoke test FAILED");
+	        throw std::runtime_error("zoom_slab restrict smoke test failed");
+	    }
+	}
+
+	// Phase G.2b prolong (8-cell injection) primitive smoke test.
+	// Scatter coarse cluster, prolong to fine, gather, compare bit-identical
+	// against a serial reference. Default off.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_prolong", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_prolong_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b prolong smoke test FAILED");
+	        throw std::runtime_error("zoom_slab prolong smoke test failed");
+	    }
+	}
+
+	// Phase G.2b prolong_add (+= injection) primitive smoke test.
+	// Mirrors mg_straight::prolong_add used by the production poisson solver
+	// (V-cycle uncoarsening: coarse correction added to fine guess).
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_prolong_add", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_prolong_add_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b prolong_add smoke test FAILED");
+	        throw std::runtime_error("zoom_slab prolong_add smoke test failed");
+	    }
+	}
+
+	// Phase G.2b production-wire step 1: gs_z_neg smoke test.
+	// Verifies bit-identical match against (a) single-rank slab reference and
+	// (b) an inlined production-formula serial loop. This is the foundation
+	// for wiring gs_z_neg into twoGrid_multibox's GS sites (mg_solver.hh:554,
+	// :689) in step 2.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_gs_neg", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const int n_sweeps = cf.getValueSafe<int>("setup", "test_zoom_slab_gs_sweeps", 4);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_gs_neg_single_cluster(halo_w, n_sweeps);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b gs_neg smoke test FAILED");
+	        throw std::runtime_error("zoom_slab gs_neg smoke test failed");
+	    }
+	}
+	// Phase G.2b production-wire step 2: end-to-end gs_z_neg_meshvarbnd smoke.
+	// Verifies the MeshvarBnd<T> ↔ ZoomSlabLayout pack/unpack bridge against an
+	// inlined production GaussSeidel formula at np=1/2/4/8. Foundation for
+	// wiring the slab smoother into twoGrid_multibox's per-box GS sites
+	// (mg_solver.hh:554-555 pre-smooth, :689-690 post-smooth) in step 3.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_gs_neg_meshvarbnd", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const int n_sweeps = cf.getValueSafe<int>("setup", "test_zoom_slab_gs_sweeps", 4);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_gs_neg_meshvarbnd_single_cluster(halo_w, n_sweeps);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b gs_neg_meshvarbnd smoke test FAILED");
+	        throw std::runtime_error("zoom_slab gs_neg_meshvarbnd smoke test failed");
+	    }
+	}
+
+	// Phase G.2b B.5.0: standalone apply_z_slab kernel smoke test.
+	// Verifies the 7-point Laplacian apply on z-slab against an inlined
+	// serial reference at np=1/2/4/8. Bit-identical contract (max|err|==0)
+	// because the kernel has no reduction. Foundation for B.5.1 wiring into
+	// twoGrid_multibox_spmd's apply+restrict path.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_apply", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_apply_z_slab_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b B.5.0 apply smoke test FAILED");
+	        throw std::runtime_error("zoom_slab apply smoke test failed");
+	    }
+	}
+
+	// Phase G.2b B.5.2: restrict-from-slab bridge smoke test.
+	// Compares restrict_meshvarbnd_from_slab against restrict_meshvarbnd at
+	// np=1/2/4/8. Bit-identical contract (max|err|==0). Validates the new
+	// bridge's pack/halo-pad/gather plumbing for the B.5.4 keep-in-slab wire.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_restrict_from_slab", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_restrict_meshvarbnd_from_slab_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b B.5.2 restrict-from-slab smoke test FAILED");
+	        throw std::runtime_error("zoom_slab restrict-from-slab smoke test failed");
+	    }
+	}
+
+	// Phase G.2b B.5.2-prod: fused apply_to_slab + restrict_from_slab smoke
+	// test. Compares the fused path against apply_meshvarbnd + restrict_meshvarbnd
+	// at np=2/4/8. Bit-identical contract (max|err|==0). Validates the new
+	// Alltoallv redistribute helper that strips the cluster-A BC perimeter
+	// and reshuffles z-ownership from Layout A (apply) to Layout B (restrict).
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_apply_to_slab_fused", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_apply_meshvarbnd_to_slab_fused_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b B.5.2-prod apply-to-slab fused smoke test FAILED");
+	        throw std::runtime_error("zoom_slab apply-to-slab fused smoke test failed");
+	    }
+	}
+
+	// Phase G.2b B.5.3a: prolong_bnd_z_slab standalone smoke test. Foundation
+	// kernel for interp_coarse_fine_z_slab (mg_cubic::prolong_bnd port). Runs
+	// the slab kernel at np ranks vs single-rank reference (same kernel,
+	// sub_comm = MPI_COMM_SELF) and expects max|err| == 0.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_prolong_bnd", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_prolong_bnd_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b B.5.3a prolong_bnd smoke test FAILED");
+	        throw std::runtime_error("zoom_slab prolong_bnd smoke test failed");
+	    }
+	}
+
+	// Phase G.2b B.5.3b: interp_cf_flux_z_slab composite smoke test.
+	// Tests (prolong_bnd + halo_exchange_z + interp_cf_flux) on slab vs
+	// single-rank reference of the same composite. Expects max|err| == 0.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_interp_cf_flux", false) )
+	{
+	    const int halo_w = cf.getValueSafe<int>("setup", "test_zoom_slab_halo", 1);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_interp_cf_flux_single_cluster(halo_w);
+	    if( !ok ) {
+	        LOGERR("Phase G.2b B.5.3b interp_cf_flux smoke test FAILED");
+	        throw std::runtime_error("zoom_slab interp_cf_flux smoke test failed");
+	    }
+	}
 #endif
 	
 	//------------------------------------------------------------------------------
@@ -1115,8 +1372,13 @@ int main (int argc, const char * argv[])
 	//bdefd &= !kspace;
 	
 	poisson_plugin_creator *the_poisson_plugin_creator = get_poisson_plugin_map()[ poisson_solver_name ];
-	// Only root runs the (still-serial) Poisson solver; workers leave it NULL.
-	poisson_plugin *the_poisson_solver = MUSIC::mpi::is_root() ? the_poisson_plugin_creator->create( cf ) : NULL;
+	// Phase G.2b B.2b.2.2.0: construct the plugin on every rank. The wpd
+	// wrapper still gates solve() to rank 0 (`if(is_root()) c();`), so
+	// workers hold a live plugin but never invoke it. This is a zero-risk
+	// scaffolding step: B.2b.2.2.1 will swap wpd→wpd_spmd at the multibox
+	// solve call site and have workers also call solve() to participate in
+	// the SPMD V-cycle (B.2b.2.1 twoGrid_multibox_spmd path).
+	poisson_plugin *the_poisson_solver = the_poisson_plugin_creator->create( cf );
 	
 	//---------------------------------------------------------------------------------
 	//... THIS IS THE MAIN DRIVER BRANCHING TREE RUNNING THE VARIOUS PARTS OF THE CODE
@@ -1142,7 +1404,11 @@ int main (int argc, const char * argv[])
 			
 			
 			GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
-			if( MUSIC::mpi::is_root() ){ coarsen_density(rh_Poisson, f, bspectral_sampling); f.add_refinement_mask( rh_Poisson.get_coord_shift() ); normalize_density(f); }
+			// H.3b: coarsen_density is SPMD-safe; workers participate in fft_coarsen_dist
+			coarsen_density(rh_Poisson, f, bspectral_sampling);
+			// H.3c: normalize_density is SPMD-safe (SPMD when grid[levelmin] is slab, else rank-0-only)
+			if( MUSIC::mpi::is_root() ) f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+			normalize_density(f);
 
 			LOGUSER("Writing CDM data");
 			if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_mass(f);
@@ -1165,9 +1431,25 @@ int main (int argc, const char * argv[])
 					u_in_slab = true;
 					err = 0.0;
 				} else {
-					MUSIC::poisson::with_pbox_distributed([&]{
-						err = the_poisson_solver->solve(f, u);
-					}, f, u);
+					// B.2b.2.2.1.c: gated wpd → wpd_spmd swap. At np==1 wpd_spmd
+					// is structurally identical to wpd (gather/scatter no-op,
+					// is_root() always true), so bit-identical when the flag is
+					// on at np==1. B.2b.2.2.1.d: read the flag directly from cf
+					// here — the zoom_slab global is set deferred inside the
+					// plugin's solve(), which runs only on rank 0 under wpd, so
+					// every rank must read the same source-of-truth here to take
+					// the same branch.
+					const bool spmd_mg_here = cf.getValueSafe<bool>(
+						"setup", "zoom_slab_spmd_multigrid", false);
+					if( spmd_mg_here ){
+						MUSIC::poisson::with_pbox_distributed_spmd([&]{
+							err = the_poisson_solver->solve(f, u);
+						}, f, u);
+					} else {
+						MUSIC::poisson::with_pbox_distributed([&]{
+							err = the_poisson_solver->solve(f, u);
+						}, f, u);
+					}
 				}
 			}
 
@@ -1208,6 +1490,34 @@ int main (int argc, const char * argv[])
 					LOGUSER("Writing CDM potential");
 					if( MUSIC::mpi::is_root() ) the_output_plugin->write_dm_potential(u);
 				} else {
+					// H.1.3: SPMD slab poisson_hybrid wrapper. Replaces rank-0-only
+					// poisson_hybrid (~60 GB FFT scratch at pillars) with FFTW3-MPI
+					// slab. Periodic only; ungated falls through to serial below.
+					const bool use_slab_hybrid_DM = bdefd
+						&& (data_forIO.levelmin()==data_forIO.levelmax())
+						&& cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+						&& MUSIC::mpi::size() > 1;
+					if( use_slab_hybrid_DM ){
+						const size_t hng = (size_t)1 << data_forIO.levelmax();
+						for( int icoord = 0; icoord < 3; ++icoord ){
+							MUSIC::poisson::with_pbox_distributed([&]{
+								data_forIO.zero();
+								*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+							}, f, data_forIO);
+							MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+							                                      /*periodic=*/true, decic_DM,
+							                                      data_forIO.levelmax(), hng, hng, hng );
+							MUSIC::poisson::with_pbox_distributed([&]{
+								*data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+								the_poisson_solver->gradient_add(icoord, u, data_forIO );
+								double dispmax = compute_finest_max( data_forIO );
+								LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
+								coarsen_density( rh_Poisson, data_forIO, false );
+								LOGUSER("Writing CDM displacements");
+								the_output_plugin->write_dm_position(icoord, data_forIO );
+							}, u, data_forIO);
+						}
+					} else {
 					MUSIC::poisson::with_pbox_distributed([&]{
 						for( int icoord = 0; icoord < 3; ++icoord )
 						{
@@ -1231,6 +1541,7 @@ int main (int argc, const char * argv[])
 							the_output_plugin->write_dm_position(icoord, data_forIO );
 						}
 					}, u, data_forIO);
+					}
 				}
 			}
 			if( do_baryons )
@@ -1261,7 +1572,10 @@ int main (int argc, const char * argv[])
 
 				if( bsph )
 				{
-				    MUSIC::poisson::with_pbox_distributed([&]{
+				    // SPMD: give workers' u the per-box layout matching f before wpd.
+				    u = f; u.zero();
+				    // D.6: SPMD-safe lambda (u=f, u.zero, solve) → flag-gated dispatch.
+				    MUSIC::poisson::with_pbox_distributed_maybe_spmd(cf, [&]{
 				        u = f;	u.zero();
 				        err = the_poisson_solver->solve(f, u);
 				    }, f, u);
@@ -1269,6 +1583,29 @@ int main (int argc, const char * argv[])
 				        f.deallocate();  // SPMD
 				    {
 				        grid_hierarchy data_forIO(u);
+				        const bool use_slab_hybrid_bsph = bdefd
+				            && (data_forIO.levelmin()==data_forIO.levelmax())
+				            && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+				            && MUSIC::mpi::size() > 1;
+				        if( use_slab_hybrid_bsph ){
+				            const size_t hng = (size_t)1 << data_forIO.levelmax();
+				            for( int icoord = 0; icoord < 3; ++icoord ){
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    data_forIO.zero();
+				                    *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                }, f, data_forIO);
+				                MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+				                                                      /*periodic=*/true, decic_baryons,
+				                                                      data_forIO.levelmax(), hng, hng, hng );
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                    the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				                    coarsen_density( rh_Poisson, data_forIO, false );
+				                    LOGUSER("Writing baryon displacements");
+				                    the_output_plugin->write_gas_position(icoord, data_forIO );
+				                }, u, data_forIO);
+				            }
+				        } else {
 				        MUSIC::poisson::with_pbox_distributed([&]{
 				            for( int icoord = 0; icoord < 3; ++icoord )
 				            {
@@ -1290,6 +1627,7 @@ int main (int argc, const char * argv[])
 				                the_output_plugin->write_gas_position(icoord, data_forIO );
 				            }
 				        }, u, data_forIO);
+				        }
 				    }
 				    u.deallocate();  // SPMD
 				    if( bdefd )
@@ -1297,6 +1635,8 @@ int main (int argc, const char * argv[])
 				}
 				else if( do_LLA )
 				{
+				    // SPMD: give workers' u the per-box layout matching f before wpd.
+				    u = f; u.zero();
 				    MUSIC::poisson::with_pbox_distributed([&]{
 				        u = f;	u.zero();
 				        err = the_poisson_solver->solve(f, u);
@@ -1318,6 +1658,9 @@ int main (int argc, const char * argv[])
 			//------------------------------------------------------------------------------
 			//... velocities
 			//------------------------------------------------------------------------------
+			const bool use_slab_vel = kspace && (lbase==lmax)
+			    && cf.getValueSafe<bool>("setup", "slab_solve_unigrid", false)
+			    && MUSIC::mpi::size() > 1;
 			if( (!the_transfer_function_plugin->tf_has_velocities() || !do_baryons) && !bsph )
 			{
 				std::cout << "=============================================================\n";
@@ -1325,9 +1668,6 @@ int main (int argc, const char * argv[])
 				std::cout << "-------------------------------------------------------------\n";
 				LOGUSER("Computing velocitites...");
 
-				const bool use_slab_vel = kspace && (lbase==lmax)
-				    && cf.getValueSafe<bool>("setup", "slab_solve_unigrid", false)
-				    && MUSIC::mpi::size() > 1;
 				const bool need_regen = do_baryons || the_transfer_function_plugin->tf_has_velocities();
 
 				if( use_slab_vel ){
@@ -1335,10 +1675,12 @@ int main (int argc, const char * argv[])
 				    if( need_regen ){
 				        LOGUSER("Generating velocity perturbations...");
 				        GenerateDensityHierarchy( cf, the_transfer_function_plugin, vtotal , rh_TF, rand, f, false, false );
+				        // H.3b: coarsen_density is SPMD-safe
+				        coarsen_density(rh_Poisson, f, bspectral_sampling);
+				        // H.3c: normalize_density is SPMD-safe
+				        if( MUSIC::mpi::is_root() ) f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				        normalize_density(f);
 				        if( MUSIC::mpi::is_root() ){
-				            coarsen_density(rh_Poisson, f, bspectral_sampling);
-				            f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-				            normalize_density(f);
 				            u = f;
 				            u.zero();
 				        }
@@ -1375,6 +1717,8 @@ int main (int argc, const char * argv[])
 				    if( need_regen ){
 				        LOGUSER("Generating velocity perturbations...");
 				        GenerateDensityHierarchy( cf, the_transfer_function_plugin, vtotal , rh_TF, rand, f, false, false );
+				        // SPMD: give workers' u the per-box layout matching f before wpd.
+				        u = f; u.zero();
 				        MUSIC::poisson::with_pbox_distributed([&]{
 				            coarsen_density(rh_Poisson, f, bspectral_sampling);
 				            f.add_refinement_mask( rh_Poisson.get_coord_shift() );
@@ -1388,6 +1732,36 @@ int main (int argc, const char * argv[])
 				    }
 				    {
 				        grid_hierarchy data_forIO(u);
+				        const bool use_slab_hybrid_v3 = bdefd
+				            && (data_forIO.levelmin()==data_forIO.levelmax())
+				            && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+				            && MUSIC::mpi::size() > 1;
+				        if( use_slab_hybrid_v3 ){
+				            const size_t hng = (size_t)1 << data_forIO.levelmax();
+				            for( int icoord = 0; icoord < 3; ++icoord ){
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    data_forIO.zero();
+				                    *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                }, f, data_forIO);
+				                MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+				                                                      /*periodic=*/true, decic_baryons,
+				                                                      data_forIO.levelmax(), hng, hng, hng );
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                    the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				                    data_forIO *= cosmo.vfact;
+				                    double sigv = compute_finest_sigma( data_forIO );
+				                    LOGINFO("sigma of %c-velocity of high-res particles is %f",'x'+icoord, sigv);
+				                    coarsen_density( rh_Poisson, data_forIO, false );
+				                    LOGUSER("Writing CDM velocities");
+				                    the_output_plugin->write_dm_velocity(icoord, data_forIO);
+				                    if( do_baryons ){
+				                        LOGUSER("Writing baryon velocities");
+				                        the_output_plugin->write_gas_velocity(icoord, data_forIO);
+				                    }
+				                }, u, data_forIO);
+				            }
+				        } else {
 				        MUSIC::poisson::with_pbox_distributed([&]{
 				            for( int icoord = 0; icoord < 3; ++icoord )
 				            {
@@ -1421,6 +1795,7 @@ int main (int argc, const char * argv[])
 				                }
 				            }
 				        }, u, data_forIO);
+				        }
 				    }
 				}
 				u.deallocate();  // SPMD
@@ -1433,48 +1808,108 @@ int main (int argc, const char * argv[])
 				std::cout << "   COMPUTING DARK MATTER VELOCITIES\n";
 				std::cout << "-------------------------------------------------------------\n";
 				LOGUSER("Computing dark matter velocitites...");
-				
+
 				//... we do baryons and have velocity transfer functions, or we do SPH and not to shift
 				//... do DM first
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vcdm , rh_TF, rand, f, false, false );
-				MUSIC::poisson::with_pbox_distributed([&]{
+
+				if( use_slab_vel ){
+				    // E.2.6: slab path for DM separate VELOCITIES.
+				    // H.3b: coarsen_density is SPMD-safe
 				    coarsen_density(rh_Poisson, f, bspectral_sampling);
-				    f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				    // H.3c: normalize_density is SPMD-safe
+				    if( MUSIC::mpi::is_root() ) f.add_refinement_mask( rh_Poisson.get_coord_shift() );
 				    normalize_density(f);
-				    u = f;	u.zero();
-				    err = the_poisson_solver->solve(f, u);
-				}, f, u);
-				if(!bdefd)
-				    f.deallocate();  // SPMD
-				{
+				    if( MUSIC::mpi::is_root() ){
+				        u = f;
+				        u.zero();
+				    }
 				    grid_hierarchy data_forIO(u);
-				    MUSIC::poisson::with_pbox_distributed([&]{
-				        for( int icoord = 0; icoord < 3; ++icoord )
-				        {
-				            //... displacement
-				            if(bdefd)
-				            {
-				                data_forIO.zero();
-				                *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-				                poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-				                           data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
-				                *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-				                the_poisson_solver->gradient_add(icoord, u, data_forIO );
-				            }
-				            else
-				                the_poisson_solver->gradient(icoord, u, data_forIO );
-
-				            //... multiply to get velocity
+				    const size_t ng = (size_t)1 << lmax;
+				    MUSIC::poisson::slab_solve_unigrid_keep_u_slab( f, u, lmax, ng, ng, ng );
+				    if(!bdefd) f.deallocate();
+				    for( int icoord = 0; icoord < 3; ++icoord ){
+				        MUSIC::poisson::slab_gradient_unigrid_existing_u( icoord, u, data_forIO,
+				                                                         lmax, ng, ng, ng, decic_DM );
+				        if( MUSIC::mpi::is_root() ){
 				            data_forIO *= cosmo.vfact;
-
 				            double sigv = compute_finest_sigma( data_forIO );
 				            LOGINFO("sigma of %c-velocity of high-res DM is %f",'x'+icoord, sigv);
-
 				            coarsen_density( rh_Poisson, data_forIO, false );
 				            LOGUSER("Writing CDM velocities");
 				            the_output_plugin->write_dm_velocity(icoord, data_forIO);
 				        }
-				    }, u, data_forIO);
+				    }
+				    MUSIC::poisson::slab_restore_u_full( u, lmax, ng, ng, ng );
+				} else {
+				    // SPMD: give workers' u the per-box layout matching f before wpd.
+				    u = f; u.zero();
+				    MUSIC::poisson::with_pbox_distributed([&]{
+				        coarsen_density(rh_Poisson, f, bspectral_sampling);
+				        f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				        normalize_density(f);
+				        u = f;	u.zero();
+				        err = the_poisson_solver->solve(f, u);
+				    }, f, u);
+				    if(!bdefd)
+				        f.deallocate();  // SPMD
+				    {
+				        grid_hierarchy data_forIO(u);
+				        const bool use_slab_hybrid_v4 = bdefd
+				            && (data_forIO.levelmin()==data_forIO.levelmax())
+				            && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+				            && MUSIC::mpi::size() > 1;
+				        if( use_slab_hybrid_v4 ){
+				            const size_t hng = (size_t)1 << data_forIO.levelmax();
+				            for( int icoord = 0; icoord < 3; ++icoord ){
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    data_forIO.zero();
+				                    *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                }, f, data_forIO);
+				                MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+				                                                      /*periodic=*/true, decic_DM,
+				                                                      data_forIO.levelmax(), hng, hng, hng );
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                    the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				                    data_forIO *= cosmo.vfact;
+				                    double sigv = compute_finest_sigma( data_forIO );
+				                    LOGINFO("sigma of %c-velocity of high-res DM is %f",'x'+icoord, sigv);
+				                    coarsen_density( rh_Poisson, data_forIO, false );
+				                    LOGUSER("Writing CDM velocities");
+				                    the_output_plugin->write_dm_velocity(icoord, data_forIO);
+				                }, u, data_forIO);
+				            }
+				        } else {
+				        MUSIC::poisson::with_pbox_distributed([&]{
+				            for( int icoord = 0; icoord < 3; ++icoord )
+				            {
+				                //... displacement
+				                if(bdefd)
+				                {
+				                    data_forIO.zero();
+				                    *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                    poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+				                               data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
+				                    *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                    the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				                }
+				                else
+				                    the_poisson_solver->gradient(icoord, u, data_forIO );
+
+				                //... multiply to get velocity
+				                data_forIO *= cosmo.vfact;
+
+				                double sigv = compute_finest_sigma( data_forIO );
+				                LOGINFO("sigma of %c-velocity of high-res DM is %f",'x'+icoord, sigv);
+
+				                coarsen_density( rh_Poisson, data_forIO, false );
+				                LOGUSER("Writing CDM velocities");
+				                the_output_plugin->write_dm_velocity(icoord, data_forIO);
+				            }
+				        }, u, data_forIO);
+				        }
+				    }
 				}
 				u.deallocate();  // SPMD
 				f.deallocate();  // SPMD (idempotent w.r.t. earlier conditional)
@@ -1486,44 +1921,104 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon velocitites...");
 				//... do baryons
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vbaryon , rh_TF, rand, f, false, bbshift );
-				MUSIC::poisson::with_pbox_distributed([&]{
+
+				if( use_slab_vel ){
+				    // E.2.6: slab path for baryon separate VELOCITIES.
+				    // H.3b: coarsen_density is SPMD-safe
 				    coarsen_density(rh_Poisson, f, bspectral_sampling);
-				    f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				    // H.3c: normalize_density is SPMD-safe
+				    if( MUSIC::mpi::is_root() ) f.add_refinement_mask( rh_Poisson.get_coord_shift() );
 				    normalize_density(f);
-				    u = f;	u.zero();
-				    err = the_poisson_solver->solve(f, u);
-				}, f, u);
-				if(!bdefd)
-				    f.deallocate();  // SPMD
-				{
+				    if( MUSIC::mpi::is_root() ){
+				        u = f;
+				        u.zero();
+				    }
 				    grid_hierarchy data_forIO(u);
-				    MUSIC::poisson::with_pbox_distributed([&]{
-				        for( int icoord = 0; icoord < 3; ++icoord )
-				        {
-				            //... displacement
-				            if(bdefd)
-				            {
-				                data_forIO.zero();
-				                *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-				                poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-				                           data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
-				                *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
-				                the_poisson_solver->gradient_add(icoord, u, data_forIO );
-				            }
-				            else
-				                the_poisson_solver->gradient(icoord, u, data_forIO );
-
-				            //... multiply to get velocity
+				    const size_t ng = (size_t)1 << lmax;
+				    MUSIC::poisson::slab_solve_unigrid_keep_u_slab( f, u, lmax, ng, ng, ng );
+				    if(!bdefd) f.deallocate();
+				    for( int icoord = 0; icoord < 3; ++icoord ){
+				        MUSIC::poisson::slab_gradient_unigrid_existing_u( icoord, u, data_forIO,
+				                                                         lmax, ng, ng, ng, decic_baryons );
+				        if( MUSIC::mpi::is_root() ){
 				            data_forIO *= cosmo.vfact;
-
 				            double sigv = compute_finest_sigma( data_forIO );
 				            LOGINFO("sigma of %c-velocity of high-res baryons is %f",'x'+icoord, sigv);
-
 				            coarsen_density( rh_Poisson, data_forIO, false );
 				            LOGUSER("Writing baryon velocities");
 				            the_output_plugin->write_gas_velocity(icoord, data_forIO);
 				        }
-				    }, u, data_forIO);
+				    }
+				    MUSIC::poisson::slab_restore_u_full( u, lmax, ng, ng, ng );
+				} else {
+				    // SPMD: give workers' u the per-box layout matching f before wpd.
+				    u = f; u.zero();
+				    MUSIC::poisson::with_pbox_distributed([&]{
+				        coarsen_density(rh_Poisson, f, bspectral_sampling);
+				        f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+				        normalize_density(f);
+				        u = f;	u.zero();
+				        err = the_poisson_solver->solve(f, u);
+				    }, f, u);
+				    if(!bdefd)
+				        f.deallocate();  // SPMD
+				    {
+				        grid_hierarchy data_forIO(u);
+				        const bool use_slab_hybrid_v5 = bdefd
+				            && (data_forIO.levelmin()==data_forIO.levelmax())
+				            && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+				            && MUSIC::mpi::size() > 1;
+				        if( use_slab_hybrid_v5 ){
+				            const size_t hng = (size_t)1 << data_forIO.levelmax();
+				            for( int icoord = 0; icoord < 3; ++icoord ){
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    data_forIO.zero();
+				                    *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                }, f, data_forIO);
+				                MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+				                                                      /*periodic=*/true, decic_baryons,
+				                                                      data_forIO.levelmax(), hng, hng, hng );
+				                MUSIC::poisson::with_pbox_distributed([&]{
+				                    *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                    the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				                    data_forIO *= cosmo.vfact;
+				                    double sigv = compute_finest_sigma( data_forIO );
+				                    LOGINFO("sigma of %c-velocity of high-res baryons is %f",'x'+icoord, sigv);
+				                    coarsen_density( rh_Poisson, data_forIO, false );
+				                    LOGUSER("Writing baryon velocities");
+				                    the_output_plugin->write_gas_velocity(icoord, data_forIO);
+				                }, u, data_forIO);
+				            }
+				        } else {
+				        MUSIC::poisson::with_pbox_distributed([&]{
+				            for( int icoord = 0; icoord < 3; ++icoord )
+				            {
+				                //... displacement
+				                if(bdefd)
+				                {
+				                    data_forIO.zero();
+				                    *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				                    poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+				                               data_forIO.levelmin()==data_forIO.levelmax(), decic_baryons );
+				                    *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+				                    the_poisson_solver->gradient_add(icoord, u, data_forIO );
+				                }
+				                else
+				                    the_poisson_solver->gradient(icoord, u, data_forIO );
+
+				                //... multiply to get velocity
+				                data_forIO *= cosmo.vfact;
+
+				                double sigv = compute_finest_sigma( data_forIO );
+				                LOGINFO("sigma of %c-velocity of high-res baryons is %f",'x'+icoord, sigv);
+
+				                coarsen_density( rh_Poisson, data_forIO, false );
+				                LOGUSER("Writing baryon velocities");
+				                the_output_plugin->write_gas_velocity(icoord, data_forIO);
+				            }
+				        }, u, data_forIO);
+				        }
+				    }
 				}
 				u.deallocate();  // SPMD
 				f.deallocate();  // SPMD
@@ -1558,96 +2053,180 @@ int main (int argc, const char * argv[])
 
 			
 			GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
-			{ MUSIC::poisson::phase_scope _ps;
+			// Task #88: rank-0 density post-processing reads the union mesh on
+			// rank 0 (populated by GDH's sync_per_box_from_union). Per-box meshes
+			// must be gathered to root before solve, so wrap each solve below in
+			// with_pbox_distributed. Workers participate in worker_pump only.
+			// H.3b: coarsen_density is SPMD-safe (workers participate in fft_coarsen_dist).
+			coarsen_density(rh_Poisson, f, bspectral_sampling);
+			// H.3c: normalize_density is SPMD-safe
+			if( MUSIC::mpi::is_root() ) f.add_refinement_mask( rh_Poisson.get_coord_shift() );
+			normalize_density(f);
 			if( MUSIC::mpi::is_root() )
 			{
-			coarsen_density(rh_Poisson, f, bspectral_sampling);
-			f.add_refinement_mask( rh_Poisson.get_coord_shift() );
-            normalize_density(f);
+				if( dm_only )
+				{
+					the_output_plugin->write_dm_density(f);
+					the_output_plugin->write_dm_mass(f);
+				}
+			} // end rank-0 density post-processing
 
-			if( dm_only )
-			{
-				the_output_plugin->write_dm_density(f);
-				the_output_plugin->write_dm_mass(f);
-			}
-
+			// SPMD: workers' u1 must have per-box layout matching f before the
+			// gather pass inside with_pbox_distributed. (Workers may have only
+			// nbnd-init u1; the copy from f propagates per-box owned slots.)
 			u1 = f;	u1.zero();
 
-			//... compute 1LPT term
-			err = the_poisson_solver->solve(f, u1);
+			//... compute 1LPT term — multibox: gather/scatter per-box around the
+			// rank-0 composite V-cycle.
+			// D.6: SPMD-safe lambda (bare solve(f,u1)) → flag-gated dispatch.
+			MUSIC::poisson::with_pbox_distributed_maybe_spmd(cf, [&]{
+				err = the_poisson_solver->solve(f, u1);
+			}, f, u1);
 
+			// D.7 2LPT-block refactor: split the original single-wpd block into
+			// 3 phases so the 2LPT Poisson solve can dispatch SPMD MG under
+			// setup.zoom_slab_spmd_multigrid=yes. The original block kept the
+			// solve trapped inside classic wpd (rank-0 lambda) → with the D.6
+			// dispatcher gate (mg_solver.hh:552, AND-s spmd_mg_is_active()),
+			// SPMD MG cannot fire from classic wpd; the 2LPT solve fell back
+			// to rank-0 composite MG. Splitting around the solve lets Part 2
+			// run under wpd_spmd (flag-on) without bleeding into the unsafe
+			// output ops in Part 3.
+			//
+			// Part 1: classic wpd — compute_2LPT_source(_FFT) (rank-0 internals).
+			//   f2LPT is captured so the exit scatter propagates the rank-0
+			//   computed source to workers' per-box hierarchies (required for
+			//   Part 2 SPMD solve).
+			// Part 2: maybe_spmd — 2LPT Poisson solve. Flag-on routes to
+			//   wpd_spmd (no gather/scatter, SPMD MG fires); flag-off keeps
+			//   classic wpd, bit-identical to pre-refactor.
+			// Part 3: classic wpd — hybrid + addition + gradient + output
+			//   writes (coarsen_density, write_dm_velocity — unsafe union ops).
+			//   All 4 hierarchies captured: rank 0 needs gathered f, u1, f2LPT,
+			//   u2LPT to run the lambda body (under flag-on, Part 2's wpd_spmd
+			//   left each rank holding only its own per-box u2LPT/f2LPT).
+			//
+			// SPMD seed f2LPT = u1 before Part 1. Matches the shape that
+			// compute_2LPT_source sets internally (`fnew = u; fnew.zero();` at
+			// cosmology.cc:636) so workers' f2LPT layout aligns with rank-0's.
 
-			//... compute 2LPT term
-			if(bdefd)
-				f2LPT=f;
-			else
+			f2LPT = u1;        // SPMD: gives workers per-box f2LPT layout
+
+			// === D.7 Part 1: compute_2LPT_source (rank-0 internals) ===
+			MUSIC::poisson::with_pbox_distributed([&]{
+				LOGINFO("Computing 2LPT term....");
+				if( !kspace2LPT )
+					compute_2LPT_source(cf, u1, f2LPT, grad_order );
+				else{
+					LOGUSER("computing term using FFT");
+					compute_2LPT_source_FFT(cf, u1, f2LPT);
+				}
+			}, f, u1, f2LPT);
+
+			// In !bdefd path, f is no longer read by Part 3 (every remaining
+			// branch guards on bdefd). Drop it SPMD-symmetrically so worker
+			// state stays aligned. Original code dropped f inside the lambda
+			// (rank-0 only) — moving to SPMD here matches Task #88's rule.
+			if( !bdefd )
 				f.deallocate();
 
-			LOGINFO("Computing 2LPT term....");
-			if( !kspace2LPT )
-				compute_2LPT_source(u1, f2LPT, grad_order );
-			else{
-				LOGUSER("computing term using FFT");
-				compute_2LPT_source_FFT(cf, u1, f2LPT);
-			}
+			// === D.7 Part 2: 2LPT Poisson solve (SPMD-eligible) ===
+			LOGINFO("Solving 2LPT Poisson equation");
+			u2LPT = u1; u2LPT.zero();   // SPMD seed for per-box layout
+			MUSIC::poisson::with_pbox_distributed_maybe_spmd(cf, [&]{
+				err = the_poisson_solver->solve(f2LPT, u2LPT);
+			}, f2LPT, u2LPT);
 
-            LOGINFO("Solving 2LPT Poisson equation");
-			u2LPT = u1; u2LPT.zero();
-			err = the_poisson_solver->solve(f2LPT, u2LPT);
+			// === D.7 Part 3a: arithmetic (f += f2LPT, u1 += u2LPT) — rank-0 ===
+			MUSIC::poisson::with_pbox_distributed([&]{
+				if( bdefd )
+				{
+					f2LPT*=6.0/7.0/vfac2lpt;
+					f+=f2LPT;
 
+					if( !dm_only )
+						f2LPT.deallocate();
+				}
 
-			//... if doing the hybrid step, we need a combined source term
-			if( bdefd )
+				u2LPT *= 6.0/7.0/vfac2lpt;
+				u1 += u2LPT;
+			}, f, u1, f2LPT, u2LPT);
+
+			// === D.7 Part 3b: per-icoord — slab path (H.1.5b site 6) or original ===
 			{
-				f2LPT*=6.0/7.0/vfac2lpt;
-				f+=f2LPT;
-
-				if( !dm_only )
-					f2LPT.deallocate();
-			}
-
-			//... add the 2LPT contribution
-			u2LPT *= 6.0/7.0/vfac2lpt;
-			u1 += u2LPT;
-
-
 			grid_hierarchy data_forIO(u1);
-			for( int icoord = 0; icoord < 3; ++icoord )
-			{
-				if(bdefd)
+			const bool use_slab_hybrid_2lpt_v = bdefd
+			    && (data_forIO.levelmin()==data_forIO.levelmax())
+			    && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+			    && MUSIC::mpi::size() > 1;
+			if( use_slab_hybrid_2lpt_v ){
+			    const size_t hng = (size_t)1 << data_forIO.levelmax();
+			    for( int icoord = 0; icoord < 3; ++icoord ){
+			        MUSIC::poisson::with_pbox_distributed([&]{
+			            data_forIO.zero();
+			            *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+			        }, f, data_forIO);
+			        MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+			                                              /*periodic=*/true, decic_DM,
+			                                              data_forIO.levelmax(), hng, hng, hng );
+			        MUSIC::poisson::with_pbox_distributed([&]{
+			            *data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
+			            the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+			            data_forIO *= cosmo.vfact;
+			            double sigv = compute_finest_sigma( data_forIO );
+			            std::cerr << " - velocity component " << icoord << " : sigma = " << sigv << std::endl;
+			            coarsen_density( rh_Poisson, data_forIO, false );
+			            LOGUSER("Writing CDM velocities");
+			            the_output_plugin->write_dm_velocity(icoord, data_forIO);
+			            if( do_baryons && !the_transfer_function_plugin->tf_has_velocities() && !bsph) {
+			                LOGUSER("Writing baryon velocities");
+			                the_output_plugin->write_gas_velocity(icoord, data_forIO);
+			            }
+			        }, u1, data_forIO);
+			    }
+			    data_forIO.deallocate();
+			} else {
+			MUSIC::poisson::with_pbox_distributed([&]{
+				for( int icoord = 0; icoord < 3; ++icoord )
 				{
-					data_forIO.zero();
-					*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-					poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
-						       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
-					*data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
-					the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+					if(bdefd)
+					{
+						data_forIO.zero();
+						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
+							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
+						*data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
+						the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+					}
+					else
+						the_poisson_solver->gradient(icoord, u1, data_forIO );
+
+					data_forIO *= cosmo.vfact;
+
+					double sigv = compute_finest_sigma( data_forIO );
+					std::cerr << " - velocity component " << icoord << " : sigma = " << sigv << std::endl;
+
+					coarsen_density( rh_Poisson, data_forIO, false );
+					LOGUSER("Writing CDM velocities");
+					the_output_plugin->write_dm_velocity(icoord, data_forIO);
+
+					if( do_baryons && !the_transfer_function_plugin->tf_has_velocities() && !bsph)
+					{
+						LOGUSER("Writing baryon velocities");
+						the_output_plugin->write_gas_velocity(icoord, data_forIO);
+					}
 				}
-				else
-					the_poisson_solver->gradient(icoord, u1, data_forIO );
-
-				data_forIO *= cosmo.vfact;
-
-				double sigv = compute_finest_sigma( data_forIO );
-				std::cerr << " - velocity component " << icoord << " : sigma = " << sigv << std::endl;
-
-				coarsen_density( rh_Poisson, data_forIO, false );
-				LOGUSER("Writing CDM velocities");
-				the_output_plugin->write_dm_velocity(icoord, data_forIO);
-
-				if( do_baryons && !the_transfer_function_plugin->tf_has_velocities() && !bsph)
-				{
-					LOGUSER("Writing baryon velocities");
-					the_output_plugin->write_gas_velocity(icoord, data_forIO);
-				}
+				data_forIO.deallocate();
+			}, f, u1); // end Part 3b wpd — 2LPT vcdm/total post-density (fallback)
 			}
-			data_forIO.deallocate();
+			}
+			// Task #88: u1.deallocate must be SPMD so wpd's scatter doesn't try
+			// to send from a rank-0-empty hierarchy. Workers also need to drop
+			// their per-box meshes here for symmetry.
 			if( !dm_only )
 				u1.deallocate();
-			} // end is_root() — 2LPT vcdm/total post-density
-			}
-			
-			
+
+
 			if( do_baryons && (the_transfer_function_plugin->tf_has_velocities() || bsph) )
 			{
 				std::cout << "=============================================================\n";
@@ -1656,9 +2235,14 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon displacements...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, vbaryon , rh_TF, rand, f, false, bbshift );
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
-				{
+				// Task #88: per-box gather/scatter so composite MG and gradient
+				// dereferences hit all clusters on rank 0. u1/f2LPT seeded SPMD
+				// before gather so workers have valid per-box shapes to scatter
+				// back after the rank-0 body runs.
+				u1 = f; u1.zero();  // SPMD seed for gather
+				if(bdefd) { f2LPT = f; f2LPT.zero(); }
+				// H.1.5b site 7a: pre-loop (solves + 2LPT source + arithmetic)
+				MUSIC::poisson::with_pbox_distributed([&]{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
@@ -1678,7 +2262,7 @@ int main (int argc, const char * argv[])
 				u2LPT = f; u2LPT.zero();
 
 				if( !kspace2LPT )
-					compute_2LPT_source(u1, f2LPT, grad_order );
+					compute_2LPT_source(cf, u1, f2LPT, grad_order );
 				else
 					compute_2LPT_source_FFT(cf, u1, f2LPT);
 
@@ -1698,8 +2282,39 @@ int main (int argc, const char * argv[])
 				u2LPT *= 6.0/7.0/vfac2lpt;
 				u1 += u2LPT;
 				u2LPT.deallocate();
+				}, f, u1);
 
+				// H.1.5b site 7b: per-icoord — slab path or original
+				{
 				grid_hierarchy data_forIO(u1);
+				const bool use_slab_hybrid_2lpt_vb = bdefd
+				    && (data_forIO.levelmin()==data_forIO.levelmax())
+				    && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+				    && MUSIC::mpi::size() > 1;
+				if( use_slab_hybrid_2lpt_vb ){
+				    const size_t hng = (size_t)1 << data_forIO.levelmax();
+				    for( int icoord = 0; icoord < 3; ++icoord ){
+				        MUSIC::poisson::with_pbox_distributed([&]{
+				            data_forIO.zero();
+				            *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				        }, f, data_forIO);
+				        MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+				                                              /*periodic=*/true, decic_baryons,
+				                                              data_forIO.levelmax(), hng, hng, hng );
+				        MUSIC::poisson::with_pbox_distributed([&]{
+				            *data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
+				            the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+				            data_forIO *= cosmo.vfact;
+				            double sigv = compute_finest_sigma( data_forIO );
+				            std::cerr << " - velocity component " << icoord << " : sigma = " << sigv << std::endl;
+				            coarsen_density( rh_Poisson, data_forIO, false );
+				            LOGUSER("Writing baryon velocities");
+				            the_output_plugin->write_gas_velocity(icoord, data_forIO);
+				        }, u1, data_forIO);
+				    }
+				    data_forIO.deallocate();
+				} else {
+				MUSIC::poisson::with_pbox_distributed([&]{
 				for( int icoord = 0; icoord < 3; ++icoord )
 				{
 					if(bdefd)
@@ -1724,9 +2339,10 @@ int main (int argc, const char * argv[])
 					the_output_plugin->write_gas_velocity(icoord, data_forIO);
 				}
 				data_forIO.deallocate();
-				u1.deallocate();
-				} // end is_root() — 2LPT vbaryon post-density
+				}, f, u1); // end wpd — 2LPT vbaryon post-density (fallback)
 				}
+				}
+				u1.deallocate();  // SPMD
 			}
 			
 			
@@ -1745,9 +2361,12 @@ int main (int argc, const char * argv[])
 					my_tf_type = total;
 
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, my_tf_type , rh_TF, rand, f, false, false );
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
-				{
+				// Task #88: per-box gather/scatter — composite MG needs all
+				// per-box meshes on rank 0. u1 seeded SPMD; f2LPT seeded only
+				// if bdefd (matches inner branch which keeps it scratched).
+				u1 = f; u1.zero();
+				if(bdefd) { f2LPT = f; f2LPT.zero(); }
+				MUSIC::poisson::with_pbox_distributed([&]{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
@@ -1767,7 +2386,7 @@ int main (int argc, const char * argv[])
 				u2LPT = f; u2LPT.zero();
 
 				if( !kspace2LPT )
-					compute_2LPT_source(u1, f2LPT, grad_order );
+					compute_2LPT_source(cf, u1, f2LPT, grad_order );
 				else
 					compute_2LPT_source_FFT(cf, u1, f2LPT);
 
@@ -1783,8 +2402,7 @@ int main (int argc, const char * argv[])
 				u2LPT *= 3.0/7.0;
 				u1 += u2LPT;
 				u2LPT.deallocate();
-				} // end is_root() — 2LPT !dm_only DM displacements
-				}
+				}, f, u1); // end wpd — 2LPT !dm_only DM displacements
 			}else if( MUSIC::mpi::is_root() ){
 				//... reuse prior data
 				/*f-=f2LPT;
@@ -1804,11 +2422,40 @@ int main (int argc, const char * argv[])
 				}
 			}
 
-			{ MUSIC::poisson::phase_scope _ps;
-			if( MUSIC::mpi::is_root() )
+			// Task #88: gradient_add/gradient/poisson_hybrid all read per-box
+			// meshes on rank 0. After the 2LPT wpd scatter, rank 0 only has
+			// its own boxes; re-gather f, u1 so every cluster is dereferenceable.
+			// u1.deallocate() is moved outside the wpd lambda so workers stay
+			// in sync (avoid scattering rank-0-empty state back to owners).
 			{
 			grid_hierarchy data_forIO(u1);
-
+			const bool use_slab_hybrid_2lpt_dm = bdefd
+			    && (data_forIO.levelmin()==data_forIO.levelmax())
+			    && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+			    && MUSIC::mpi::size() > 1;
+			if( use_slab_hybrid_2lpt_dm ){
+			    const size_t hng = (size_t)1 << data_forIO.levelmax();
+			    for( int icoord = 0; icoord < 3; ++icoord ){
+			        MUSIC::poisson::with_pbox_distributed([&]{
+			            data_forIO.zero();
+			            *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+			        }, f, data_forIO);
+			        MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+			                                              /*periodic=*/true, decic_DM,
+			                                              data_forIO.levelmax(), hng, hng, hng );
+			        MUSIC::poisson::with_pbox_distributed([&]{
+			            *data_forIO.get_grid(data_forIO.levelmax()) /= 1<<f.levelmax();
+			            the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+			            double dispmax = compute_finest_max( data_forIO );
+			            LOGINFO("max. %c-displacement of HR particles is %f [mean dx]",'x'+icoord, dispmax*(double)(1ll<<data_forIO.levelmax()));
+			            coarsen_density( rh_Poisson, data_forIO, false );
+			            LOGUSER("Writing CDM displacements");
+			            the_output_plugin->write_dm_position(icoord, data_forIO );
+			        }, u1, data_forIO);
+			    }
+			    data_forIO.deallocate();
+			} else {
+			MUSIC::poisson::with_pbox_distributed([&]{
 			for( int icoord = 0; icoord < 3; ++icoord )
 			{
 				//... displacement
@@ -1833,9 +2480,10 @@ int main (int argc, const char * argv[])
 			}
 
 			data_forIO.deallocate();
-			u1.deallocate();
-			} // end is_root() — 2LPT DM displacements post-density
+			}, f, u1); // end with_pbox_distributed — 2LPT DM displacements
 			}
+			}
+			u1.deallocate();  // SPMD: workers also drop u1 post-scatter
 			
 
 			if( do_baryons && !bsph )
@@ -1846,9 +2494,11 @@ int main (int argc, const char * argv[])
 				LOGUSER("Computing baryon density...");
 				
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, true, false );
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
-				{
+				// Task #88: wrap rank-0 baryon-density LLA solve with wpd(f).
+				// u1/u2LPT/f2LPT are scratch hierarchies allocated rank-0 only
+				// from f inside the lambda (operator= clones f's per-box meshes
+				// which are all present after the gather).
+				MUSIC::poisson::with_pbox_distributed([&]{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
@@ -1866,7 +2516,7 @@ int main (int argc, const char * argv[])
 					u2LPT = f; u2LPT.zero();
 
 					if( !kspace2LPT )
-						compute_2LPT_source(u1, f2LPT, grad_order );
+						compute_2LPT_source(cf, u1, f2LPT, grad_order );
 					else
 						compute_2LPT_source_FFT(cf, u1, f2LPT);
 
@@ -1881,8 +2531,7 @@ int main (int argc, const char * argv[])
 					LOGUSER("Writing baryon density");
 					the_output_plugin->write_gas_density(f);
 				}
-				} // end is_root() — 2LPT gas density (!bsph)
-				}
+				}, f); // end wpd — 2LPT gas density (!bsph)
 			}
 			else if( do_baryons && bsph )
 			{
@@ -1890,18 +2539,18 @@ int main (int argc, const char * argv[])
 				std::cout << "   COMPUTING BARYON DISPLACEMENTS\n";
 				std::cout << "-------------------------------------------------------------\n";
 				LOGUSER("Computing baryon displacements...");
-				
+
 				GenerateDensityHierarchy(	cf, the_transfer_function_plugin, baryon , rh_TF, rand, f, false, bbshift );
-				{ MUSIC::poisson::phase_scope _ps;
-				if( MUSIC::mpi::is_root() )
-				{
+				u1 = f; u1.zero();
+				if(bdefd) { f2LPT = f; f2LPT.zero(); }
+				// H.1.5b site 9a: pre-loop (solves + 2LPT source + arithmetic)
+				MUSIC::poisson::with_pbox_distributed([&]{
 				coarsen_density(rh_Poisson, f, bspectral_sampling);
 				f.add_refinement_mask( rh_Poisson.get_coord_shift() );
                 normalize_density(f);
 
 				LOGUSER("Writing baryon density");
 				the_output_plugin->write_gas_density(f);
-				u1 = f;	u1.zero();
 
 				if(bdefd)
 					f2LPT=f;
@@ -1913,7 +2562,7 @@ int main (int argc, const char * argv[])
 				u2LPT = f; u2LPT.zero();
 
 				if( !kspace2LPT )
-					compute_2LPT_source(u1, f2LPT, grad_order );
+					compute_2LPT_source(cf, u1, f2LPT, grad_order );
 				else
 					compute_2LPT_source_FFT(cf, u1, f2LPT);
 
@@ -1929,9 +2578,36 @@ int main (int argc, const char * argv[])
 				u2LPT *= 3.0/7.0;
 				u1 += u2LPT;
 				u2LPT.deallocate();
+				}, f, u1);
 
+				// H.1.5b site 9b: per-icoord — slab path or original
+				{
 				grid_hierarchy data_forIO(u1);
-
+				const bool use_slab_hybrid_2lpt_db = bdefd
+				    && (data_forIO.levelmin()==data_forIO.levelmax())
+				    && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
+				    && MUSIC::mpi::size() > 1;
+				if( use_slab_hybrid_2lpt_db ){
+				    const size_t hng = (size_t)1 << data_forIO.levelmax();
+				    for( int icoord = 0; icoord < 3; ++icoord ){
+				        MUSIC::poisson::with_pbox_distributed([&]{
+				            data_forIO.zero();
+				            *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+				        }, f, data_forIO);
+				        MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
+				                                              /*periodic=*/true, decic_baryons,
+				                                              data_forIO.levelmax(), hng, hng, hng );
+				        MUSIC::poisson::with_pbox_distributed([&]{
+				            *data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
+				            the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+				            coarsen_density( rh_Poisson, data_forIO, false );
+				            LOGUSER("Writing baryon displacements");
+				            the_output_plugin->write_gas_position(icoord, data_forIO );
+				        }, u1, data_forIO);
+				    }
+				    data_forIO.deallocate();
+				} else {
+				MUSIC::poisson::with_pbox_distributed([&]{
 				for( int icoord = 0; icoord < 3; ++icoord )
 				{
 					//... displacement
@@ -1951,8 +2627,11 @@ int main (int argc, const char * argv[])
 					LOGUSER("Writing baryon displacements");
 					the_output_plugin->write_gas_position(icoord, data_forIO );
 				}
-				} // end is_root() — 2LPT gas displacements (bsph)
+				data_forIO.deallocate();
+				}, f, u1); // end wpd — 2LPT gas displacements (bsph) (fallback)
 				}
+				}
+				u1.deallocate();
 			}
 
 		}

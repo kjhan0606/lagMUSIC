@@ -18,6 +18,10 @@
 #include <vector>
 #include <cstring>
 #include <climits>
+#include <cerrno>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
 
 #if defined(FFTW3) && defined(SINGLE_PRECISION)
 //#define fftw_complex fftwf_complex
@@ -572,6 +576,19 @@ void perform_dist_slab(kernel *pk, Meshvar<real_t> *slab, real_t *root_data,
 	const size_t nz_padded   = 2*(gnz/2+1);
 	const size_t plane       = gny * nz_padded;
 
+	// H.4: bcast rank-0's "do we want a gather?" decision. When rank 0 passes
+	// root_data=NULL the result stays distributed (per-rank slabs); skip the
+	// final Gatherv entirely so we never materialize a gnx*gny*nz_padded buffer
+	// on rank 0.
+	int gather_wanted = (rk==0) ? (root_data ? 1 : 0) : 0;
+	MPI_Bcast(&gather_wanted, 1, MPI_INT, 0, MUSIC::mpi::world());
+
+	convolution::perform_mpi<real_t>(pk, slab, shift, fix, flip);
+
+	if( !gather_wanted ){
+		return;
+	}
+
 	// Same int-count fix as perform_dist: gather x-slices using a derived
 	// datatype so counts/displs stay in the small (gnx-sized) range.
 	if( plane > (size_t)INT_MAX ){
@@ -589,8 +606,6 @@ void perform_dist_slab(kernel *pk, Meshvar<real_t> *slab, real_t *root_data,
 	MPI_Allgather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MUSIC::mpi::world());
 	displs[0] = 0;
 	for( int i=1; i<sz; ++i ) displs[i] = displs[i-1] + counts[i-1];
-
-	convolution::perform_mpi<real_t>(pk, slab, shift, fix, flip);
 
 	MPI_Gatherv( slab->m_pdata, my_count, dtype_plane,
 	             (rk==0) ? root_data : NULL, counts.data(), displs.data(), dtype_plane,
@@ -701,21 +716,39 @@ class kernel_real_cached : public kernel
 protected:
 	std::vector<real_t> kdata_;
 	void precompute_kernel(transfer_function *ptf, tf_type type, const refinement_hierarchy &refh);
+	void precompute_kernel_slab(transfer_function *ptf, tf_type type, const refinement_hierarchy &refh);
 
 public:
 	kernel_real_cached(config_file &cf, transfer_function *ptf, refinement_hierarchy &refh, tf_type type)
 		: kernel(cf, ptf, refh, type)
 	{
-		// SPMD-light: only root precomputes & writes temp_kernel_*.tmp.
-		// Concurrent rank writes are byte-identical so the existing race is
-		// benign, but root-only saves CPU and removes the theoretical race.
-		// In the current code workers never read the cached kernel (they
-		// early-return in densities.cc before fetch_kernel), so kdata_ may
-		// safely stay empty on non-root ranks.
+		// H.2 SPMD path: when setup.precompute_kernel_slab=yes AND np>1,
+		// all ranks cooperate to sample, FFT-deconvolve and pwrite the
+		// finest-level kernel on an FFTW3-MPI x-slab.
+		//
+		// Unigrid only (levelmin==levelmax) at this point — multibox needs
+		// the 8-pt fine→coarse averaging step which would require a halo
+		// exchange of the deconvolved fine slab; deferred to H.2b.
+		// Default-off: root-only legacy path preserved bit-identical.
+		const bool want_slab = cf.getValueSafe<bool>("setup", "precompute_kernel_slab", false);
+		const bool unigrid_kernel = (refh.levelmin() == refh.levelmax());
+#ifdef USE_MPI
+		if (want_slab && MUSIC::mpi::size() > 1 && unigrid_kernel)
+		{
+			precompute_kernel_slab(ptf, type, refh);
+		}
+		else
+		{
+			if (want_slab && MUSIC::mpi::is_root() && !unigrid_kernel)
+				LOGINFO("H.2 slab path requested but levelmin != levelmax; falling back to rank-0 precompute (H.2b deferred).");
+			if (MUSIC::mpi::is_root())
+				precompute_kernel(ptf, type, refh);
+		}
+		MPI_Barrier(MUSIC::mpi::world());
+#else
+		(void)want_slab;
 		if (MUSIC::mpi::is_root())
 			precompute_kernel(ptf, type, refh);
-#ifdef USE_MPI
-		MPI_Barrier(MUSIC::mpi::world());
 #endif
 	}
 
@@ -1635,6 +1668,530 @@ void kernel_real_cached<real_t>::precompute_kernel(transfer_function *ptf, tf_ty
 
 	//... clean up
 	delete[] rkernel;
+}
+
+// H.2 — SPMD slab-distributed finest-level kernel precompute.
+// All ranks participate; each rank samples its FFTW3-MPI x-slab, runs
+// a distributed r2c+c2r deconvolution and pwrites its slab to the
+// temp_kernel_levelNNN.tmp cache file (rank 0 first writes the 3-unsigned
+// header and pre-extends the file via ftruncate). Coarse levels are
+// re-sampled rank-0-only (the OLD_KERNEL_SAMPLING 8-pt averaging path
+// needs the fine kernel, which is no longer rank-0 resident here, so
+// we use direct tfr->compute_real for coarse — same as the
+// !OLD_KERNEL_SAMPLING branch already does for coarse levels).
+template <typename real_t>
+void kernel_real_cached<real_t>::precompute_kernel_slab(transfer_function *ptf, tf_type type, const refinement_hierarchy &refh)
+{
+#ifdef USE_MPI
+	int nx, ny, nz;
+	real_t dx, lx, ly, lz;
+
+	real_t
+		boxlength = pcf_->getValue<double>("setup", "boxlength"),
+		boxlength2 = 0.5 * boxlength;
+
+	int
+		levelmax = refh.levelmax(),
+		levelmin = refh.levelmin();
+
+	LOGUSER("Precomputing transfer function kernels (slab path)...");
+
+	nx = refh.size(refh.levelmax(), 0);
+	ny = refh.size(refh.levelmax(), 1);
+	nz = refh.size(refh.levelmax(), 2);
+
+	if (levelmax != levelmin)
+	{
+		nx *= 2;
+		ny *= 2;
+		nz *= 2;
+	}
+
+	dx = boxlength / (1 << refh.levelmax());
+	lx = dx * nx;
+	ly = dx * ny;
+	lz = dx * nz;
+
+	real_t
+		kny = M_PI / dx,
+		fac = lx * ly * lz / pow(2.0 * M_PI, 3) / ((double)nx * (double)ny * (double)nz),
+		nspec = pcf_->getValue<double>("cosmology", "nspec"),
+		pnorm = pcf_->getValue<double>("cosmology", "pnorm");
+
+	bool
+		bperiodic = pcf_->getValueSafe<bool>("setup", "periodic_TF", true),
+		deconv    = pcf_->getValueSafe<bool>("setup", "deconvolve", true);
+	bool bsmooth_baryons = false;
+	bool kspacepoisson = ((pcf_->getValueSafe<bool>("poisson", "fft_fine", true) |
+						   pcf_->getValueSafe<bool>("poisson", "kspace", false)));
+
+	if (MUSIC::mpi::is_root())
+		std::cout << "   - Computing transfer function kernel (slab path; np=" << MUSIC::mpi::size() << ")...\n";
+
+	TransferFunction_real *tfr = new TransferFunction_real(boxlength, 1 << levelmax, type, ptf, nspec, pnorm,
+														   0.25 * dx, 2.0 * boxlength, kny, (int)pow(2, levelmax + 2));
+
+	// FFTW3-MPI x-slab layout for the finest grid (r2c in-place padded inner dim).
+	MUSIC::dist::slab_layout slab = MUSIC::dist::compute_slab_layout(
+		(size_t)nx, (size_t)ny, (size_t)nz, /*fftw_inplace_pad=*/true);
+
+	const size_t nz_padded  = 2 * ((size_t)nz / 2 + 1);
+	const size_t nz_complex = (size_t)nz / 2 + 1;
+
+	fftw_real *rkernel = new fftw_real[slab.alloc_real_count];
+	std::memset(rkernel, 0, slab.alloc_real_count * sizeof(fftw_real));
+
+	LOGUSER("Sampling fine kernel slab (level %d, local_nx=%zu @ x=%zu)...",
+	        levelmax, slab.local_nx, slab.local_x_start);
+
+#ifdef OLD_KERNEL_SAMPLING
+	const int ref_fac_slab = (deconv && kspacepoisson) ? 2 : 0;
+	const int ql_slab = -ref_fac_slab / 2 + 1, qr_slab = ql_slab + ref_fac_slab;
+	const double rf8_slab = pow((double)ref_fac_slab, 3);
+	const double dx05_slab = 0.5 * dx, dx025_slab = 0.25 * dx;
+#endif
+
+	// Sampling: each rank loops its full x-slab. We mirror within-slab
+	// (j, k) octants only — the i↔(nx-i) mirror crosses ranks, so we
+	// instead sample every i in the local slab directly.
+	if (bperiodic)
+	{
+#pragma omp parallel for
+		for (size_t ix_local = 0; ix_local < slab.local_nx; ++ix_local)
+		{
+			int i = (int)(slab.local_x_start + ix_local);
+			for (int j = 0; j <= ny / 2; ++j)
+				for (int k = 0; k <= nz / 2; ++k)
+				{
+					int iix(i), iiy(j), iiz(k);
+					real_t rr[3];
+
+					if (iix > nx / 2)
+						iix -= nx;
+					if (iiy > ny / 2)
+						iiy -= ny;
+					if (iiz > nz / 2)
+						iiz -= nz;
+
+					// 4-way (j, k) mirror within the local slab.
+					size_t idx[4];
+					idx[0] = (ix_local * (size_t)ny + (size_t)j)        * nz_padded + (size_t)k;
+					idx[1] = (ix_local * (size_t)ny + (size_t)(ny - j)) * nz_padded + (size_t)k;
+					idx[2] = (ix_local * (size_t)ny + (size_t)j)        * nz_padded + (size_t)(nz - k);
+					idx[3] = (ix_local * (size_t)ny + (size_t)(ny - j)) * nz_padded + (size_t)(nz - k);
+
+					if (j == 0 || j == ny / 2) idx[1] = idx[3] = (size_t)-1;
+					if (k == 0 || k == nz / 2) idx[2] = idx[3] = (size_t)-1;
+
+					double val = 0.0;
+					for (int ii = -1; ii <= 1; ++ii)
+						for (int jj = -1; jj <= 1; ++jj)
+							for (int kk = -1; kk <= 1; ++kk)
+							{
+								rr[0] = ((double)iix) * dx + ii * boxlength;
+								rr[1] = ((double)iiy) * dx + jj * boxlength;
+								rr[2] = ((double)iiz) * dx + kk * boxlength;
+								if (rr[0] > -boxlength && rr[0] <= boxlength &&
+								    rr[1] > -boxlength && rr[1] <= boxlength &&
+								    rr[2] > -boxlength && rr[2] <= boxlength)
+								{
+#ifdef OLD_KERNEL_SAMPLING
+									if (ref_fac_slab > 0)
+									{
+										double rrr[3], rrr2[3];
+										for (int iii = ql_slab; iii < qr_slab; ++iii)
+										{
+											rrr[0] = rr[0] + (double)iii * dx05_slab - dx025_slab;
+											rrr2[0] = rrr[0] * rrr[0];
+											for (int jjj = ql_slab; jjj < qr_slab; ++jjj)
+											{
+												rrr[1] = rr[1] + (double)jjj * dx05_slab - dx025_slab;
+												rrr2[1] = rrr[1] * rrr[1];
+												for (int kkk = ql_slab; kkk < qr_slab; ++kkk)
+												{
+													rrr[2] = rr[2] + (double)kkk * dx05_slab - dx025_slab;
+													rrr2[2] = rrr[2] * rrr[2];
+													val += tfr->compute_real(rrr2[0] + rrr2[1] + rrr2[2]) / rf8_slab;
+												}
+											}
+										}
+									}
+									else
+									{
+										val += tfr->compute_real(rr[0]*rr[0] + rr[1]*rr[1] + rr[2]*rr[2]);
+									}
+#else
+									val += eval_split_recurse(tfr, rr, dx) / (dx * dx * dx);
+#endif
+								}
+							}
+
+					val *= fac;
+					for (int q = 0; q < 4; ++q)
+						if (idx[q] != (size_t)-1)
+							rkernel[idx[q]] = val;
+				}
+		}
+	}
+	else
+	{
+		// Non-periodic: sample every cell in the local slab directly.
+#pragma omp parallel for
+		for (size_t ix_local = 0; ix_local < slab.local_nx; ++ix_local)
+		{
+			int i = (int)(slab.local_x_start + ix_local);
+			for (int j = 0; j < ny; ++j)
+				for (int k = 0; k < nz; ++k)
+				{
+					int iix(i), iiy(j), iiz(k);
+					real_t rr[3];
+
+					if (iix > nx / 2) iix -= nx;
+					if (iiy > ny / 2) iiy -= ny;
+					if (iiz > nz / 2) iiz -= nz;
+
+					rr[0] = (double)iix * dx;
+					rr[1] = (double)iiy * dx;
+					rr[2] = (double)iiz * dx;
+
+					size_t idx = (ix_local * (size_t)ny + (size_t)j) * nz_padded + (size_t)k;
+					double val = 0.0;
+#ifdef OLD_KERNEL_SAMPLING
+					val = tfr->compute_real(rr[0]*rr[0] + rr[1]*rr[1] + rr[2]*rr[2]);
+#else
+					if (i == 0 && j == 0 && k == 0)
+						continue;
+					val = eval_split_recurse(tfr, rr, dx) / (dx * dx * dx);
+#endif
+					val *= fac;
+					rkernel[idx] = val;
+				}
+		}
+	}
+
+	// Pin the (0,0,0) cell on the rank that owns x=0.
+	if (slab.local_x_start == 0 && slab.local_nx > 0)
+	{
+#ifdef OLD_KERNEL_SAMPLING
+		rkernel[0] = tfr->compute_real(0.0) * fac;
+#else
+		real_t xmid[3] = {0.0, 0.0, 0.0};
+		rkernel[0] = fac * eval_split_recurse(tfr, xmid, dx) / (dx * dx * dx);
+#endif
+	}
+
+	// Deconvolution: distributed r2c, per-slab k-space loop, distributed c2r.
+	if (deconv)
+	{
+		LOGUSER("Deconvolving fine kernel (slab path)...");
+		if (MUSIC::mpi::is_root())
+			std::cout << " - Deconvolving density kernel (slab path)...\n";
+
+		const double fftnorm = 1.0 / ((size_t)nx * (size_t)ny * (size_t)nz);
+
+		// k0 lives on the rank owning x=0 (and is rkernel[0]).
+		double k0_local = 0.0;
+		if (slab.local_x_start == 0 && slab.local_nx > 0)
+			k0_local = (double)rkernel[0];
+		double k0 = 0.0;
+		MPI_Allreduce(&k0_local, &k0, 1, MPI_DOUBLE, MPI_SUM, MUSIC::mpi::world());
+
+		// Subtract white-noise component prior to forward FFT.
+		if (!bsmooth_baryons && slab.local_x_start == 0 && slab.local_nx > 0)
+			rkernel[0] = 0.0;
+
+		MUSIC::fft::fft_plan_t plan = MUSIC::fft::plan_r2c_3d_mpi(
+			(ptrdiff_t)nx, (ptrdiff_t)ny, (ptrdiff_t)nz, rkernel);
+		MUSIC::fft::execute(plan);
+		MUSIC::fft::destroy(plan);
+
+		MUSIC::fft::fft_cplx_t *kkernel = reinterpret_cast<MUSIC::fft::fft_cplx_t *>(rkernel);
+
+		double ksum_local = 0.0;
+		unsigned long long kcount_local = 0;
+		const double kmax = 0.5 * M_PI / std::max(nx, std::max(ny, nz));
+
+#pragma omp parallel for reduction(+ : ksum_local, kcount_local)
+		for (size_t ix_local = 0; ix_local < slab.local_nx; ++ix_local)
+		{
+			int i = (int)(slab.local_x_start + ix_local);
+			for (int j = 0; j < ny; ++j)
+				for (int k = 0; k < (int)nz_complex; ++k)
+				{
+					double kx = (double)i, ky = (double)j, kz = (double)k;
+					if (kx > nx / 2) kx -= nx;
+					if (ky > ny / 2) ky -= ny;
+
+					double kkmax = kmax;
+					size_t q = (ix_local * (size_t)ny + (size_t)j) * nz_complex + (size_t)k;
+
+					if (!bsmooth_baryons)
+					{
+						if (kspacepoisson)
+						{
+							double ipix = cos(kx * kkmax) * cos(ky * kkmax) * cos(kz * kkmax);
+							RE(kkernel[q]) /= ipix;
+							IM(kkernel[q]) /= ipix;
+						}
+						else
+						{
+							kkmax = kmax;
+							double ipix = 1.0;
+							if (i > 0) ipix /= sin(kx * 2.0 * kkmax) / (kx * 2.0 * kkmax);
+							if (j > 0) ipix /= sin(ky * 2.0 * kkmax) / (ky * 2.0 * kkmax);
+							if (k > 0) ipix /= sin(kz * 2.0 * kkmax) / (kz * 2.0 * kkmax);
+							RE(kkernel[q]) *= ipix;
+							IM(kkernel[q]) *= ipix;
+						}
+					}
+					else
+					{
+						double ipix = 1.0;
+						if (i > 0) ipix /= sin(kx * 2.0 * kkmax) / (kx * 2.0 * kkmax);
+						if (j > 0) ipix /= sin(ky * 2.0 * kkmax) / (ky * 2.0 * kkmax);
+						if (k > 0) ipix /= sin(kz * 2.0 * kkmax) / (kz * 2.0 * kkmax);
+						RE(kkernel[q]) /= ipix;
+						IM(kkernel[q]) /= ipix;
+					}
+
+					if (k == 0 || k == nz / 2)
+					{
+						ksum_local += RE(kkernel[q]);
+						kcount_local++;
+					}
+					else
+					{
+						ksum_local += 2.0 * RE(kkernel[q]);
+						kcount_local += 2;
+					}
+				}
+		}
+
+		double ksum = 0.0;
+		unsigned long long kcount = 0;
+		MPI_Allreduce(&ksum_local, &ksum, 1, MPI_DOUBLE, MPI_SUM, MUSIC::mpi::world());
+		MPI_Allreduce(&kcount_local, &kcount, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MUSIC::mpi::world());
+
+		double dk = k0 - ksum / (double)kcount;
+		if (bsmooth_baryons) dk = 0.0;
+
+#pragma omp parallel for
+		for (size_t ix_local = 0; ix_local < slab.local_nx; ++ix_local)
+		{
+			for (int j = 0; j < ny; ++j)
+				for (int k = 0; k < (int)nz_complex; ++k)
+				{
+					size_t q = (ix_local * (size_t)ny + (size_t)j) * nz_complex + (size_t)k;
+					RE(kkernel[q]) += dk;
+					RE(kkernel[q]) *= fftnorm;
+					IM(kkernel[q]) *= fftnorm;
+				}
+		}
+
+		MUSIC::fft::fft_plan_t iplan = MUSIC::fft::plan_c2r_3d_mpi(
+			(ptrdiff_t)nx, (ptrdiff_t)ny, (ptrdiff_t)nz, rkernel);
+		MUSIC::fft::execute(iplan);
+		MUSIC::fft::destroy(iplan);
+	}
+
+	// Write the cached kernel: rank 0 writes the 3-unsigned header and
+	// ftruncate-extends to total bytes; all ranks then pwrite their slab.
+	char cachefname[128];
+	sprintf(cachefname, "temp_kernel_level%03d.tmp", levelmax);
+	LOGUSER("Storing fine kernel in temp file '%s' (slab pwrite).", cachefname);
+
+	const size_t header_bytes = 3 * sizeof(unsigned);
+	const size_t row_reals    = (size_t)ny * nz_padded;
+
+	if (MUSIC::mpi::is_root())
+	{
+		int fd_init = ::open(cachefname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd_init < 0)
+		{
+			LOGERR("precompute_kernel_slab: cannot create '%s': %s", cachefname, std::strerror(errno));
+			throw std::runtime_error("precompute_kernel_slab: cache file create failed");
+		}
+		const unsigned hdr[3] = { (unsigned)nx, (unsigned)ny, (unsigned)nz_padded };
+		ssize_t hw = ::write(fd_init, hdr, sizeof(hdr));
+		if (hw != (ssize_t)sizeof(hdr))
+		{
+			::close(fd_init);
+			LOGERR("precompute_kernel_slab: header write short on '%s'", cachefname);
+			throw std::runtime_error("precompute_kernel_slab: header write failed");
+		}
+		const off_t total_bytes = (off_t)header_bytes + (off_t)nx * (off_t)row_reals * (off_t)sizeof(fftw_real);
+		if (::ftruncate(fd_init, total_bytes) != 0)
+		{
+			::close(fd_init);
+			LOGERR("precompute_kernel_slab: ftruncate failed on '%s': %s", cachefname, std::strerror(errno));
+			throw std::runtime_error("precompute_kernel_slab: ftruncate failed");
+		}
+		::close(fd_init);
+	}
+	MPI_Barrier(MUSIC::mpi::world());
+
+	if (slab.local_nx > 0)
+	{
+		int fd = ::open(cachefname, O_WRONLY, 0644);
+		if (fd < 0)
+		{
+			LOGERR("precompute_kernel_slab: rank %d cannot open '%s': %s",
+			       MUSIC::mpi::rank(), cachefname, std::strerror(errno));
+			throw std::runtime_error("precompute_kernel_slab: rank open failed");
+		}
+		const off_t offset = (off_t)header_bytes + (off_t)slab.local_x_start * (off_t)row_reals * (off_t)sizeof(fftw_real);
+		// pwrite slab one x-row at a time to skip the FFTW r2c tail-padding
+		// columns when local_nx*row_reals would exceed alloc; but
+		// alloc_real_count >= local_nx*row_reals, so a single pwrite is safe.
+		const size_t nbytes = slab.local_nx * row_reals * sizeof(fftw_real);
+		ssize_t got = ::pwrite(fd, rkernel, nbytes, offset);
+		if (got < 0 || (size_t)got != nbytes)
+		{
+			::close(fd);
+			LOGERR("precompute_kernel_slab: rank %d short pwrite on '%s' (got %zd of %zu): %s",
+			       MUSIC::mpi::rank(), cachefname, got, nbytes, std::strerror(errno));
+			throw std::runtime_error("precompute_kernel_slab: short pwrite");
+		}
+		::close(fd);
+	}
+	MPI_Barrier(MUSIC::mpi::world());
+
+	delete[] rkernel;
+
+	// Coarse levels — rank-0-only resampling (no 8-pt averaging across slabs).
+	if (MUSIC::mpi::is_root())
+	{
+		for (int ilevel = levelmax - 1; ilevel >= levelmin; ilevel--)
+		{
+			LOGUSER("Computing coarse kernel (level %d) on rank 0 (slab path)...", ilevel);
+
+			int nxc, nyc, nzc;
+			real_t dxc, lxc, lyc, lzc;
+
+			nxc = refh.size(ilevel, 0);
+			nyc = refh.size(ilevel, 1);
+			nzc = refh.size(ilevel, 2);
+
+			if (ilevel != levelmin)
+			{
+				nxc *= 2;
+				nyc *= 2;
+				nzc *= 2;
+			}
+
+			dxc = boxlength / (1 << ilevel);
+			lxc = dxc * nxc; lyc = dxc * nyc; lzc = dxc * nzc;
+
+			fftw_real *rkernel_coarse = new fftw_real[(size_t)nxc * (size_t)nyc * 2 * ((size_t)nzc / 2 + 1)];
+			real_t fac_c = lxc * lyc * lzc / pow(2.0 * M_PI, 3) / ((double)nxc * (double)nyc * (double)nzc);
+
+			if (bperiodic)
+			{
+#pragma omp parallel for
+				for (int i = 0; i <= nxc / 2; ++i)
+					for (int j = 0; j <= nyc / 2; ++j)
+						for (int k = 0; k <= nzc / 2; ++k)
+						{
+							int iix(i), iiy(j), iiz(k);
+							real_t rr[3];
+							if (iix > nxc / 2) iix -= nxc;
+							if (iiy > nyc / 2) iiy -= nyc;
+							if (iiz > nzc / 2) iiz -= nzc;
+
+							size_t idx[8];
+							idx[0] = ((size_t)i  *nyc + (size_t)j      ) * 2 * (nzc/2+1) + (size_t)k;
+							idx[1] = ((size_t)(nxc-i)*nyc + (size_t)j  ) * 2 * (nzc/2+1) + (size_t)k;
+							idx[2] = ((size_t)i  *nyc + (size_t)(nyc-j)) * 2 * (nzc/2+1) + (size_t)k;
+							idx[3] = ((size_t)(nxc-i)*nyc + (size_t)(nyc-j)) * 2 * (nzc/2+1) + (size_t)k;
+							idx[4] = ((size_t)i  *nyc + (size_t)j      ) * 2 * (nzc/2+1) + (size_t)(nzc-k);
+							idx[5] = ((size_t)(nxc-i)*nyc + (size_t)j  ) * 2 * (nzc/2+1) + (size_t)(nzc-k);
+							idx[6] = ((size_t)i  *nyc + (size_t)(nyc-j)) * 2 * (nzc/2+1) + (size_t)(nzc-k);
+							idx[7] = ((size_t)(nxc-i)*nyc + (size_t)(nyc-j)) * 2 * (nzc/2+1) + (size_t)(nzc-k);
+
+							if (i == 0 || i == nxc/2) idx[1]=idx[3]=idx[5]=idx[7]=(size_t)-1;
+							if (j == 0 || j == nyc/2) idx[2]=idx[3]=idx[6]=idx[7]=(size_t)-1;
+							if (k == 0 || k == nzc/2) idx[4]=idx[5]=idx[6]=idx[7]=(size_t)-1;
+
+							double val = 0.0;
+							for (int ii = -1; ii <= 1; ++ii)
+								for (int jj = -1; jj <= 1; ++jj)
+									for (int kk = -1; kk <= 1; ++kk)
+									{
+										rr[0] = ((double)iix) * dxc + ii * boxlength;
+										rr[1] = ((double)iiy) * dxc + jj * boxlength;
+										rr[2] = ((double)iiz) * dxc + kk * boxlength;
+										if (rr[0] > -boxlength && rr[0] < boxlength &&
+										    rr[1] > -boxlength && rr[1] < boxlength &&
+										    rr[2] > -boxlength && rr[2] < boxlength)
+										{
+#ifdef OLD_KERNEL_SAMPLING
+											val += tfr->compute_real(rr[0]*rr[0] + rr[1]*rr[1] + rr[2]*rr[2]);
+#else
+											val += eval_split_recurse(tfr, rr, dxc) / (dxc*dxc*dxc);
+#endif
+										}
+									}
+							val *= fac_c;
+							for (int qq = 0; qq < 8; ++qq)
+								if (idx[qq] != (size_t)-1)
+									rkernel_coarse[idx[qq]] = val;
+						}
+			}
+			else
+			{
+#pragma omp parallel for
+				for (int i = 0; i < nxc; ++i)
+					for (int j = 0; j < nyc; ++j)
+						for (int k = 0; k < nzc; ++k)
+						{
+							int iix(i), iiy(j), iiz(k);
+							real_t rr[3];
+							if (iix > nxc/2) iix -= nxc;
+							if (iiy > nyc/2) iiy -= nyc;
+							if (iiz > nzc/2) iiz -= nzc;
+							size_t idx = ((size_t)i*nyc + (size_t)j) * 2 * (nzc/2+1) + (size_t)k;
+							rr[0] = (double)iix * dxc; rr[1] = (double)iiy * dxc; rr[2] = (double)iiz * dxc;
+#ifdef OLD_KERNEL_SAMPLING
+							rkernel_coarse[idx] = 0.0;
+							real_t rr2 = rr[0]*rr[0] + rr[1]*rr[1] + rr[2]*rr[2];
+							if (fabs(rr[0]) <= boxlength2 || fabs(rr[1]) <= boxlength2 || fabs(rr[2]) <= boxlength2)
+								rkernel_coarse[idx] += (fftw_real)tfr->compute_real(rr2) * fac_c;
+#else
+							rkernel_coarse[idx] = 0.0;
+							real_t val = eval_split_recurse(tfr, rr, dxc) / (dxc*dxc*dxc);
+							if (fabs(rr[0]) <= boxlength2 || fabs(rr[1]) <= boxlength2 || fabs(rr[2]) <= boxlength2)
+								rkernel_coarse[idx] += val * fac_c;
+#endif
+						}
+			}
+
+			// NOTE: OLD_KERNEL_SAMPLING 8-pt averaging from the fine kernel
+			// is skipped in slab mode (fine kernel is no longer rank-0
+			// resident). Coarse values come from direct tfr->compute_real,
+			// ULP-level different from the legacy path.
+
+			sprintf(cachefname, "temp_kernel_level%03d.tmp", ilevel);
+			LOGUSER("Storing coarse kernel in temp file '%s'.", cachefname);
+			FILE *fp = fopen(cachefname, "w+");
+			unsigned q = (unsigned)nxc; fwrite(&q, sizeof(unsigned), 1, fp);
+			q = (unsigned)nyc; fwrite(&q, sizeof(unsigned), 1, fp);
+			q = (unsigned)(2 * (nzc/2 + 1)); fwrite(&q, sizeof(unsigned), 1, fp);
+			for (int ix = 0; ix < nxc; ++ix)
+			{
+				size_t sz = (size_t)nyc * 2 * ((size_t)nzc/2 + 1);
+				fwrite(reinterpret_cast<void *>(&rkernel_coarse[(size_t)ix * sz]), sizeof(fftw_real), sz, fp);
+			}
+			fclose(fp);
+			delete[] rkernel_coarse;
+		}
+	}
+
+	MPI_Barrier(MUSIC::mpi::world());
+	delete tfr;
+#else
+	(void)ptf; (void)type; (void)refh;
+	throw std::runtime_error("precompute_kernel_slab requires USE_MPI");
+#endif
 }
 
 } // namespace convolution

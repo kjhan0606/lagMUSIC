@@ -42,10 +42,13 @@ struct slab_layout {
 	size_t padded_nz;        //!< inner dim including FFTW r2c padding (2*(nz/2+1)); equal to nz when fftw_inplace_pad=false
 };
 
-//! Query FFTW for the slab decomposition this rank should own.
-//! When USE_MPI is undefined, returns a single-rank "decomposition" (rank owns everything).
-inline slab_layout compute_slab_layout( size_t gnx, size_t gny, size_t gnz,
-                                        bool fftw_inplace_pad )
+//! Query FFTW for the slab decomposition that the calling rank should own
+//! within an explicit communicator. Sub_comm variant — used by G.3 per-cluster
+//! RNG builder where each cluster's FFT runs on its own sub-communicator.
+//! In serial builds (USE_MPI undefined) the comm argument is ignored.
+inline slab_layout compute_slab_layout_comm( MPI_Comm comm,
+                                             size_t gnx, size_t gny, size_t gnz,
+                                             bool fftw_inplace_pad )
 {
 	slab_layout s;
 	s.global_nx = gnx;
@@ -62,7 +65,7 @@ inline slab_layout compute_slab_layout( size_t gnx, size_t gny, size_t gnz,
 	alloc_local = fftw_mpi_local_size_3d(
 #endif
 		(ptrdiff_t)gnx, (ptrdiff_t)gny, (ptrdiff_t)(gnz/2+1),
-		MUSIC::mpi::world(), &local_n0, &local_0_start);
+		comm, &local_n0, &local_0_start);
 
 	s.local_nx       = (size_t)local_n0;
 	s.local_x_start  = (size_t)local_0_start;
@@ -71,6 +74,7 @@ inline slab_layout compute_slab_layout( size_t gnx, size_t gny, size_t gnz,
 	else
 		s.alloc_real_count = s.local_nx * s.global_ny * s.global_nz;
 #else
+	(void)comm;
 	s.local_nx        = gnx;
 	s.local_x_start   = 0;
 	s.alloc_real_count = s.local_nx * s.global_ny * s.padded_nz;
@@ -78,24 +82,33 @@ inline slab_layout compute_slab_layout( size_t gnx, size_t gny, size_t gnz,
 	return s;
 }
 
-//! Allocate a Meshvar<real_t> as a slab of a (gnx,gny,gnz) global grid.
-//! The caller owns the returned pointer.
-template<typename real_t>
-inline Meshvar<real_t>* make_slab_meshvar( size_t gnx, size_t gny, size_t gnz,
-                                           bool fftw_inplace_pad,
-                                           int offx=0, int offy=0, int offz=0 )
+//! Query FFTW for the slab decomposition this rank should own (world comm).
+//! When USE_MPI is undefined, returns a single-rank "decomposition" (rank owns everything).
+inline slab_layout compute_slab_layout( size_t gnx, size_t gny, size_t gnz,
+                                        bool fftw_inplace_pad )
 {
-	slab_layout s = compute_slab_layout(gnx, gny, gnz, fftw_inplace_pad);
+#ifdef USE_MPI
+	return compute_slab_layout_comm(MUSIC::mpi::world(), gnx, gny, gnz, fftw_inplace_pad);
+#else
+	return compute_slab_layout_comm((MPI_Comm)0, gnx, gny, gnz, fftw_inplace_pad);
+#endif
+}
+
+//! Allocate a Meshvar<real_t> as a slab on an explicit communicator.
+//! G.3 per-cluster RNG builder uses this with a per-cluster sub_comm.
+template<typename real_t>
+inline Meshvar<real_t>* make_slab_meshvar_comm( MPI_Comm comm,
+                                                size_t gnx, size_t gny, size_t gnz,
+                                                bool fftw_inplace_pad,
+                                                int offx=0, int offy=0, int offz=0 )
+{
+	slab_layout s = compute_slab_layout_comm(comm, gnx, gny, gnz, fftw_inplace_pad);
 	Meshvar<real_t>* m = new Meshvar<real_t>(
 		s.local_nx == 0 ? 1 : s.local_nx,
 		s.global_ny,
 		s.padded_nz,
 		offx, offy, offz);
 	m->mark_as_distributed(gnx, gny, gnz, s.local_x_start, s.local_nx);
-	// FFTW MPI may need MORE reals than the naive local_nx*gny*padded_nz product
-	// (it allocates extra workspace for the implicit all-to-all transpose when
-	// the grid does not divide evenly across ranks). When that's the case,
-	// reallocate to alloc_real_count so the FFT plan can run in-place safely.
 	const size_t naive_count = m->m_nx * m->m_ny * m->m_nz;
 	if( fftw_inplace_pad && s.alloc_real_count > naive_count ){
 		delete[] m->m_pdata;
@@ -105,6 +118,24 @@ inline Meshvar<real_t>* make_slab_meshvar( size_t gnx, size_t gny, size_t gnz,
 		std::memset(m->m_pdata, 0, naive_count * sizeof(real_t));
 	}
 	return m;
+}
+
+//! Allocate a Meshvar<real_t> as a slab of a (gnx,gny,gnz) global grid (world comm).
+//! The caller owns the returned pointer.
+template<typename real_t>
+inline Meshvar<real_t>* make_slab_meshvar( size_t gnx, size_t gny, size_t gnz,
+                                           bool fftw_inplace_pad,
+                                           int offx=0, int offy=0, int offz=0 )
+{
+#ifdef USE_MPI
+	return make_slab_meshvar_comm<real_t>(MUSIC::mpi::world(),
+	                                      gnx, gny, gnz, fftw_inplace_pad,
+	                                      offx, offy, offz);
+#else
+	return make_slab_meshvar_comm<real_t>((MPI_Comm)0,
+	                                      gnx, gny, gnz, fftw_inplace_pad,
+	                                      offx, offy, offz);
+#endif
 }
 
 //! Allocate a MeshvarBnd<real_t> as a slab of a (gnx,gny,gnz) global grid with

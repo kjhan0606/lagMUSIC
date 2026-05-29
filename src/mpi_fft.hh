@@ -54,30 +54,46 @@ inline fft_plan_t plan_c2r_3d_serial( int nx, int ny, int nz, fftw_real* data )
 }
 
 #ifdef USE_MPI
-//! In-place MPI r2c plan for an gnx*gny*gnz real grid (padded inner dim).
-inline fft_plan_t plan_r2c_3d_mpi( ptrdiff_t gnx, ptrdiff_t gny, ptrdiff_t gnz, fftw_real* data )
+//! In-place MPI r2c plan on an explicit communicator (default-comm uses world).
+inline fft_plan_t plan_r2c_3d_mpi_comm( MPI_Comm comm,
+                                        ptrdiff_t gnx, ptrdiff_t gny, ptrdiff_t gnz,
+                                        fftw_real* data )
 {
 	fft_cplx_t* cdata = reinterpret_cast<fft_cplx_t*>(data);
 #ifdef SINGLE_PRECISION
 	return fftwf_mpi_plan_dft_r2c_3d(gnx, gny, gnz, data, cdata,
-	                                 MUSIC::mpi::world(), FFTW_ESTIMATE);
+	                                 comm, FFTW_ESTIMATE);
 #else
 	return fftw_mpi_plan_dft_r2c_3d(gnx, gny, gnz, data, cdata,
-	                                MUSIC::mpi::world(), FFTW_ESTIMATE);
+	                                comm, FFTW_ESTIMATE);
 #endif
 }
 
-//! In-place MPI c2r plan for an gnx*gny*gnz real grid (padded inner dim).
-inline fft_plan_t plan_c2r_3d_mpi( ptrdiff_t gnx, ptrdiff_t gny, ptrdiff_t gnz, fftw_real* data )
+//! In-place MPI c2r plan on an explicit communicator (default-comm uses world).
+inline fft_plan_t plan_c2r_3d_mpi_comm( MPI_Comm comm,
+                                        ptrdiff_t gnx, ptrdiff_t gny, ptrdiff_t gnz,
+                                        fftw_real* data )
 {
 	fft_cplx_t* cdata = reinterpret_cast<fft_cplx_t*>(data);
 #ifdef SINGLE_PRECISION
 	return fftwf_mpi_plan_dft_c2r_3d(gnx, gny, gnz, cdata, data,
-	                                 MUSIC::mpi::world(), FFTW_ESTIMATE);
+	                                 comm, FFTW_ESTIMATE);
 #else
 	return fftw_mpi_plan_dft_c2r_3d(gnx, gny, gnz, cdata, data,
-	                                MUSIC::mpi::world(), FFTW_ESTIMATE);
+	                                comm, FFTW_ESTIMATE);
 #endif
+}
+
+//! In-place MPI r2c plan for an gnx*gny*gnz real grid (padded inner dim), world comm.
+inline fft_plan_t plan_r2c_3d_mpi( ptrdiff_t gnx, ptrdiff_t gny, ptrdiff_t gnz, fftw_real* data )
+{
+	return plan_r2c_3d_mpi_comm(MUSIC::mpi::world(), gnx, gny, gnz, data);
+}
+
+//! In-place MPI c2r plan for an gnx*gny*gnz real grid (padded inner dim), world comm.
+inline fft_plan_t plan_c2r_3d_mpi( ptrdiff_t gnx, ptrdiff_t gny, ptrdiff_t gnz, fftw_real* data )
+{
+	return plan_c2r_3d_mpi_comm(MUSIC::mpi::world(), gnx, gny, gnz, data);
 }
 #endif
 

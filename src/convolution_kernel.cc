@@ -724,23 +724,19 @@ public:
 	{
 		// H.2 SPMD path: when setup.precompute_kernel_slab=yes AND np>1,
 		// all ranks cooperate to sample, FFT-deconvolve and pwrite the
-		// finest-level kernel on an FFTW3-MPI x-slab.
-		//
-		// Unigrid only (levelmin==levelmax) at this point — multibox needs
-		// the 8-pt fine→coarse averaging step which would require a halo
-		// exchange of the deconvolved fine slab; deferred to H.2b.
+		// finest-level kernel on an FFTW3-MPI x-slab. H.2b adds the
+		// distributed 8-pt fine→coarse averaging so multibox (levelmin !=
+		// levelmax) is now supported too: the first coarse level averages
+		// from the distributed fine slab, lower levels cascade rank-0-only.
 		// Default-off: root-only legacy path preserved bit-identical.
 		const bool want_slab = cf.getValueSafe<bool>("setup", "precompute_kernel_slab", false);
-		const bool unigrid_kernel = (refh.levelmin() == refh.levelmax());
 #ifdef USE_MPI
-		if (want_slab && MUSIC::mpi::size() > 1 && unigrid_kernel)
+		if (want_slab && MUSIC::mpi::size() > 1)
 		{
 			precompute_kernel_slab(ptf, type, refh);
 		}
 		else
 		{
-			if (want_slab && MUSIC::mpi::is_root() && !unigrid_kernel)
-				LOGINFO("H.2 slab path requested but levelmin != levelmax; falling back to rank-0 precompute (H.2b deferred).");
 			if (MUSIC::mpi::is_root())
 				precompute_kernel(ptf, type, refh);
 		}
@@ -1670,6 +1666,269 @@ void kernel_real_cached<real_t>::precompute_kernel(transfer_function *ptf, tf_ty
 	delete[] rkernel;
 }
 
+//------------------------------------------------------------------------------
+// H.2b — slab-aware fine→coarse 8-pt averaging.
+//
+// The legacy OLD_KERNEL_SAMPLING path (precompute_kernel) produces each coarse
+// kernel level by overwriting its central footprint with an 8-point average of
+// the (deconvolved) fine kernel one level up. In the slab path (H.2) the finest
+// kernel is FFTW3-MPI x-slab-distributed and never rank-0 resident, so that
+// averaging step was deferred. These helpers perform the average distributed.
+//
+// average_fine_full_to_coarse_serial: bit-exact transcription of the legacy
+//   averaging block (convolution_kernel.cc OLD_KERNEL_SAMPLING) on a full,
+//   rank-0-resident fine array. Used as the smoke reference.
+//
+// average_fine_slab_to_coarse: each rank averages from its fine x-slab plus a
+//   1-plane left/right x-halo (periodic ring), writing the coarse cells whose
+//   2³ blocks start on an x-plane it owns. Each coarse cell is produced by
+//   exactly one rank in the same per-cell summation order as the serial path,
+//   so the MPI_SUM merge into a pre-zeroed rank-0 buffer is bit-identical to
+//   the serial reference (no FFT is involved in this step).
+//------------------------------------------------------------------------------
+static void average_fine_full_to_coarse_serial(const fftw_real *rkernel,
+                                                int nx, int ny, int nz,
+                                                fftw_real *rkernel_coarse,
+                                                int nxc, int nyc, int nzc)
+{
+#pragma omp parallel for
+	for (int ix = 0; ix < nx; ix += 2)
+		for (int iy = 0; iy < ny; iy += 2)
+			for (int iz = 0; iz < nz; iz += 2)
+			{
+				int iix(ix / 2), iiy(iy / 2), iiz(iz / 2);
+				if (ix > nx / 2) iix += nxc - nx / 2;
+				if (iy > ny / 2) iiy += nyc - ny / 2;
+				if (iz > nz / 2) iiz += nzc - nz / 2;
+
+				if (ix == nx / 2 || iy == ny / 2 || iz == nz / 2)
+					continue;
+
+				for (int i = 0; i <= 1; ++i)
+					for (int j = 0; j <= 1; ++j)
+						for (int k = 0; k <= 1; ++k)
+							if (i == 0 && k == 0 && j == 0)
+								rkernel_coarse[ACC_RC(iix, iiy, iiz)] =
+									0.125 * (rkernel[ACC_RF(ix - i, iy - j, iz - k)] + rkernel[ACC_RF(ix - i + 1, iy - j, iz - k)] + rkernel[ACC_RF(ix - i, iy - j + 1, iz - k)] + rkernel[ACC_RF(ix - i, iy - j, iz - k + 1)] + rkernel[ACC_RF(ix - i + 1, iy - j + 1, iz - k)] + rkernel[ACC_RF(ix - i + 1, iy - j, iz - k + 1)] + rkernel[ACC_RF(ix - i, iy - j + 1, iz - k + 1)] + rkernel[ACC_RF(ix - i + 1, iy - j + 1, iz - k + 1)]);
+							else
+								rkernel_coarse[ACC_RC(iix, iiy, iiz)] +=
+									0.125 * (rkernel[ACC_RF(ix - i, iy - j, iz - k)] + rkernel[ACC_RF(ix - i + 1, iy - j, iz - k)] + rkernel[ACC_RF(ix - i, iy - j + 1, iz - k)] + rkernel[ACC_RF(ix - i, iy - j, iz - k + 1)] + rkernel[ACC_RF(ix - i + 1, iy - j + 1, iz - k)] + rkernel[ACC_RF(ix - i + 1, iy - j, iz - k + 1)] + rkernel[ACC_RF(ix - i, iy - j + 1, iz - k + 1)] + rkernel[ACC_RF(ix - i + 1, iy - j + 1, iz - k + 1)]);
+			}
+}
+
+#ifdef USE_MPI
+// Distributed 8-pt average. coarse_root is the full coarse buffer on rank 0
+// (must be pre-zeroed by the caller for the MPI_SUM merge); NULL on workers.
+// Returns true on success, false if the slab layout is unusable (a rank with
+// an empty slab breaks the halo ring — caller should fall back to rank-0).
+// touch_root (root-only buffer, NULL on workers) receives, per coarse cell, the
+// number of ranks that produced it via averaging (0 or 1 — each touched cell is
+// owned by exactly one rank). The production caller uses it to OVERWRITE only
+// the averaged cells while preserving the direct-sampled gap cells; the smoke
+// passes a throwaway buffer.
+static bool average_fine_slab_to_coarse(const fftw_real *fine_slab,
+                                        const MUSIC::dist::slab_layout &slab,
+                                        int nx, int ny, int nz,
+                                        fftw_real *coarse_root,
+                                        int nxc, int nyc, int nzc,
+                                        unsigned char *touch_root)
+{
+	const int rank = MUSIC::mpi::rank();
+	const int np   = MUSIC::mpi::size();
+	const MPI_Datatype T = (sizeof(fftw_real) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	// Require a non-empty slab on every rank (ascending-x block decomposition,
+	// the FFTW3-MPI default) so rank±1 are the x-adjacent neighbors.
+	int lnx_min_local = (int)slab.local_nx;
+	int lnx_min = 0;
+	MPI_Allreduce(&lnx_min_local, &lnx_min, 1, MPI_INT, MPI_MIN, MUSIC::mpi::world());
+	if (lnx_min < 1)
+		return false;
+
+	const int x0  = (int)slab.local_x_start;
+	const int lnx = (int)slab.local_nx;
+	const int x1  = x0 + lnx;
+
+	const size_t nz_padded_f = 2 * ((size_t)nz / 2 + 1);
+	const size_t plane = (size_t)ny * nz_padded_f;
+
+	std::vector<fftw_real> left_halo(plane), right_halo(plane);
+
+	const int left  = (rank - 1 + np) % np;
+	const int right = (rank + 1) % np;
+
+	// right_halo = right neighbour's first plane (global x = x1, periodic).
+	MPI_Sendrecv(const_cast<fftw_real *>(fine_slab), (int)plane, T, left, 27100,
+	             right_halo.data(), (int)plane, T, right, 27100,
+	             MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+	// left_halo = left neighbour's last plane (global x = x0-1, periodic).
+	MPI_Sendrecv(const_cast<fftw_real *>(fine_slab) + (size_t)(lnx - 1) * plane,
+	             (int)plane, T, right, 27101,
+	             left_halo.data(), (int)plane, T, left, 27101,
+	             MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+
+	// Fine accessor over [x0-1, x1] (slab + 2 halos); y,z wrap locally.
+	auto Ffine = [&](int gx, int gy, int gz) -> fftw_real {
+		gy = (gy % ny + ny) % ny;
+		gz = (gz % nz + nz) % nz;
+		const size_t yz = (size_t)gy * nz_padded_f + (size_t)gz;
+		if (gx < x0)  return left_halo[yz];
+		if (gx >= x1) return right_halo[yz];
+		return fine_slab[(size_t)(gx - x0) * plane + yz];
+	};
+
+	const size_t nz_padded_c = 2 * ((size_t)nzc / 2 + 1);
+	const size_t coarse_size = (size_t)nxc * (size_t)nyc * nz_padded_c;
+	std::vector<fftw_real> coarse_local(coarse_size, (fftw_real)0);
+	std::vector<unsigned char> touch_local(coarse_size, (unsigned char)0);
+
+	const int ix0 = (x0 % 2 == 0) ? x0 : x0 + 1; // first even global x we own
+	for (int ix = ix0; ix < x1; ix += 2)
+	{
+		if (ix == nx / 2) continue;
+		int iix = ix / 2;
+		if (ix > nx / 2) iix += nxc - nx / 2;
+		for (int iy = 0; iy < ny; iy += 2)
+		{
+			if (iy == ny / 2) continue;
+			int iiy = iy / 2;
+			if (iy > ny / 2) iiy += nyc - ny / 2;
+			for (int iz = 0; iz < nz; iz += 2)
+			{
+				if (iz == nz / 2) continue;
+				int iiz = iz / 2;
+				if (iz > nz / 2) iiz += nzc - nz / 2;
+
+				for (int i = 0; i <= 1; ++i)
+					for (int j = 0; j <= 1; ++j)
+						for (int k = 0; k <= 1; ++k)
+						{
+							fftw_real fsum =
+								Ffine(ix - i, iy - j, iz - k) + Ffine(ix - i + 1, iy - j, iz - k) + Ffine(ix - i, iy - j + 1, iz - k) + Ffine(ix - i, iy - j, iz - k + 1) + Ffine(ix - i + 1, iy - j + 1, iz - k) + Ffine(ix - i + 1, iy - j, iz - k + 1) + Ffine(ix - i, iy - j + 1, iz - k + 1) + Ffine(ix - i + 1, iy - j + 1, iz - k + 1);
+							if (i == 0 && j == 0 && k == 0)
+							{
+								coarse_local[ACC_RC(iix, iiy, iiz)] = 0.125 * fsum;
+								touch_local[ACC_RC(iix, iiy, iiz)] = 1;
+							}
+							else
+								coarse_local[ACC_RC(iix, iiy, iiz)] += 0.125 * fsum;
+						}
+			}
+		}
+	}
+
+	MPI_Reduce(coarse_local.data(), coarse_root,
+	           (int)coarse_local.size(), T, MPI_SUM, 0, MUSIC::mpi::world());
+	MPI_Reduce(touch_local.data(), touch_root,
+	           (int)touch_local.size(), MPI_UNSIGNED_CHAR, MPI_SUM, 0, MUSIC::mpi::world());
+	return true;
+}
+#endif // USE_MPI
+
+// H.2b standalone smoke: deterministic separable pattern on a fine x-slab,
+// distributed 8-pt average vs serial legacy average on rank 0. Expects a
+// bit-identical match (no FFT in this step). Returns 0 on PASS.
+int run_h2b_avg_smoke(size_t Nfine)
+{
+	if (Nfine == 0 || (Nfine & 1u))
+	{
+		if (MUSIC::mpi::is_root())
+			std::cerr << "[h2b-avg-smoke] Nfine must be > 0 and even\n";
+		return 1;
+	}
+	const int nx = (int)Nfine, ny = (int)Nfine, nz = (int)Nfine;
+	const int nxc = (int)Nfine, nyc = (int)Nfine, nzc = (int)Nfine;
+	const size_t nz_padded_f = 2 * ((size_t)nz / 2 + 1);
+	const size_t nz_padded_c = 2 * ((size_t)nzc / 2 + 1);
+	const bool is_root = MUSIC::mpi::is_root();
+	const double TWO_PI = 2.0 * M_PI;
+
+	auto pattern = [&](int gx, int gy, int gz) -> fftw_real {
+		double sx = std::sin(TWO_PI * gx / nx) + 0.5 * std::cos(2.0 * TWO_PI * gx / nx);
+		double sy = std::sin(TWO_PI * gy / ny) + 0.3 * std::cos(3.0 * TWO_PI * gy / ny);
+		double sz = std::sin(TWO_PI * gz / nz) + 0.2 * std::cos(4.0 * TWO_PI * gz / nz);
+		return (fftw_real)(sx * sy * sz);
+	};
+
+#ifdef USE_MPI
+	MUSIC::dist::slab_layout slab = MUSIC::dist::compute_slab_layout(
+		(size_t)nx, (size_t)ny, (size_t)nz, /*fftw_inplace_pad=*/true);
+
+	std::vector<fftw_real> fine_slab(slab.alloc_real_count, (fftw_real)0);
+#pragma omp parallel for
+	for (int ixl = 0; ixl < (int)slab.local_nx; ++ixl)
+	{
+		int gx = (int)slab.local_x_start + ixl;
+		for (int gy = 0; gy < ny; ++gy)
+			for (int gz = 0; gz < nz; ++gz)
+				fine_slab[((size_t)ixl * ny + gy) * nz_padded_f + gz] = pattern(gx, gy, gz);
+	}
+
+	std::vector<fftw_real> coarse_ref, coarse_dist, fine_full;
+	if (is_root)
+	{
+		fine_full.assign((size_t)nx * ny * nz_padded_f, (fftw_real)0);
+#pragma omp parallel for
+		for (int gx = 0; gx < nx; ++gx)
+			for (int gy = 0; gy < ny; ++gy)
+				for (int gz = 0; gz < nz; ++gz)
+					fine_full[((size_t)gx * ny + gy) * nz_padded_f + gz] = pattern(gx, gy, gz);
+		coarse_ref.assign((size_t)nxc * nyc * nz_padded_c, (fftw_real)0);
+		coarse_dist.assign((size_t)nxc * nyc * nz_padded_c, (fftw_real)0);
+		average_fine_full_to_coarse_serial(fine_full.data(), nx, ny, nz,
+		                                   coarse_ref.data(), nxc, nyc, nzc);
+	}
+	std::vector<unsigned char> touch_throwaway;
+	if (is_root)
+		touch_throwaway.assign((size_t)nxc * nyc * nz_padded_c, (unsigned char)0);
+
+	bool ok = average_fine_slab_to_coarse(fine_slab.data(), slab, nx, ny, nz,
+	                                      is_root ? coarse_dist.data() : NULL,
+	                                      nxc, nyc, nzc,
+	                                      is_root ? touch_throwaway.data() : NULL);
+	int ok_all = ok ? 0 : 1;
+	MPI_Allreduce(MPI_IN_PLACE, &ok_all, 1, MPI_INT, MPI_MAX, MUSIC::mpi::world());
+	if (ok_all)
+	{
+		if (is_root)
+			std::cerr << "[h2b-avg-smoke] slab layout unusable (empty slab on some rank); pick smaller np\n";
+		return 1;
+	}
+
+	int rc = 0;
+	if (is_root)
+	{
+		double max_abs_diff = 0.0, max_abs_ref = 0.0;
+		for (size_t q = 0; q < coarse_ref.size(); ++q)
+		{
+			double a = (double)coarse_ref[q], b = (double)coarse_dist[q];
+			double d = std::fabs(a - b);
+			if (d > max_abs_diff) max_abs_diff = d;
+			if (std::fabs(a) > max_abs_ref) max_abs_ref = std::fabs(a);
+		}
+		bool pass = (max_abs_diff == 0.0);
+		std::cerr << "[h2b-avg-smoke] Nfine=" << Nfine
+		          << " ranks=" << MUSIC::mpi::size()
+		          << " max|ref|=" << max_abs_ref
+		          << " max|dist-ref|=" << max_abs_diff
+		          << " " << (pass ? "PASS" : "FAIL") << "\n";
+		rc = pass ? 0 : 2;
+	}
+	MPI_Bcast(&rc, 1, MPI_INT, 0, MUSIC::mpi::world());
+	return rc;
+#else
+	std::vector<fftw_real> fine_full((size_t)nx * ny * nz_padded_f, (fftw_real)0);
+	for (int gx = 0; gx < nx; ++gx)
+		for (int gy = 0; gy < ny; ++gy)
+			for (int gz = 0; gz < nz; ++gz)
+				fine_full[((size_t)gx * ny + gy) * nz_padded_f + gz] = pattern(gx, gy, gz);
+	std::vector<fftw_real> coarse_ref((size_t)nxc * nyc * nz_padded_c, (fftw_real)0);
+	average_fine_full_to_coarse_serial(fine_full.data(), nx, ny, nz, coarse_ref.data(), nxc, nyc, nzc);
+	std::cerr << "[h2b-avg-smoke] Nfine=" << Nfine << " serial-only PASS\n";
+	return 0;
+#endif
+}
+
 // H.2 — SPMD slab-distributed finest-level kernel precompute.
 // All ranks participate; each rank samples its FFTW3-MPI x-slab, runs
 // a distributed r2c+c2r deconvolution and pwrites its slab to the
@@ -2056,11 +2315,38 @@ void kernel_real_cached<real_t>::precompute_kernel_slab(transfer_function *ptf, 
 	}
 	MPI_Barrier(MUSIC::mpi::world());
 
-	delete[] rkernel;
+	// H.2b: the first coarse level (levelmax-1) is produced by the legacy
+	// OLD_KERNEL_SAMPLING 8-pt average of the deconvolved fine kernel. That
+	// fine kernel is the x-slab just computed, so the averaging is distributed
+	// across all ranks and merged into a rank-0 coarse buffer; lower coarse
+	// levels then cascade rank-0-only from the previous coarse kernel, exactly
+	// like the legacy precompute_kernel. touch1 marks the averaged (overwritten)
+	// cells so the direct-sampled gap cells are preserved.
+	int nxc1 = refh.size(levelmax - 1, 0);
+	int nyc1 = refh.size(levelmax - 1, 1);
+	int nzc1 = refh.size(levelmax - 1, 2);
+	if (levelmax - 1 != levelmin) { nxc1 *= 2; nyc1 *= 2; nzc1 *= 2; }
+	const size_t avg1_size = (size_t)nxc1 * (size_t)nyc1 * 2 * ((size_t)nzc1 / 2 + 1);
+	std::vector<fftw_real>     avg1;
+	std::vector<unsigned char> touch1;
+	if (MUSIC::mpi::is_root()) { avg1.assign(avg1_size, (fftw_real)0); touch1.assign(avg1_size, (unsigned char)0); }
+#ifdef OLD_KERNEL_SAMPLING
+	bool avg1_ok = average_fine_slab_to_coarse(rkernel, slab, nx, ny, nz,
+	                   MUSIC::mpi::is_root() ? avg1.data() : NULL, nxc1, nyc1, nzc1,
+	                   MUSIC::mpi::is_root() ? touch1.data() : NULL);
+	if (!avg1_ok && MUSIC::mpi::is_root())
+		LOGINFO("H.2b: fine slab unusable for 8-pt averaging (empty slab on some rank); coarse level %d falls back to direct sampling.", levelmax - 1);
+#else
+	bool avg1_ok = false; // !OLD_KERNEL_SAMPLING never averaged in the first place
+#endif
 
-	// Coarse levels — rank-0-only resampling (no 8-pt averaging across slabs).
+	delete[] rkernel; // fine slab no longer needed
+
+	// Coarse levels — rank-0-only after the distributed first-level average.
 	if (MUSIC::mpi::is_root())
 	{
+		fftw_real *rkernel_prev = NULL; // previous coarse kernel (cascade source)
+		int nx_prev = 0, ny_prev = 0, nz_prev = 0;
 		for (int ilevel = levelmax - 1; ilevel >= levelmin; ilevel--)
 		{
 			LOGUSER("Computing coarse kernel (level %d) on rank 0 (slab path)...", ilevel);
@@ -2165,10 +2451,26 @@ void kernel_real_cached<real_t>::precompute_kernel_slab(transfer_function *ptf, 
 						}
 			}
 
-			// NOTE: OLD_KERNEL_SAMPLING 8-pt averaging from the fine kernel
-			// is skipped in slab mode (fine kernel is no longer rank-0
-			// resident). Coarse values come from direct tfr->compute_real,
-			// ULP-level different from the legacy path.
+#ifdef OLD_KERNEL_SAMPLING
+			// 8-pt averaging overwrite of the central footprint (H.2b).
+			// First coarse level: merge the distributed average (touched cells
+			// only, preserving direct-sampled gap cells). Lower levels cascade
+			// from the previous coarse kernel exactly like precompute_kernel.
+			if (ilevel == levelmax - 1)
+			{
+				if (avg1_ok)
+				{
+					const size_t csz = (size_t)nxc * (size_t)nyc * 2 * ((size_t)nzc / 2 + 1);
+					for (size_t c = 0; c < csz; ++c)
+						if (touch1[c]) rkernel_coarse[c] = avg1[c];
+				}
+			}
+			else
+			{
+				average_fine_full_to_coarse_serial(rkernel_prev, nx_prev, ny_prev, nz_prev,
+				                                   rkernel_coarse, nxc, nyc, nzc);
+			}
+#endif
 
 			sprintf(cachefname, "temp_kernel_level%03d.tmp", ilevel);
 			LOGUSER("Storing coarse kernel in temp file '%s'.", cachefname);
@@ -2182,8 +2484,14 @@ void kernel_real_cached<real_t>::precompute_kernel_slab(transfer_function *ptf, 
 				fwrite(reinterpret_cast<void *>(&rkernel_coarse[(size_t)ix * sz]), sizeof(fftw_real), sz, fp);
 			}
 			fclose(fp);
-			delete[] rkernel_coarse;
+
+			// Cascade: keep this coarse kernel as the averaging source for the
+			// next (coarser) level instead of freeing it immediately.
+			if (rkernel_prev) delete[] rkernel_prev;
+			rkernel_prev = rkernel_coarse;
+			nx_prev = nxc; ny_prev = nyc; nz_prev = nzc;
 		}
+		if (rkernel_prev) delete[] rkernel_prev;
 	}
 
 	MPI_Barrier(MUSIC::mpi::world());

@@ -5,8 +5,12 @@ build
 
 # Run-time / per-run outputs
 *_log.txt
+*.out
 wnoise_*.bin
+wnoise_*.bin.np*
 temp_kernel_level*.tmp
 input_powerspec.txt
 input_powerspec_total.txt
 transfer_real_total.txt
+prof_logs/
+test_pillars/

@@ -797,6 +797,15 @@ bool keep_slab_smooth_enabled();
 void set_keep_slab_urestrict_enabled(bool v);
 bool keep_slab_urestrict_enabled();
 
+// Phase G.2b B.5.4.c: opt-in toggle for fused keep-in-slab prolong_add. Builds
+// on B.5.4.a — when on (and B.5.4.a is on, with m_npostsmooth>0), the
+// post-coarse prolong_add and post-smooth fuse into a single scatter/gather
+// via prolong_add_then_smooth_n_meshvarbnd, eliminating one fine scatter + one
+// fine gather per box per V-cycle. Default false; requires
+// keep_slab_smooth_enabled() to fire.
+void set_keep_slab_prolong_enabled(bool v);
+bool keep_slab_prolong_enabled();
+
 // ---------------------------------------------------------------------------
 // Phase G.2b (B.1): per-cluster sub_comm registry for the bridge.
 //
@@ -1233,6 +1242,60 @@ inline bool smooth_pre_post_n_meshvarbnd_keep_slab(
         box_owner, uc, uf, ff, h, n_sweeps, sub_comm, Lf_out, my_uf_int_out); }
 
 // ---------------------------------------------------------------------------
+// Phase G.2b B.5.4.c — fused prolong_add + post-smoothing on the z-slab.
+//
+// Performs uf += prolong(cc) and then n_sweeps of (prolong_bnd + interp_cf +
+// GS) in a single scatter/gather lifetime, eliminating 1 fine scatter +
+// 1 fine gather per box per V-cycle versus the unfused (prolong_add bridge →
+// smooth_pre_post_n_meshvarbnd) sequence. Bit-identical to the unfused path.
+//
+//   cc : per-box coarse correction (same shape/offset as uc).
+//   uc : coarse solution feeding interp_cf's BC perimeter.
+//   uf : fine solution (in/out; current on owner after the call).
+//   ff : fine source (interior).
+//
+// Returns false on the standard fallback conditions (sub_size<=1, n_sweeps<=0,
+// parity/reach/alignment failures) — caller must then run the unfused
+// prolong_add + post-smooth path on its own.
+bool prolong_add_then_smooth_n_meshvarbnd_double(
+        int box_owner,
+        const MeshvarBnd<double>* cc,
+        const MeshvarBnd<double>* uc,
+        MeshvarBnd<double>* uf,
+        const MeshvarBnd<double>* ff,
+        double h, int n_sweeps,
+        MPI_Comm sub_comm);
+bool prolong_add_then_smooth_n_meshvarbnd_float (
+        int box_owner,
+        const MeshvarBnd<float>*  cc,
+        const MeshvarBnd<float>*  uc,
+        MeshvarBnd<float>*  uf,
+        const MeshvarBnd<float>*  ff,
+        float h, int n_sweeps,
+        MPI_Comm sub_comm);
+
+inline bool prolong_add_then_smooth_n_meshvarbnd(
+        int box_owner,
+        const MeshvarBnd<double>* cc,
+        const MeshvarBnd<double>* uc,
+        MeshvarBnd<double>* uf,
+        const MeshvarBnd<double>* ff,
+        double h, int n_sweeps,
+        MPI_Comm sub_comm)
+{ return prolong_add_then_smooth_n_meshvarbnd_double(
+        box_owner, cc, uc, uf, ff, h, n_sweeps, sub_comm); }
+inline bool prolong_add_then_smooth_n_meshvarbnd(
+        int box_owner,
+        const MeshvarBnd<float>* cc,
+        const MeshvarBnd<float>* uc,
+        MeshvarBnd<float>* uf,
+        const MeshvarBnd<float>* ff,
+        float h, int n_sweeps,
+        MPI_Comm sub_comm)
+{ return prolong_add_then_smooth_n_meshvarbnd_float(
+        box_owner, cc, uc, uf, ff, h, n_sweeps, sub_comm); }
+
+// ---------------------------------------------------------------------------
 // Phase G.4: 2LPT FD source primitive on the z-slab.
 //
 // Implements the same operator as cosmology.cc::compute_2LPT_source over
@@ -1273,6 +1336,35 @@ inline double lpt2_fd_z(const ZoomSlabLayout& L,
 inline float  lpt2_fd_z(const ZoomSlabLayout& L,
                         const float*  u, float  h, unsigned order, float*  f)
 { return lpt2_fd_z_slab_float (L, u, h, order, f); }
+
+// Task #135: MeshvarBnd bridge for the 2LPT FD source. Scatters one level's
+// mesh (interior + r-cell BC perimeter, r = stencil radius) across sub_comm,
+// runs lpt2_fd_z on each rank's z-slab, gathers, and writes the FULL interior
+// of fout on box_owner. Bit-identical to cosmology.cc::compute_2LPT_source's
+// per-level body (per-cell, no reduction). u must have m_nbnd >= r on owner.
+// Returns false when sub_size == 1 or the z-split cannot host halo_w = r; the
+// caller then runs the serial level body.
+bool lpt2_fd_meshvarbnd_double(int box_owner, const MeshvarBnd<double>* u,
+                               MeshvarBnd<double>* fout, double h, unsigned order,
+                               MPI_Comm sub_comm);
+bool lpt2_fd_meshvarbnd_float (int box_owner, const MeshvarBnd<float>*  u,
+                               MeshvarBnd<float>*  fout, float  h, unsigned order,
+                               MPI_Comm sub_comm);
+
+inline bool lpt2_fd_meshvarbnd(int box_owner, const MeshvarBnd<double>* u,
+                               MeshvarBnd<double>* fout, double h, unsigned order,
+                               MPI_Comm sub_comm)
+{ return lpt2_fd_meshvarbnd_double(box_owner, u, fout, h, order, sub_comm); }
+inline bool lpt2_fd_meshvarbnd(int box_owner, const MeshvarBnd<float>* u,
+                               MeshvarBnd<float>* fout, float h, unsigned order,
+                               MPI_Comm sub_comm)
+{ return lpt2_fd_meshvarbnd_float(box_owner, u, fout, h, order, sub_comm); }
+
+// Task #135 smoke test: compares lpt2_fd_meshvarbnd against a BOUNDED serial
+// reference (reads MeshvarBnd boundary cells, unlike the G.4 zero-halo smoke).
+// Opt-in via setup.test_zoom_slab_lpt2_meshvarbnd=yes; order via
+// setup.test_zoom_slab_lpt2_order (2 or 4, default 2).
+bool smoke_test_lpt2_meshvarbnd(unsigned order = 2);
 
 // Phase G.4 smoke test. Builds a single cluster with a deterministic u
 // pattern, computes f_slab on each rank's z-slab, gathers, and compares

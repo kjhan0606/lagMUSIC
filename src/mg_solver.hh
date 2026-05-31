@@ -1398,6 +1398,14 @@ void solver<S,I,O,T>::twoGrid_multibox_spmd( unsigned ilevel )
 		cc_for_parent[pi] = cc;
 	}
 
+	// B.5.4.c: when fusing prolong_add into the post-smoother, defer the
+	// collective-box prolong_add to the post-smooth site (a single fused
+	// scatter/gather). Requires keep-slab smoothing on and post-sweeps > 0.
+	const bool fuse_prolong =
+		MUSIC::zoom_slab::keep_slab_prolong_enabled() &&
+		MUSIC::zoom_slab::keep_slab_smooth_enabled() &&
+		m_npostsmooth > 0;
+
 	// B.2b.5 bridge dispatch (same gating pattern as the restrict sites above).
 	// When sub_size>1 the per-box coarse correction cc is scattered across
 	// sub_comm, prolong_add'd onto the per-box fine mesh in z-slab form, and
@@ -1412,6 +1420,8 @@ void solver<S,I,O,T>::twoGrid_multibox_spmd( unsigned ilevel )
 #endif
 		const bool collective_bridge = use_zoom_slab_gs && sub_size > 1;
 		if( collective_bridge ){
+			// B.5.4.c: fused path handles prolong_add at the post-smooth site.
+			if( fuse_prolong ) continue;
 			const int owner_world = (int)m_pu->owner_of_box(ilevel, b);
 			meshvar_bnd * cc_ptr = NULL;
 			if( ufs[b] ){
@@ -1430,7 +1440,9 @@ void solver<S,I,O,T>::twoGrid_multibox_spmd( unsigned ilevel )
 	}
 
 	for( auto & kv : ucsave_for_parent ){ kv.second->deallocate(); delete kv.second; }
-	for( auto & kv : cc_for_parent     ){ kv.second->deallocate(); delete kv.second; }
+	// B.5.4.c: cc_for_parent stays alive past here when fusing — the fused
+	// prolong_add_then_smooth call at the post-smooth site still needs it.
+	// Deleted below after the keep-slab post-smooth site.
 
 	// --- post-smoothing sweeps (per box, owner-gated; bridge can be collective)
 	// B.5.4.a: see pre-smoothing comment.
@@ -1447,11 +1459,35 @@ void solver<S,I,O,T>::twoGrid_multibox_spmd( unsigned ilevel )
 				use_zoom_slab_gs && m_smoother == opt::sm_gauss_seidel && sub_size > 1;
 			if( !collective_bridge ) continue;
 			const int owner_world = (int)m_pu->owner_of_box(ilevel, b);
-			post_keep_slab_done[b] = MUSIC::zoom_slab::smooth_pre_post_n_meshvarbnd(
-				owner_world, ucs[b], ufs[b], ffs[b], h,
-				(int)m_npostsmooth, sub_comm);
+			if( fuse_prolong ){
+				// B.5.4.c: fused prolong_add + post-smooth in one scatter/gather.
+				meshvar_bnd * cc_ptr = NULL;
+				if( ufs[b] ){
+					auto it = cc_for_parent.find(pidx[b]);
+					if( it != cc_for_parent.end() ) cc_ptr = it->second;
+				}
+				const bool fused = MUSIC::zoom_slab::prolong_add_then_smooth_n_meshvarbnd(
+					owner_world, cc_ptr, ucs[b], ufs[b], ffs[b], h,
+					(int)m_npostsmooth, sub_comm);
+				if( fused ){
+					post_keep_slab_done[b] = true;
+				} else {
+					// Fused fell back: do the prolong_add now (collective bridge,
+					// matching the deferred site), leave smoothing to the per-iter
+					// loop below (post_keep_slab_done[b] stays false).
+					const bool did_bridge = MUSIC::zoom_slab::prolong_add_meshvarbnd(
+						owner_world, cc_ptr, ufs[b], sub_comm);
+					if( !did_bridge && ufs[b] && cc_ptr )
+						m_gridop.prolong_add( *cc_ptr, *(ufs[b]) );
+				}
+			} else {
+				post_keep_slab_done[b] = MUSIC::zoom_slab::smooth_pre_post_n_meshvarbnd(
+					owner_world, ucs[b], ufs[b], ffs[b], h,
+					(int)m_npostsmooth, sub_comm);
+			}
 		}
 	}
+	for( auto & kv : cc_for_parent ){ kv.second->deallocate(); delete kv.second; }
 	for( unsigned i=0; i<m_npostsmooth; ++i ){
 		for( size_t b=0; b<nb; ++b ){
 			if( post_keep_slab_done[b] ) continue;

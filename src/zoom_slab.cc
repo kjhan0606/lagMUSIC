@@ -59,6 +59,16 @@ namespace { bool g_keep_slab_urestrict_enabled = false; }
 void set_keep_slab_urestrict_enabled(bool v) { g_keep_slab_urestrict_enabled = v; }
 bool keep_slab_urestrict_enabled() { return g_keep_slab_urestrict_enabled; }
 
+// Phase G.2b B.5.4.c: opt-in toggle for fused keep-in-slab prolong_add. When
+// on (and B.5.4.a keep-slab smoothing is also active, with m_npostsmooth>0),
+// twoGrid_multibox_spmd's post-coarse prolong_add and post-smooth share one
+// scatter/gather lifetime via prolong_add_then_smooth_n_meshvarbnd,
+// eliminating one fine scatter + one fine gather per box per V-cycle. Default
+// false. Requires keep_slab_smooth_enabled() to fire.
+namespace { bool g_keep_slab_prolong_enabled = false; }
+void set_keep_slab_prolong_enabled(bool v) { g_keep_slab_prolong_enabled = v; }
+bool keep_slab_prolong_enabled() { return g_keep_slab_prolong_enabled; }
+
 // ---------------------------------------------------------------------------
 // Phase G.2b (B.1): per-cluster sub_comm registry. See zoom_slab.hh comments
 // for policy semantics + lifecycle contract.
@@ -4303,6 +4313,318 @@ bool smooth_pre_post_n_meshvarbnd_impl(int box_owner,
     return true;
 }
 
+// Phase G.2b B.5.4.c — fused prolong_add + post-smoothing in z-slab.
+//
+// Combines the coarse-correction prolong_add (uf += prolong(cc)) and the
+// subsequent N-sweep post-smoother into a single scatter/gather lifetime.
+// Eliminates 1 fine scatter + 1 fine gather per box per V-cycle versus the
+// unfused (prolong_add_meshvarbnd bridge → smooth_pre_post_n_meshvarbnd)
+// sequence.
+//
+// Bit-identicality: the post-smoother overwrites uf's 2-cell BC perimeter on
+// every sweep (prolong_bnd + interp_cf) before GS reads it, so only the uf
+// *interior* produced by prolong_add matters. The prolong injection is a pure
+// per-fine-cell += of one coarse value (no reduction order), identical across
+// z-slab decompositions; the smoother stage is byte-for-byte the same as the
+// standalone smoother fed the same interior. Full bit-identicality expected.
+//
+// cc is the per-box coarse correction (same shape/offset as uc); the fine box
+// footprint in cc is the coarse sub-region [oxf, oxf+nxc_int) — exactly the
+// region prolong_add_meshvarbnd injects.
+template<typename T>
+bool prolong_add_then_smooth_n_meshvarbnd_impl(int box_owner,
+                                               const MeshvarBnd<T>* cc,
+                                               const MeshvarBnd<T>* uc,
+                                               MeshvarBnd<T>* uf,
+                                               const MeshvarBnd<T>* ff,
+                                               T h, int n_sweeps,
+                                               MPI_Comm sub_comm)
+{
+    int rk = 0, sz = 1;
+#ifdef USE_MPI
+    MPI_Comm_rank(sub_comm, &rk);
+    MPI_Comm_size(sub_comm, &sz);
+#endif
+
+    if( sz <= 1 ) return false;
+    if( n_sweeps <= 0 ) return false;
+
+#ifdef USE_MPI
+    const MPI_Datatype MPI_T =
+        (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+#endif
+
+    int hdr[6] = {0, 0, 0, 0, 0, 0};
+    if( rk == box_owner ) {
+        if( !uf || !ff || !uc || !cc )
+            throw std::runtime_error("prolong_add_then_smooth: cc/uc/uf/ff null on box_owner");
+        if( uf->m_nbnd < 2 )
+            throw std::runtime_error("prolong_add_then_smooth: uf->m_nbnd must be >= 2");
+        if( ff->m_nbnd < 1 )
+            throw std::runtime_error("prolong_add_then_smooth: ff->m_nbnd must be >= 1");
+        if( (int)ff->size(0) != (int)uf->size(0) ||
+            (int)ff->size(1) != (int)uf->size(1) ||
+            (int)ff->size(2) != (int)uf->size(2) )
+            throw std::runtime_error("prolong_add_then_smooth: uf/ff size mismatch");
+        hdr[0] = (int)uf->size(0);
+        hdr[1] = (int)uf->size(1);
+        hdr[2] = (int)uf->size(2);
+        hdr[3] = uf->offset(0);
+        hdr[4] = uf->offset(1);
+        hdr[5] = uf->offset(2);
+    }
+#ifdef USE_MPI
+    MPI_Bcast(hdr, 6, MPI_INT, box_owner, sub_comm);
+#endif
+
+    const int nxf = hdr[0], nyf = hdr[1], nzf = hdr[2];
+    const int oxf = hdr[3], oyf = hdr[4], ozf = hdr[5];
+    if( nxf <= 0 || nyf <= 0 || nzf <= 0 )
+        throw std::runtime_error("prolong_add_then_smooth: bad fine dims from box_owner");
+    if( (nxf & 1) || (nyf & 1) || (nzf & 1) ) return false;
+    const int nxc_int = nxf / 2;
+    const int nyc_int = nyf / 2;
+    const int nzc_int = nzf / 2;
+    if( nxc_int < 1 || nyc_int < 1 || nzc_int < 1 ) return false;
+
+    int reach_ok = 1;
+    if( rk == box_owner ) {
+        if( oxf < 1 || oyf < 1 || ozf < 1 ) reach_ok = 0;
+        if( (int)uc->size(0) < oxf + nxc_int + 1 ) reach_ok = 0;
+        if( (int)uc->size(1) < oyf + nyc_int + 1 ) reach_ok = 0;
+        if( (int)uc->size(2) < ozf + nzc_int + 1 ) reach_ok = 0;
+    }
+#ifdef USE_MPI
+    MPI_Bcast(&reach_ok, 1, MPI_INT, box_owner, sub_comm);
+#endif
+    if( !reach_ok ) return false;
+
+    const int cluster_nz_f = nzf + 4;
+    if( cluster_nz_f % (2 * sz) != 0 ) return false;
+    const int halo_w = 1;
+
+    // Fine perimeter-2 layout (identical to the post-smoother).
+    ZoomSlabLayout Lf = make_layout(
+        sub_comm, /*cluster_id=*/0, /*level=*/1,
+        0, 0, 0, nxf + 4, nyf + 4, nzf + 4, halo_w);
+    if( (Lf.my_z0 & 1) || (local_nz(Lf) & 1) ) return false;
+
+    // Coarse injection layout for prolong_add: 1-cell perimeter so it is
+    // exactly Lf/2 aligned (cluster = nxc_int+2, Lf cluster = nxf+4 =
+    // 2*(nxc_int+2)). Natural coarse cell n maps to cluster cell n+1, whose
+    // 8 fine children land on fine cluster cells [2n+2, 2n+4) = fine interior
+    // cells [2n, 2n+2). The perimeter coarse cells inject onto the fine BC
+    // perimeter (harmless — overwritten by interp_cf).
+    ZoomSlabLayout Lc_pa = make_layout(
+        sub_comm, /*cluster_id=*/0, /*level=*/0,
+        0, 0, 0, nxc_int + 2, nyc_int + 2, nzc_int + 2, halo_w);
+    if( 2 * Lc_pa.my_z0 != Lf.my_z0 || 2 * Lc_pa.my_z1 != Lf.my_z1 )
+        return false;
+
+    static bool s_b5_4c_logged = false;
+    if( rk == box_owner && !s_b5_4c_logged ) {
+        s_b5_4c_logged = true;
+        LOGINFO("B.5.4.c: prolong_add_then_smooth active (uf=(%d,%d,%d) "
+                "oxf=(%d,%d,%d) n_sweeps=%d sub_size=%d)",
+                nxf, nyf, nzf, oxf, oyf, ozf, n_sweeps, sz);
+    }
+
+    const int ox_c = 3, oy_c = 3, oz_c = 3;
+    const int cnxc = nxc_int + 6;
+    const int cnyc = nyc_int + 6;
+    const int cnzc = nzc_int + 6;
+    const std::size_t coarse_buf_sz =
+        (std::size_t)cnxc * (std::size_t)cnyc * (std::size_t)cnzc;
+
+    const int cnxf = Lf.cluster_nx;
+    const int cnyf = Lf.cluster_ny;
+    const int cnzf = Lf.cluster_nz;
+
+    const int cnxc_pa = Lc_pa.cluster_nx;
+    const int cnyc_pa = Lc_pa.cluster_ny;
+    const int cnzc_pa = Lc_pa.cluster_nz;
+
+    // --- (1) Pack uf cluster (interior + 2-cell perimeter), ff cluster
+    //         (interior), and cc cluster (1-cell perimeter) on owner.
+    std::vector<T> cluster_uf_in, cluster_ff_in, cluster_cc_in;
+    if( rk == box_owner ) {
+        cluster_uf_in.assign(cluster_full_size(Lf), T(0));
+        cluster_ff_in.assign(cluster_full_size(Lf), T(0));
+        cluster_cc_in.assign(cluster_full_size(Lc_pa), T(0));
+        for( int cx=0; cx<cnxf; ++cx ) {
+            const int ix_uf = cx - 2;
+            for( int cy=0; cy<cnyf; ++cy ) {
+                const int iy_uf = cy - 2;
+                for( int cz=0; cz<cnzf; ++cz ) {
+                    const int iz_uf = cz - 2;
+                    const std::size_t idx =
+                        ((std::size_t)cx * (std::size_t)cnyf + (std::size_t)cy)
+                        * (std::size_t)cnzf + (std::size_t)cz;
+                    cluster_uf_in[idx] = (*uf)(ix_uf, iy_uf, iz_uf);
+                }
+            }
+        }
+        for( int cx=2; cx<cnxf-2; ++cx ) {
+            const int ix_ff = cx - 2;
+            for( int cy=2; cy<cnyf-2; ++cy ) {
+                const int iy_ff = cy - 2;
+                for( int cz=2; cz<cnzf-2; ++cz ) {
+                    const int iz_ff = cz - 2;
+                    const std::size_t idx =
+                        ((std::size_t)cx * (std::size_t)cnyf + (std::size_t)cy)
+                        * (std::size_t)cnzf + (std::size_t)cz;
+                    cluster_ff_in[idx] = (*ff)(ix_ff, iy_ff, iz_ff);
+                }
+            }
+        }
+        // cc: natural coarse cell (ic,jc,kc) -> cluster cell (ic+1,jc+1,kc+1).
+        for( int ic=0; ic<nxc_int; ++ic )
+            for( int jc=0; jc<nyc_int; ++jc )
+                for( int kc=0; kc<nzc_int; ++kc ) {
+                    const std::size_t idx =
+                        ((std::size_t)(ic+1) * (std::size_t)cnyc_pa + (std::size_t)(jc+1))
+                        * (std::size_t)cnzc_pa + (std::size_t)(kc+1);
+                    cluster_cc_in[idx] = (*cc)(ic + oxf, jc + oyf, kc + ozf);
+                }
+    }
+
+    // --- (2) Scatter uf, ff, cc to per-rank z-slabs.
+    std::vector<T> my_uf_int(local_interior_size(Lf), T(0));
+    std::vector<T> my_ff_int(local_interior_size(Lf), T(0));
+    std::vector<T> my_cc_int(local_interior_size(Lc_pa), T(0));
+    scatter_from(Lf, box_owner,
+                 rk == box_owner ? cluster_uf_in.data() : (const T*)nullptr,
+                 my_uf_int.data());
+    scatter_from(Lf, box_owner,
+                 rk == box_owner ? cluster_ff_in.data() : (const T*)nullptr,
+                 my_ff_int.data());
+    scatter_from(Lc_pa, box_owner,
+                 rk == box_owner ? cluster_cc_in.data() : (const T*)nullptr,
+                 my_cc_int.data());
+
+    // --- (3) Copy interiors into halo-padded buffers at k offset = halo_w.
+    std::vector<T> uf_pad(local_with_halo_size(Lf), T(0));
+    std::vector<T> ff_pad(local_with_halo_size(Lf), T(0));
+    std::vector<T> cc_pad(local_with_halo_size(Lc_pa), T(0));
+    {
+        const int nz_rf  = local_nz(Lf);
+        const int hwf    = Lf.halo_w;
+        const int kstridef = 2 * hwf + nz_rf;
+        for( int ii=0; ii<cnxf; ++ii )
+            for( int jj=0; jj<cnyf; ++jj )
+                for( int kl=0; kl<nz_rf; ++kl ) {
+                    const std::size_t dst =
+                        ((std::size_t)ii * (std::size_t)cnyf + (std::size_t)jj)
+                        * (std::size_t)kstridef + (std::size_t)(hwf + kl);
+                    const std::size_t src =
+                        ((std::size_t)ii * (std::size_t)cnyf + (std::size_t)jj)
+                        * (std::size_t)nz_rf + (std::size_t)kl;
+                    uf_pad[dst] = my_uf_int[src];
+                    ff_pad[dst] = my_ff_int[src];
+                }
+    }
+    {
+        const int nz_rc  = local_nz(Lc_pa);
+        const int hwc    = Lc_pa.halo_w;
+        const int kstridec = 2 * hwc + nz_rc;
+        for( int ic=0; ic<cnxc_pa; ++ic )
+            for( int jc=0; jc<cnyc_pa; ++jc )
+                for( int kl=0; kl<nz_rc; ++kl ) {
+                    const std::size_t dst =
+                        ((std::size_t)ic * (std::size_t)cnyc_pa + (std::size_t)jc)
+                        * (std::size_t)kstridec + (std::size_t)(hwc + kl);
+                    const std::size_t src =
+                        ((std::size_t)ic * (std::size_t)cnyc_pa + (std::size_t)jc)
+                        * (std::size_t)nz_rc + (std::size_t)kl;
+                    cc_pad[dst] = my_cc_int[src];
+                }
+    }
+
+    // --- (3b) prolong_add: uf_pad interior += prolong(cc). Pure per-cell +=,
+    //          no halo needed on cc (prolong_add reads coarse interior only).
+    prolong_add_impl<T>(Lc_pa, Lf, cc_pad.data(), uf_pad.data());
+
+    // Initial halo exchange (matches smoother).
+    halo_exchange_z(Lf, uf_pad.data());
+
+    // --- (4) Sweep loop (identical to smooth_pre_post_n_meshvarbnd).
+    std::vector<T> coarse_buf(coarse_buf_sz, T(0));
+    for( int s = 0; s < n_sweeps; ++s ) {
+        if( rk == box_owner ) {
+            for( int cx=0; cx<cnxc; ++cx ) {
+                const int ix_uc = oxf + cx - ox_c;
+                for( int cy=0; cy<cnyc; ++cy ) {
+                    const int iy_uc = oyf + cy - oy_c;
+                    for( int cz=0; cz<cnzc; ++cz ) {
+                        const int iz_uc = ozf + cz - oz_c;
+                        const std::size_t idx =
+                            ((std::size_t)cx * (std::size_t)cnyc + (std::size_t)cy)
+                            * (std::size_t)cnzc + (std::size_t)cz;
+                        coarse_buf[idx] = (*uc)(ix_uc, iy_uc, iz_uc);
+                    }
+                }
+            }
+        }
+#ifdef USE_MPI
+        MPI_Bcast(coarse_buf.data(), (int)coarse_buf_sz, MPI_T, box_owner, sub_comm);
+#endif
+        if( !prolong_bnd_z_slab_impl<T>(cnxc, cnyc, cnzc, coarse_buf.data(),
+                                        ox_c, oy_c, oz_c,
+                                        nxc_int, nyc_int, nzc_int,
+                                        Lf, uf_pad.data()) )
+            return false;
+        halo_exchange_z(Lf, uf_pad.data());
+        if( !interp_cf_flux_z_slab_impl<T>(cnxc, cnyc, cnzc, coarse_buf.data(),
+                                           ox_c, oy_c, oz_c,
+                                           nxc_int, nyc_int, nzc_int,
+                                           Lf, uf_pad.data()) )
+            return false;
+        halo_exchange_z(Lf, uf_pad.data());
+        gs_neg_skip_z_wide_impl<T>(Lf, uf_pad.data(), ff_pad.data(), h, /*bnd=*/2);
+    }
+
+    // --- (5) Extract padded interior back to per-rank interior buffer.
+    {
+        const int nz_rf  = local_nz(Lf);
+        const int hwf    = Lf.halo_w;
+        const int kstridef = 2 * hwf + nz_rf;
+        for( int ii=0; ii<cnxf; ++ii )
+            for( int jj=0; jj<cnyf; ++jj )
+                for( int kl=0; kl<nz_rf; ++kl ) {
+                    const std::size_t src =
+                        ((std::size_t)ii * (std::size_t)cnyf + (std::size_t)jj)
+                        * (std::size_t)kstridef + (std::size_t)(hwf + kl);
+                    const std::size_t dst =
+                        ((std::size_t)ii * (std::size_t)cnyf + (std::size_t)jj)
+                        * (std::size_t)nz_rf + (std::size_t)kl;
+                    my_uf_int[dst] = uf_pad[src];
+                }
+    }
+
+    // --- (6) Gather to owner; write back uf (interior + 2-cell BC perimeter).
+    std::vector<T> cluster_uf_out;
+    if( rk == box_owner ) cluster_uf_out.assign(cluster_full_size(Lf), T(0));
+    gather_to(Lf, box_owner, my_uf_int.data(),
+              rk == box_owner ? cluster_uf_out.data() : (T*)nullptr);
+    if( rk == box_owner ) {
+        for( int cx=0; cx<cnxf; ++cx ) {
+            const int ix_uf = cx - 2;
+            for( int cy=0; cy<cnyf; ++cy ) {
+                const int iy_uf = cy - 2;
+                for( int cz=0; cz<cnzf; ++cz ) {
+                    const int iz_uf = cz - 2;
+                    const std::size_t idx =
+                        ((std::size_t)cx * (std::size_t)cnyf + (std::size_t)cy)
+                        * (std::size_t)cnzf + (std::size_t)cz;
+                    (*uf)(ix_uf, iy_uf, iz_uf) = cluster_uf_out[idx];
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 } // anonymous namespace
 
 bool smooth_pre_post_n_meshvarbnd_double(int box_owner,
@@ -4357,6 +4679,28 @@ bool smooth_pre_post_n_meshvarbnd_keep_slab_float (
 { return smooth_pre_post_n_meshvarbnd_impl<float >(
         box_owner, uc, uf, ff, h, n_sweeps, sub_comm,
         &Lf_out, &my_uf_int_out); }
+
+bool prolong_add_then_smooth_n_meshvarbnd_double(
+        int box_owner,
+        const MeshvarBnd<double>* cc,
+        const MeshvarBnd<double>* uc,
+        MeshvarBnd<double>* uf,
+        const MeshvarBnd<double>* ff,
+        double h, int n_sweeps,
+        MPI_Comm sub_comm)
+{ return prolong_add_then_smooth_n_meshvarbnd_impl<double>(
+        box_owner, cc, uc, uf, ff, h, n_sweeps, sub_comm); }
+
+bool prolong_add_then_smooth_n_meshvarbnd_float (
+        int box_owner,
+        const MeshvarBnd<float>*  cc,
+        const MeshvarBnd<float>*  uc,
+        MeshvarBnd<float>*  uf,
+        const MeshvarBnd<float>*  ff,
+        float h, int n_sweeps,
+        MPI_Comm sub_comm)
+{ return prolong_add_then_smooth_n_meshvarbnd_impl<float >(
+        box_owner, cc, uc, uf, ff, h, n_sweeps, sub_comm); }
 
 // ---------------------------------------------------------------------------
 // Phase G.2b smoke test for prolong_add_z. Mirrors prolong smoke, but
@@ -5952,6 +6296,15 @@ bool smoke_test_single_cluster(int halo_w)
 // ---------------------------------------------------------------------------
 namespace {
 
+// Force a precise FP model (no contraction, no reassociation) inside the 2LPT
+// FD kernels. The compiler is Intel icpx, whose default fast FP model lets the
+// AVX-vectorized z-loop reassociate/contract the per-cell expression DIFFERENTLY
+// from the scalar remainder tail. So the SAME kernel yields ULP-different
+// results depending on how the z-slab splits across ranks (diff appears iff
+// local_nz % vecwidth != 0). Pinning contract+reassociate off makes the vector
+// and scalar paths bit-identical, which is what makes the slab path bit-identical
+// across np (the #135 contract). icpx is clang-based, so use the clang fp pragma;
+// GCC optimize attributes/pragmas are silently ignored.
 #define LSQR(x) ((x)*(x))
 
 // Order-2 stencil radius 2.
@@ -5959,6 +6312,9 @@ template<typename T>
 double lpt2_o2_impl(const ZoomSlabLayout& L,
                     const T* u, T h, T* f)
 {
+#if defined(__clang__)
+    #pragma clang fp contract(off) reassociate(off)
+#endif
     const int cnx   = L.cluster_nx;
     const int cny   = L.cluster_ny;
     const int nz_r  = local_nz(L);
@@ -6004,6 +6360,9 @@ template<typename T>
 double lpt2_o4_impl(const ZoomSlabLayout& L,
                     const T* u, T h, T* f)
 {
+#if defined(__clang__)
+    #pragma clang fp contract(off) reassociate(off)
+#endif
     const int cnx   = L.cluster_nx;
     const int cny   = L.cluster_ny;
     const int nz_r  = local_nz(L);
@@ -6099,6 +6458,263 @@ double lpt2_fd_z_slab_double(const ZoomSlabLayout& L, const double* u,
 float  lpt2_fd_z_slab_float (const ZoomSlabLayout& L, const float* u,
                               float h, unsigned order, float* f)
 { return lpt2_fd_impl<float>(L, u, h, order, f); }
+
+// ---------------------------------------------------------------------------
+// Task #135: MeshvarBnd bridge for the 2LPT FD source.
+//
+// Mirrors gs_z_neg_meshvarbnd_impl, but:
+//   - the cluster carries an r-cell BC perimeter (r = stencil radius = 2 for
+//     order 2, 4 for order 4/6) instead of 1, because the FD stencil reaches
+//     +/- r cells and reads the MeshvarBnd's boundary cells (parent-interpolated
+//     potential at refinement levels). halo_w = r carries that reach in z.
+//   - it runs lpt2_fd_z (one shot, no sweeps) reading u, writing a separate f.
+//   - it writes the FULL MeshvarBnd interior [0,nx)x[0,ny)x[0,nz) of fout,
+//     matching cosmology.cc::compute_2LPT_source exactly (per-cell, no
+//     reduction -> bit-identical to the rank-0-serial level loop).
+//
+// Returns false (caller must run the serial level body) when sub_size == 1 or
+// when the cluster_nz/sub_size split cannot host halo_w = r on every rank.
+// The owner must supply u with m_nbnd >= r (production already requires this:
+// the serial stencil reads ACC(ix-r..ix+r)).
+namespace {
+
+template<typename T>
+bool lpt2_fd_meshvarbnd_impl(int box_owner,
+                             const MeshvarBnd<T>* u,
+                             MeshvarBnd<T>* fout,
+                             T h, unsigned order,
+                             MPI_Comm sub_comm)
+{
+    int rk = 0, sz = 1;
+#ifdef USE_MPI
+    MPI_Comm_rank(sub_comm, &rk);
+    MPI_Comm_size(sub_comm, &sz);
+#endif
+
+    const int r = (order == 2) ? 2 : 4;
+
+    // Broadcast interior dims from box_owner.
+    int dims[3] = {0, 0, 0};
+    if( rk == box_owner ) {
+        if( !u || !fout )
+            throw std::runtime_error("lpt2_fd_meshvarbnd: u/fout null on box_owner");
+        dims[0] = (int)u->size(0);
+        dims[1] = (int)u->size(1);
+        dims[2] = (int)u->size(2);
+        if( (int)fout->size(0) != dims[0] || (int)fout->size(1) != dims[1] || (int)fout->size(2) != dims[2] )
+            throw std::runtime_error("lpt2_fd_meshvarbnd: u/fout size mismatch");
+        if( u->m_nbnd < r )
+            throw std::runtime_error("lpt2_fd_meshvarbnd: m_nbnd < stencil radius");
+    }
+#ifdef USE_MPI
+    MPI_Bcast(dims, 3, MPI_INT, box_owner, sub_comm);
+#endif
+
+    const int nx = dims[0], ny = dims[1], nz = dims[2];
+    if( nx <= 0 || ny <= 0 || nz <= 0 )
+        throw std::runtime_error("lpt2_fd_meshvarbnd: bad cluster dims");
+
+    // Cluster shape = MeshvarBnd interior + r-cell BC perimeter on all axes.
+    const int cnx = nx + 2*r;
+    const int cny = ny + 2*r;
+    const int cnz = nz + 2*r;
+    const int halo_w = r;
+
+    // If the z-split can't host halo_w = r on every rank, the owner computes
+    // locally over a self-comm (sub_size 1 -> identical kernel, no cross-rank
+    // data, so bit-identical to the distributed path). Workers skip. The
+    // decision is deterministic on every rank from dims + sz.
+#ifdef USE_MPI
+    if( sz > 1 && halo_w > (cnz / sz) ) {
+        if( rk == box_owner )
+            lpt2_fd_meshvarbnd_impl<T>(box_owner, u, fout, h, order, MPI_COMM_SELF);
+        return true;
+    }
+#endif
+
+    ZoomSlabLayout L = make_layout(
+        sub_comm, /*cluster_id=*/0, /*level=*/0,
+        /*oax=*/0, /*oay=*/0, /*oaz=*/0,
+        cnx, cny, cnz, halo_w);
+
+    // Box-owner: pack interior + r-cell BC perimeter into cluster buffer.
+    std::vector<T> cluster_u_in;
+    if( rk == box_owner ) {
+        cluster_u_in.assign(cluster_full_size(L), T(0));
+        for( int ci=0; ci<cnx; ++ci )
+            for( int cj=0; cj<cny; ++cj )
+                for( int ck=0; ck<cnz; ++ck ) {
+                    const std::size_t idx = ((std::size_t)ci * (std::size_t)cny + (std::size_t)cj)
+                                          * (std::size_t)cnz + (std::size_t)ck;
+                    cluster_u_in[idx] = (*u)(ci - r, cj - r, ck - r);
+                }
+    }
+
+    std::vector<T> my_u_int(local_interior_size(L), T(0));
+    std::vector<T> my_f_int(local_interior_size(L), T(0));
+    std::vector<T> u_pad   (local_with_halo_size(L), T(0));
+    std::vector<T> f_pad   (local_with_halo_size(L), T(0));
+
+    scatter_from(L, box_owner,
+                 rk == box_owner ? cluster_u_in.data() : (const T*)nullptr,
+                 my_u_int.data());
+
+    // Copy per-rank interior into local-with-halo (k offset by halo_w).
+    {
+        const int nz_r = local_nz(L);
+        const int kstride = 2*halo_w + nz_r;
+        for( int ii=0; ii<cnx; ++ii )
+            for( int jj=0; jj<cny; ++jj )
+                for( int kl=0; kl<nz_r; ++kl ) {
+                    const std::size_t dst = ((std::size_t)ii * (std::size_t)cny + (std::size_t)jj)
+                                          * (std::size_t)kstride + (std::size_t)(halo_w + kl);
+                    const std::size_t src = ((std::size_t)ii * (std::size_t)cny + (std::size_t)jj)
+                                          * (std::size_t)nz_r + (std::size_t)kl;
+                    u_pad[dst] = my_u_int[src];
+                }
+    }
+
+    // Exchange z-halo so the stencil reads fresh neighbor values within +/- r.
+    halo_exchange_z(L, u_pad.data());
+
+    // One-shot 2LPT FD source. Writes f_pad over the interior the kernel owns.
+    lpt2_fd_z(L, u_pad.data(), h, order, f_pad.data());
+
+    // Extract interior from local-with-halo back into my_f_int.
+    {
+        const int nz_r = local_nz(L);
+        const int kstride = 2*halo_w + nz_r;
+        for( int ii=0; ii<cnx; ++ii )
+            for( int jj=0; jj<cny; ++jj )
+                for( int kl=0; kl<nz_r; ++kl ) {
+                    const std::size_t src = ((std::size_t)ii * (std::size_t)cny + (std::size_t)jj)
+                                          * (std::size_t)kstride + (std::size_t)(halo_w + kl);
+                    const std::size_t dst = ((std::size_t)ii * (std::size_t)cny + (std::size_t)jj)
+                                          * (std::size_t)nz_r + (std::size_t)kl;
+                    my_f_int[dst] = f_pad[src];
+                }
+    }
+
+    std::vector<T> cluster_f_out;
+    if( rk == box_owner ) cluster_f_out.assign(cluster_full_size(L), T(0));
+    gather_to(L, box_owner, my_f_int.data(),
+              rk == box_owner ? cluster_f_out.data() : (T*)nullptr);
+
+    // Box-owner: write FULL MeshvarBnd interior (cluster cell (ix+r,iy+r,iz+r)).
+    if( rk == box_owner ) {
+        for( int ix=0; ix<nx; ++ix )
+            for( int iy=0; iy<ny; ++iy )
+                for( int iz=0; iz<nz; ++iz ) {
+                    const std::size_t idx = ((std::size_t)(ix+r) * (std::size_t)cny + (std::size_t)(iy+r))
+                                          * (std::size_t)cnz + (std::size_t)(iz+r);
+                    (*fout)(ix, iy, iz) = cluster_f_out[idx];
+                }
+    }
+    return true;
+}
+
+} // anonymous namespace
+
+bool lpt2_fd_meshvarbnd_double(int box_owner, const MeshvarBnd<double>* u,
+                               MeshvarBnd<double>* fout, double h, unsigned order,
+                               MPI_Comm sub_comm)
+{ return lpt2_fd_meshvarbnd_impl<double>(box_owner, u, fout, h, order, sub_comm); }
+
+bool lpt2_fd_meshvarbnd_float (int box_owner, const MeshvarBnd<float>* u,
+                               MeshvarBnd<float>* fout, float h, unsigned order,
+                               MPI_Comm sub_comm)
+{ return lpt2_fd_meshvarbnd_impl<float>(box_owner, u, fout, h, order, sub_comm); }
+
+// ---------------------------------------------------------------------------
+// Task #135 smoke test: lpt2_fd_meshvarbnd world z-split vs self-comm reference.
+//
+// Both runs use the SAME slab kernel (lpt2_fd_meshvarbnd_impl). The reference
+// runs it on MPI_COMM_SELF (single z-slab, no split); the test runs it on the
+// world sub_comm (real z-split + halo exchange). Since the 2LPT-FD source is a
+// per-cell stencil with no cross-rank reduction, the only difference is the
+// z-decomposition itself, which must be exactly bit-identical. Any nonzero diff
+// is a real bug (not cross-TU FMA contraction noise).
+// ---------------------------------------------------------------------------
+bool smoke_test_lpt2_meshvarbnd(unsigned order)
+{
+    int wr = 0, ws = 1;
+#ifdef USE_MPI
+    MPI_Comm sub = MUSIC::mpi::world();
+    MPI_Comm_rank(sub, &wr);
+    MPI_Comm_size(sub, &ws);
+#else
+    MPI_Comm sub = 0;
+#endif
+    const int r = (order == 2) ? 2 : 4;
+    const int nx = (order == 2) ? 12 : 16;
+    const int ny = nx;
+    int nz = 32;
+    // Ensure halo_w = r fits the split.
+    while( (nz + 2*r) / std::max(1, ws) < r ) nz += 2*ws;
+
+    LOGINFO("Task #135 smoke (lpt2_meshvarbnd): order=%u r=%d cluster=%dx%dx%d sub_size=%d",
+            order, r, nx, ny, nz, ws);
+
+    std::unique_ptr< MeshvarBnd<double> > u, f_ref, f_test;
+    if( wr == 0 ) {
+        u    .reset(new MeshvarBnd<double>(r, nx, ny, nz));
+        f_ref.reset(new MeshvarBnd<double>(r, nx, ny, nz));
+        f_test.reset(new MeshvarBnd<double>(r, nx, ny, nz));
+        // Deterministic smooth field over interior + r-cell boundary perimeter.
+        auto uval = [](int i, int j, int k) -> double {
+            return 0.017*(i+1) + 0.031*(j+1) + 0.043*(k+1)
+                 + std::sin(0.13*i + 0.21*j + 0.29*k)
+                 + std::cos(0.07*i - 0.11*j + 0.17*k);
+        };
+        for( int i=-r; i<nx+r; ++i )
+            for( int j=-r; j<ny+r; ++j )
+                for( int k=-r; k<nz+r; ++k )
+                    (*u)(i,j,k) = uval(i,j,k);
+        f_ref->zero();
+        f_test->zero();
+        // Reference = SAME slab kernel on a self-comm (single z-slab, no split).
+        // Comparing against the distributed-world run isolates the z-split alone,
+        // so any nonzero diff is a real bug (not cross-TU FMA contraction noise).
+        lpt2_fd_meshvarbnd_double(0, u.get(), f_ref.get(), 2.0, order, MPI_COMM_SELF);
+    }
+
+    const bool ran = lpt2_fd_meshvarbnd_double(
+        /*box_owner=*/0,
+        wr == 0 ? u.get()     : (const MeshvarBnd<double>*)nullptr,
+        wr == 0 ? f_test.get(): (MeshvarBnd<double>*)nullptr,
+        2.0, order, sub);
+
+    bool ok = true;
+    if( wr == 0 ) {
+        if( !ran ) {
+            LOGINFO("Task #135 smoke (lpt2_meshvarbnd): bridge skipped "
+                    "(sub_size==1 or split too fine); nothing to compare.");
+        } else {
+            double max_abs = 0.0; std::size_t diff = 0;
+            for( int i=0; i<nx; ++i )
+                for( int j=0; j<ny; ++j )
+                    for( int k=0; k<nz; ++k ) {
+                        const double e = std::fabs((*f_ref)(i,j,k) - (*f_test)(i,j,k));
+                        if( e > max_abs ) max_abs = e;
+                        if( e != 0.0 ) ++diff;
+                    }
+            ok = (max_abs == 0.0);
+            if( ok )
+                LOGINFO("Task #135 smoke (lpt2_meshvarbnd): PASSED order=%u "
+                        "(world z-split bit-identical to self-comm slab kernel)", order);
+            else
+                LOGERR("Task #135 smoke (lpt2_meshvarbnd): FAILED order=%u "
+                       "max|d|=%.6e nonzero=%zu", order, max_abs, diff);
+        }
+    }
+#ifdef USE_MPI
+    int ok_int = ok ? 1 : 0;
+    MPI_Bcast(&ok_int, 1, MPI_INT, 0, sub);
+    ok = (ok_int != 0);
+    MPI_Barrier(sub);
+#endif
+    return ok;
+}
 
 // ---------------------------------------------------------------------------
 // Phase G.4 smoke test.

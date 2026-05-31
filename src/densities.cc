@@ -16,6 +16,7 @@
 #include "densities.hh"
 #include "convolution_kernel.hh"
 #include "mpi_helper.hh"
+#include "mpi_poisson.hh"
 #include "mesh_distributed.hh"
 #include "zoom_slab.hh"
 
@@ -751,6 +752,246 @@ void fft_interpolate_dist(m1 *V, m2 *v, bool from_basegrid = false)
 }
 #endif // USE_MPI
 
+#ifdef USE_MPI
+//---------------------------------------------------------------------
+// H.4 C.4: slab-parent variant of fft_interpolate_dist. Replaces the
+// rank-0-only coarse pack (which would otherwise require gather_union_
+// to_root + a full nxF^3 tenant on rank-0) with a collective sub-region
+// gather (GridHierarchy::gather_subregion_with_wrap). Rank-0 never
+// materializes the full union; the gather hands rank-0 just the nxc^3
+// window the coarse FFT needs.
+//
+// Semantics: bit-identical to fft_interpolate_dist(V_full, v, ...)
+// where V_full would have been the gather_union_to_root result.
+// (Same wrap/pack pattern; same Bcast + FFTs + blend + Scatterv/Gatherv.)
+//---------------------------------------------------------------------
+template <typename gh_t, typename m2>
+void fft_interpolate_dist_slab_parent(gh_t* gh, unsigned parent_level,
+                                       m2* v, bool from_basegrid = false)
+{
+	if (MUSIC::mpi::size() == 1) {
+		// Serial fallback: parent slab == full union on a single rank.
+		typedef typename gh_t::real_t T;
+		MeshvarBnd<T>* V = gh->get_grid(parent_level);
+		fft_interpolate(*V, *v, from_basegrid);
+		return;
+	}
+	const int rk = MUSIC::mpi::rank();
+	const int sz = MUSIC::mpi::size();
+	const bool is_root = (rk == 0);
+
+	// -- Broadcast geometry --
+	int dims[9] = {0};
+	if (is_root) {
+		dims[0] = (int)v->size(0);
+		dims[1] = (int)v->size(1);
+		dims[2] = (int)v->size(2);
+		dims[3] = (int)gh->union_global_size(parent_level, 0);
+		dims[4] = (int)gh->union_global_size(parent_level, 1);
+		dims[5] = (int)gh->union_global_size(parent_level, 2);
+		int oxf = v->offset(0), oyf = v->offset(1), ozf = v->offset(2);
+		if (!from_basegrid) {
+#ifdef NO_COARSE_OVERLAP
+			oxf += dims[3] / 4;
+			oyf += dims[4] / 4;
+			ozf += dims[5] / 4;
+#else
+			oxf += dims[3] / 4 - dims[0] / 8;
+			oyf += dims[4] / 4 - dims[1] / 8;
+			ozf += dims[5] / 4 - dims[2] / 8;
+		} else {
+			oxf -= dims[0] / 8;
+			oyf -= dims[1] / 8;
+			ozf -= dims[2] / 8;
+#endif
+		}
+		dims[6] = oxf; dims[7] = oyf; dims[8] = ozf;
+	}
+	MPI_Bcast(dims, 9, MPI_INT, 0, MUSIC::mpi::world());
+
+	const size_t nxf = (size_t)dims[0];
+	const size_t nyf = (size_t)dims[1];
+	const size_t nzf = (size_t)dims[2];
+	const size_t nxF = (size_t)dims[3];
+	const size_t nyF = (size_t)dims[4];
+	const size_t nzF = (size_t)dims[5];
+	const int    oxf = dims[6], oyf = dims[7], ozf = dims[8];
+	const size_t nzfp = nzf + 2;
+
+	assert(nxf % 2 == 0 && nyf % 2 == 0 && nzf % 2 == 0);
+	const size_t nxc = nxf / 2, nyc = nyf / 2, nzc = nzf / 2, nzcp = nzc + 2;
+	(void)nxF; (void)nyF; (void)nzF;
+
+	LOGUSER("FFT interpolate (slab-parent SPMD): offset=%d,%d,%d size=%zu,%zu,%zu",
+	        oxf, oyf, ozf, nxf, nyf, nzf);
+
+	MPI_Datatype mpi_real = (sizeof(real_t) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	// -- Coarse path: collective sub-region gather, then Bcast + local r2c --
+	fftw_real *rcoarse = new fftw_real[nxc * nyc * nzcp];
+	fftw_complex *ccoarse = reinterpret_cast<fftw_complex *>(rcoarse);
+	std::memset(rcoarse, 0, sizeof(fftw_real) * nxc * nyc * nzcp);
+
+	// Workers pass NULL; rank-0 receives nxc*nyc*nzcp padded buf
+	gh->gather_subregion_with_wrap(parent_level, oxf, oyf, ozf,
+	                                nxc, nyc, nzc,
+	                                is_root ? (real_t*)rcoarse : (real_t*)NULL);
+
+	{
+		size_t total = nxc * nyc * nzcp;
+		size_t plane = nyc * nzcp;
+		if (total <= (size_t)INT_MAX) {
+			MPI_Bcast(rcoarse, (int)total, mpi_real, 0, MUSIC::mpi::world());
+		} else {
+			if (plane > (size_t)INT_MAX)
+				throw std::runtime_error("fft_interpolate_dist_slab_parent: coarse plane exceeds INT_MAX");
+			MPI_Datatype dt;
+			MPI_Type_contiguous((int)plane, mpi_real, &dt);
+			MPI_Type_commit(&dt);
+			MPI_Bcast(rcoarse, (int)nxc, dt, 0, MUSIC::mpi::world());
+			MPI_Type_free(&dt);
+		}
+	}
+
+#ifdef SINGLE_PRECISION
+	fftwf_plan pc = fftwf_plan_dft_r2c_3d((int)nxc, (int)nyc, (int)nzc, rcoarse, ccoarse, FFTW_ESTIMATE);
+	fftwf_execute(pc);
+	fftwf_destroy_plan(pc);
+#else
+	fftw_plan pc = fftw_plan_dft_r2c_3d((int)nxc, (int)nyc, (int)nzc, rcoarse, ccoarse, FFTW_ESTIMATE);
+	fftw_execute(pc);
+	fftw_destroy_plan(pc);
+#endif
+
+	// -- Fine path (distributed): allocate slab, scatter from rank 0 --
+	Meshvar<real_t> *slab = MUSIC::dist::make_slab_meshvar<real_t>(
+	    nxf, nyf, nzf, /*fftw_inplace_pad=*/true);
+	const size_t local_nx      = slab->local_nx();
+	const size_t local_x_start = slab->local_x_start();
+	const size_t plane_fine    = nyf * nzfp;
+	if (plane_fine > (size_t)INT_MAX) {
+		throw std::runtime_error("fft_interpolate_dist_slab_parent: fine y-z plane exceeds INT_MAX");
+	}
+	MPI_Datatype dtype_plane_fine;
+	MPI_Type_contiguous((int)plane_fine, mpi_real, &dtype_plane_fine);
+	MPI_Type_commit(&dtype_plane_fine);
+
+	std::vector<int> counts(sz), displs(sz);
+	int my_count = (int)local_nx;
+	MPI_Allgather(&my_count, 1, MPI_INT, counts.data(), 1, MPI_INT, MUSIC::mpi::world());
+	displs[0] = 0;
+	for (int i = 1; i < sz; ++i) displs[i] = displs[i - 1] + counts[i - 1];
+
+	real_t *fine_root = NULL;
+	if (is_root) {
+		fine_root = new real_t[nxf * nyf * nzfp];
+#pragma omp parallel for
+		for (int i = 0; i < (int)nxf; ++i)
+			for (int j = 0; j < (int)nyf; ++j)
+				for (int k = 0; k < (int)nzf; ++k) {
+					size_t q = ((size_t)i * nyf + (size_t)j) * nzfp + (size_t)k;
+					fine_root[q] = (*v)(i, j, k);
+				}
+	}
+
+	MPI_Scatterv(is_root ? fine_root : (real_t *)NULL,
+	             counts.data(), displs.data(), dtype_plane_fine,
+	             slab->m_pdata, my_count, dtype_plane_fine,
+	             0, MUSIC::mpi::world());
+
+	fftw_complex *cslab = reinterpret_cast<fftw_complex *>(slab->m_pdata);
+
+#ifdef SINGLE_PRECISION
+	fftwf_plan p_fwd = fftwf_mpi_plan_dft_r2c_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    slab->m_pdata, cslab, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftwf_plan p_inv = fftwf_mpi_plan_dft_c2r_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    cslab, slab->m_pdata, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftwf_execute(p_fwd);
+#else
+	fftw_plan p_fwd = fftw_mpi_plan_dft_r2c_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    slab->m_pdata, cslab, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftw_plan p_inv = fftw_mpi_plan_dft_c2r_3d(
+	    (ptrdiff_t)nxf, (ptrdiff_t)nyf, (ptrdiff_t)nzf,
+	    cslab, slab->m_pdata, MUSIC::mpi::world(), FFTW_ESTIMATE);
+	fftw_execute(p_fwd);
+#endif
+
+	// -- K-space blend (identical to fft_interpolate_dist) --
+	const double fftnorm = 1.0 / ((double)nxf * (double)nyf * (double)nzf);
+	const double sqrt8 = 8.0;
+	const double phasefac = -0.5;
+
+	for (int i = 0; i < (int)nxc; ++i) {
+		int ii = i;
+		if (i > (int)nxc / 2) ii += (int)nxf / 2;
+		if ((size_t)ii < local_x_start || (size_t)ii >= local_x_start + local_nx) continue;
+		const size_t ii_local = (size_t)ii - local_x_start;
+
+#pragma omp parallel for
+		for (int j = 0; j < (int)nyc; ++j) {
+			for (int k = 0; k < (int)nzc / 2 + 1; ++k) {
+				int jj = j, kk = k;
+				if (j > (int)nyc / 2) jj += (int)nyf / 2;
+				if (k > (int)nzc / 2) kk += (int)nzf / 2;
+
+				size_t qc = ((size_t)i * nyc + (size_t)j) * (nzc / 2 + 1) + (size_t)k;
+				size_t qf = (ii_local * nyf + (size_t)jj) * (nzf / 2 + 1) + (size_t)kk;
+
+				double kx = (i <= (int)nxc / 2) ? (double)i : (double)(i - (int)nxc);
+				double ky = (j <= (int)nyc / 2) ? (double)j : (double)(j - (int)nyc);
+				double kz = (k <= (int)nzc / 2) ? (double)k : (double)(k - (int)nzc);
+
+				double phase = phasefac * (kx / (double)nxc + ky / (double)nyc + kz / (double)nzc) * M_PI;
+				std::complex<double> val_phas(cos(phase), sin(phase));
+
+				std::complex<double> val(RE(ccoarse[qc]), IM(ccoarse[qc]));
+				val *= sqrt8 * val_phas;
+
+				double blend_coarse = Blend_Function(sqrt(kx * kx + ky * ky + kz * kz), nxc / 2);
+				double blend_fine = 1.0 - blend_coarse;
+
+				RE(cslab[qf]) = blend_fine * RE(cslab[qf]) + blend_coarse * val.real();
+				IM(cslab[qf]) = blend_fine * IM(cslab[qf]) + blend_coarse * val.imag();
+			}
+		}
+	}
+
+	delete[] rcoarse;
+
+#ifdef SINGLE_PRECISION
+	fftwf_execute(p_inv);
+	fftwf_destroy_plan(p_fwd);
+	fftwf_destroy_plan(p_inv);
+#else
+	fftw_execute(p_inv);
+	fftw_destroy_plan(p_fwd);
+	fftw_destroy_plan(p_inv);
+#endif
+
+	MPI_Gatherv(slab->m_pdata, my_count, dtype_plane_fine,
+	            is_root ? fine_root : (real_t *)NULL,
+	            counts.data(), displs.data(), dtype_plane_fine,
+	            0, MUSIC::mpi::world());
+
+	MPI_Type_free(&dtype_plane_fine);
+	delete slab;
+
+	if (is_root) {
+#pragma omp parallel for
+		for (int i = 0; i < (int)nxf; ++i)
+			for (int j = 0; j < (int)nyf; ++j)
+				for (int k = 0; k < (int)nzf; ++k) {
+					size_t q = ((size_t)i * nyf + (size_t)j) * nzfp + (size_t)k;
+					(*v)(i, j, k) = fine_root[q] * fftnorm;
+				}
+		delete[] fine_root;
+	}
+}
+#endif // USE_MPI
+
 /*******************************************************************************************/
 //
 // Phase H.3a: SPMD/MPI-distributed variant of fft_coarsen.
@@ -1324,6 +1565,13 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 		cf.getValueSafe<bool>("setup", "zoom_slab_spmd_multigrid", false);
 	const bool need_union_skel = MUSIC::mpi::is_root() || spmd_mg_skel;
 
+	// H.4 C.3: opt-in flag must be visible to the post-refinement-loop sync
+	// section below (outside the kspaceTF branch), so hoist it here.
+	const bool h4_slab_sync_fn = (MUSIC::mpi::size() > 1)
+	    && cf.getValueSafe<bool>("setup", "slab_levelmin_density", false)
+	    && (levelmin < levelmax)
+	    && cf.getValueSafe<bool>("setup", "h4_slab_sync", false);
+
 	// Load-balance instrumentation: per-level wall time split into rank-0
 	// serial (pre/post; workers idle in worker_pump) vs SPMD (conv/interp).
 	// slot 0 = levelmin, slot i = levelmin+i.
@@ -1390,14 +1638,35 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 
 		const bool is_root = MUSIC::mpi::is_root();
 		// H.4 production wire: opt-in slab storage for the levelmin density.
-		// Scoped to unigrid (levelmin == levelmax) + MPI; on a unigrid run the
-		// refinement loop below does not execute and `top` is never consumed
-		// downstream, so the rank-0 full DensityGrid materialization can be
-		// skipped end-to-end. H.3b (coarsen_density) + H.3c (normalize_density)
-		// are SPMD-safe on slab GH, so production consumers tolerate the flip.
-		const bool h4_slab_active = (levelmin == levelmax)
-		                         && (MUSIC::mpi::size() > 1)
+		// Active whenever np>1 + flag is set. On unigrid (levelmin == levelmax)
+		// the refinement loop below does not execute and `top` is never
+		// consumed downstream, so the rank-0 full DensityGrid materialization
+		// can be skipped end-to-end. On multibox (levelmin < levelmax) the
+		// refinement loop at i==1 needs `top` on rank-0, so C.1 below does a
+		// transient slab→full gather + top alloc after the strip — no memory
+		// win at C.1, but plumbing-verified path for C.2-C.4 follow-ups.
+		// H.3b (coarsen_density) + H.3c (normalize_density) are SPMD-safe on
+		// slab GH, so production consumers tolerate the flip.
+		const bool h4_slab_active = (MUSIC::mpi::size() > 1)
 		                         && cf.getValueSafe<bool>("setup", "slab_levelmin_density", false);
+		// H.4 C.3: opt-in additional switch — keep the levelmin slab alive
+		// across the refinement loop (no transient slab→full gather), and
+		// ship slab cells directly to per-box owners at sync time via
+		// sync_per_box_from_union_slab. fft_interpolate_dist at i==1 still
+		// needs a rank-0 full union; we get one via gather_union_to_root
+		// just for that single call and release immediately. Net effect:
+		// rank-0 stops holding the full nbase³ MeshvarBnd through the
+		// rest of the refinement loop and sync; saves ~30GB rank-0 RSS
+		// at L=10 1968³ single (data redistributes to ~7.5GB/rank @ np=4).
+		const bool h4_slab_sync = h4_slab_active && (levelmin < levelmax)
+		                       && cf.getValueSafe<bool>("setup", "h4_slab_sync", false);
+		// H.4 C.4: opt-in slab-aware refinement loop. Replaces the C.3
+		// gather_union_to_root(levelmin)→fft_interpolate_dist→release
+		// pattern with a sub-region gather. Eliminates the rank-0
+		// nbase³ tenant during the i==1 interp call (the last
+		// rank-0-only full-union materialization in the H.4 path).
+		const bool h4_slab_sync_v2 = h4_slab_sync
+		                       && cf.getValueSafe<bool>("setup", "h4_slab_sync_v2", false);
 		Meshvar<real_t>* slab_keep = NULL;
 		double __t_lvl = omp_get_wtime();
 #ifdef USE_MPI
@@ -1471,6 +1740,45 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 				delta.create_base_hierarchy(levelmin);
 			if (is_root)
 				top->copy(*delta.get_grid(levelmin));
+		}
+
+		// H.4 C.2-alt multibox scaffolding: the refinement loop below calls
+		// fft_interpolate_dist(top, fine, true) at i==1, which reads its V
+		// param on rank-0 only (workers pass NULL). C.2-alt skips the
+		// redundant `top = new DensityGrid` + cell-by-cell copy by passing
+		// delta.get_grid(levelmin) directly as V — both DensityGrid and
+		// MeshvarBnd implement size()/operator()(int,int,int). The
+		// slab→full gather is still needed (rank-0 reads the full union via
+		// wrap(...)); the saving is one nbase³ allocation (~30 GB at L=10
+		// 1968³ single, ~60 GB double). Workers shed their phantom
+		// 0..levelmin-1 zero-init meshes (created by
+		// create_base_hierarchy_slab) so their delta state matches the
+		// non-H.4 multibox path (empty m_pgrids on workers without
+		// spmd_mg_skel). Real per-rank peak reduction comes from C.4 slab-
+		// aware refinement.
+		if (h4_slab_active && levelmin < levelmax) {
+			if (h4_slab_sync) {
+				if (h4_slab_sync_v2)
+					LOGINFO("H.4 C.4: slab-aware refinement (sub-region gather for i==1 fft_interpolate)");
+				LOGINFO("H.4 C.3: keep slab on every rank (SPMD slab->per-box sync at end)");
+				// No convert. Workers keep slab + their phantom 0..levelmin-1
+				// meshes; downstream consumers tolerate this because
+				// normalize_density/coarsen_density already gate on
+				// is_level_slab(levelmin), and need_union_skel guards rank-0
+				// add_patch/copy_unpad/etc. The refinement loop's i==1
+				// fft_interpolate_dist gathers via gather_union_to_root +
+				// release_union_root_tenant just for that single call.
+			} else {
+				LOGINFO("H.4 C.2-alt: multibox transient slab->full gather (no top alloc)");
+				// When spmd_mg_skel is on, workers must hold a full union mesh at
+				// levelmin so broadcast_union_mesh_from_owner / single-box-parent
+				// recurse can read m_pgrids[levelmin] without NULL deref.
+				delta.convert_level_slab_to_full((unsigned)levelmin,
+				                                  /*keep_workers_full=*/spmd_mg_skel);
+				if (!is_root && !spmd_mg_skel) {
+					delta.deallocate();
+				}
+			}
 		}
 		prof_post[0] += omp_get_wtime() - __t_lvl;
 
@@ -1589,10 +1897,38 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 			// FFT across ranks via FFTW3-MPI, and writes the result back into
 			// *fine on rank 0.
 			__t_ph = omp_get_wtime();
-			if (i == 1)
-				fft_interpolate_dist(top, fine, true);
-			else
+			if (i == 1) {
+				// H.4 C.2-alt: pass delta.get_grid(levelmin) directly as V
+				// when slab path is active; top is NULL on this branch.
+				// fft_interpolate_dist only reads V on rank-0; workers pass
+				// NULL. delta on workers may be deallocated (m_pgrids empty),
+				// so guard get_grid() behind is_root.
+				if (h4_slab_active) {
+					if (h4_slab_sync_v2) {
+						// H.4 C.4: slab-aware refinement. The new sibling
+						// pulls only the (nxc×nyc×nzc) coarse-pack window
+						// via gather_subregion_with_wrap instead of
+						// materializing the full nbase³ on rank-0. No
+						// transient tenant; slab stays in place.
+						fft_interpolate_dist_slab_parent(&delta, (unsigned)levelmin, fine, true);
+					} else {
+						// H.4 C.3: when keeping the slab, transient gather→
+						// rank-0 tenant full just for this call (workers' slab
+						// untouched; rank-0's slab pointer parked in
+						// m_level_slab_backup_). release_union_root_tenant
+						// frees the tenant and restores slab on rank-0.
+						if (h4_slab_sync) delta.gather_union_to_root((unsigned)levelmin);
+						MeshvarBnd<real_t>* V_slab = is_root ? delta.get_grid(levelmin)
+						                                     : (MeshvarBnd<real_t>*)NULL;
+						fft_interpolate_dist(V_slab, fine, true);
+						if (h4_slab_sync) delta.release_union_root_tenant((unsigned)levelmin);
+					}
+				} else {
+					fft_interpolate_dist(top, fine, true);
+				}
+			} else {
 				fft_interpolate_dist(coarse, fine, false);
+			}
 			prof_interp[i] += omp_get_wtime() - __t_ph;
 
 			__t_ph = omp_get_wtime();
@@ -1614,10 +1950,13 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 				fine->copy_unpad(*delta.get_grid(levelmin + i));
 				prof_post_copy[i] += omp_get_wtime() - __t_sub;
 
-				if (i == 1)
-					delete top;
-				else
+				if (i == 1) {
+					// H.4 C.2-alt: top is NULL on slab path (we passed
+					// delta.get_grid(levelmin) as V instead). Guard delete.
+					if (top) delete top;
+				} else {
 					delete coarse;
+				}
 
 				coarse = fine;
 				if (dens_omp_boost > dens_omp_saved)
@@ -1996,6 +2335,35 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 	// and scatter helpers are no-ops (every box is already on rank 0).
 	double __t_tail = omp_get_wtime();
 	delta.populate_per_box_meshes(refh.get_level_boxes());
+	// H.4 C.3: when the levelmin slab was kept (no transient slab→full
+	// gather), ship slab cells directly to per-box owners here. This is
+	// collective; alloc_root_tenants + sync_per_box_from_union below skip
+	// slab levels via is_level_slab guards in mesh.hh.
+	if (h4_slab_sync_fn) {
+		LOGINFO("H.4 C.3: SPMD slab->per-box sync at L=%u", (unsigned)levelmin);
+		delta.sync_per_box_from_union_slab((unsigned)levelmin);
+		// Restore downstream-compatible state: rank-0 holds full union at
+		// levelmin (Poisson solver + output plugin both expect that layout).
+		// Workers' slab is replaced with NULL (cf. convert_level_slab_to_full).
+		// The C.3 saving stands: the levelmin slab was alive on every rank
+		// across the entire refinement loop, only being collapsed back here
+		// at the very end. Worker per-box meshes at multibox levels survive
+		// because convert_level_slab_to_full only touches L=levelmin.
+		LOGINFO("H.4 C.3: post-sync slab->full at L=%u (restore downstream layout)", (unsigned)levelmin);
+		// Mirror C.2-alt: keep workers' union mesh allocated under spmd_mg_skel so
+		// downstream SPMD-MG primitives do not see m_pgrids[levelmin] NULL.
+		delta.convert_level_slab_to_full((unsigned)levelmin,
+		                                  /*keep_workers_full=*/spmd_mg_skel);
+		// Workers shed phantom 0..levelmin-1 meshes left behind by
+		// create_base_hierarchy_slab so their m_pgrids matches the empty
+		// shell that downstream code (copy ctor at main.cc:1417, MG solver)
+		// expects on non-root ranks under multibox. C.2-alt achieves this
+		// via delta.deallocate() but that also drops per-box meshes, so
+		// C.3 uses the surgical helper that preserves m_pgrids_per_box_.
+		if (!MUSIC::mpi::is_root() && !spmd_mg_skel) {
+			delta.shed_levelmin_union_skeleton((unsigned)levelmin);
+		}
+	}
 	if( MUSIC::mpi::is_root() ){
 		delta.alloc_root_tenants();
 		delta.sync_per_box_from_union();
@@ -2047,6 +2415,22 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 
 	LOGUSER("Finished computing the density field in %fs", tend - tstart);
 
+	// Per-rank profile gather (must be collective — every rank participates).
+	// pre/post run rank-0-only inside if(is_root) blocks, but workers' prof_pre/
+	// prof_post measure their idle barrier wait inside worker_pump for that
+	// span — equal-across-ranks values therefore signal "rank-0 serial here,
+	// workers blocked" (the parallelism hole). conv/interp are real SPMD; large
+	// max/min imbalance there signals load skew.
+#ifdef USE_MPI
+	std::vector<double> per_rank_pre, per_rank_conv, per_rank_interp, per_rank_post;
+	if (MUSIC::mpi::size() > 1 && kspaceTF) {
+		per_rank_pre    = MUSIC::mpi::gather_vec_to_root(prof_pre);
+		per_rank_conv   = MUSIC::mpi::gather_vec_to_root(prof_conv);
+		per_rank_interp = MUSIC::mpi::gather_vec_to_root(prof_interp);
+		per_rank_post   = MUSIC::mpi::gather_vec_to_root(prof_post);
+	}
+#endif
+
 	// Load-balance profile dump (rank 0 only). pre/post are rank-0 serial
 	// blocks (workers idle in worker_pump); conv/interp are SPMD.
 	if (MUSIC::mpi::is_root() && kspaceTF) {
@@ -2084,6 +2468,29 @@ void GenerateDensityHierarchy(config_file &cf, transfer_function *ptf, tf_type t
 		}
 		LOGINFO("density-profile  SUM   %9.4f %9.4f %9.4f %9.4f",
 		        s_pre_alloc, s_pre_load, s_post_addpatch, s_post_copy);
+
+#ifdef USE_MPI
+		// Per-rank breakdown: max/min/imbalance signals parallelism weakness.
+		// Equal-across-ranks pre/post = rank-0 serial section (workers idle).
+		// max/min skew on conv/interp = SPMD load imbalance.
+		const int np = MUSIC::mpi::size();
+		if (np > 1 && !per_rank_conv.empty()) {
+			LOGINFO("density-profile per-rank breakdown (np=%d):", np);
+			for (int slot = 0; slot < prof_nlev; ++slot) {
+				std::vector<double> v(np);
+				#define _DUMP(NAME, SRC) \
+					for (int r = 0; r < np; ++r) v[r] = SRC[(size_t)r*prof_nlev + slot]; \
+					LOGINFO("density-profile  L=%3u %-6s %s", \
+					        (unsigned)(levelmin + slot), NAME, \
+					        MUSIC::mpi::format_per_rank(v, "%.3f").c_str());
+				_DUMP("pre",    per_rank_pre);
+				_DUMP("conv",   per_rank_conv);
+				_DUMP("interp", per_rank_interp);
+				_DUMP("post",   per_rank_post);
+				#undef _DUMP
+			}
+		}
+#endif
 	}
 }
 
@@ -2111,7 +2518,13 @@ void normalize_density(grid_hierarchy &delta)
 	const bool is_root = MUSIC::mpi::is_root();
 #ifdef USE_MPI
 	const int sz = MUSIC::mpi::size();
-	if (sz > 1) {
+	// H.3c-fix: like coarsen_density, the SPMD slab_mode bcast must only fire
+	// when called collectively. Inside a wpd lambda body workers are parked in
+	// worker_pump and would interpret our 1-int bcast as garbage META bits.
+	// phase_scope_active() is true on rank-0 in that case → fall through to
+	// the serial path below (gather_per_box_to_root in wpd has already put
+	// the full hierarchy on rank-0, so the serial loop is correct).
+	if (sz > 1 && !MUSIC::poisson::phase_scope_active()) {
 		// Workers may carry an empty GH; consult rank 0 for slab status.
 		int slab_mode = 0;
 		if (is_root) {
@@ -2266,7 +2679,15 @@ void coarsen_density(const refinement_hierarchy &rh, GridHierarchy<real_t> &u, b
 	if (kspace)
 	{
 #ifdef USE_MPI
-		if (MUSIC::mpi::size() > 1) {
+		// H.3b-fix: route to the SPMD fft_coarsen_dist only when called
+		// collectively (DM site, lifted out of wpd). When invoked inside a
+		// wpd lambda body (baryon site + ~10 others), workers are parked in
+		// worker_pump expecting META_LEN-int op dispatches; an unsolicited
+		// 2-int MPI_Bcast here triggers count-mismatch undefined behavior on
+		// the workers. phase_scope_active() returns true on rank-0 in that
+		// case, so we fall back to the rank-0 serial fft_coarsen (workers do
+		// not enter this function — they're in the pump).
+		if (MUSIC::mpi::size() > 1 && !MUSIC::poisson::phase_scope_active()) {
 			// Workers may not hold the GH skeleton (callers that wrap
 			// GenerateDensityHierarchy rank-0-only leave workers with empty
 			// m_pgrids). Bcast loop bounds from rank 0 so workers participate
@@ -2282,7 +2703,7 @@ void coarsen_density(const refinement_hierarchy &rh, GridHierarchy<real_t> &u, b
 				MeshvarBnd<real_t> *dst = is_root ? u.get_grid(i - 1) : (MeshvarBnd<real_t> *)NULL;
 				fft_coarsen_dist(src, dst);
 			}
-		} else {
+		} else if (is_root) {
 			const unsigned levelmin_TF = u.levelmin();
 			for (int i = (int)levelmin_TF; i >= (int)rh.levelmin(); --i)
 				fft_coarsen(*(u.get_grid(i)), *(u.get_grid(i - 1)));

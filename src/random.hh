@@ -20,10 +20,13 @@
 
 #include <fstream>
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <map>
 #include <stdexcept>
+#include <unistd.h>
 #include <vector>
 #include <sys/types.h>
 #include <omp.h>
@@ -287,6 +290,26 @@ public:
 	double fill_subvolume_x_slab( int *i0, int *n,
 	                              unsigned cube_x0_abs, unsigned cube_nx_local );
 
+	//! R.1: Pack a subvolume [abs_x0..abs_x0+lx) × [abs_y0..+ly) × [abs_z0..+lz)
+	//! of the random-number field into a dense buffer `dst` laid out as
+	//! `dst[(ix * y_pitch + iy) * z_pitch + iz]`. Iterates by cubes (outer) to
+	//! amortize the per-cell `cubemap_.find` lookup. Templated on the buffer
+	//! element type `B` so we can write into fftw_real buffers even when
+	//! `T != fftw_real` (implicit T→B conversion per cell, matching the
+	//! original `dst[q] = (*this)(...)` semantics). All cubes intersecting the
+	//! range must already be registered and allocated.
+	template <typename B>
+	void pack_subvolume_to_buffer( int abs_x0, int abs_y0, int abs_z0,
+	                               int lx, int ly, int lz,
+	                               B *dst, size_t y_pitch, size_t z_pitch );
+
+	//! R.1: Inverse of pack_subvolume_to_buffer — writes `src` cells back into
+	//! the random-number field. Same layout convention for `src`.
+	template <typename B>
+	void unpack_subvolume_from_buffer( int abs_x0, int abs_y0, int abs_z0,
+	                                   int lx, int ly, int lz,
+	                                   const B *src, size_t y_pitch, size_t z_pitch );
+
 	//! free all cubes
 	void free_all_mem( void )
 	{
@@ -487,20 +510,60 @@ public:
 			      throw std::runtime_error("White noise file is not aligned with array. This is an internal inconsistency and bad.");
 			    }
 			}else{
-			
-			  for( int i=0; i<nx; ++i )
-			    {
-			      std::vector<T> slice( ny*nz, 0.0 );
-			      ifs.read( reinterpret_cast<char*> ( &slice[0] ), ny*nz*sizeof(T) );
-			      
-                              #pragma omp parallel for
-			      for( int j=0; j<ny; ++j )
-				for( int k=0; k<nz; ++k )
-				  A(i,j,k) = slice[j*nz+k];
-			      
-			    }		
-			  
-			  ifs.close();	
+			  // R.3: chunked pread + reusable buffer. Replaces per-plane
+			  // ifstream::read (1968 syscalls + 1968 vector allocations at
+			  // L=10) with one pread per ~256 MiB chunk and a single buffer.
+			  // OMP-parallel copy with collapse(2) over (di, j) gives better
+			  // load balance than the original per-plane (j) parallel section
+			  // when chunk_planes is small (e.g. 8 planes × 1968 rows / 16
+			  // threads → ~984 rows/thread vs the original 1968/16 = 123).
+			  ifs.close();
+			  int fd = ::open( fname, O_RDONLY );
+			  if( fd < 0 ){
+			    LOGERR("White noise file '%s' reopen failed (errno=%d)", fname, errno);
+			    throw std::runtime_error("Wnoise file reopen failed");
+			  }
+			  const off_t header_bytes = (off_t)(3 * sizeof(int));
+			  const size_t plane_cells = (size_t)ny * (size_t)nz;
+			  const size_t plane_bytes = plane_cells * sizeof(T);
+			  const size_t chunk_bytes_target = (size_t)256 << 20;
+			  size_t chunk_planes = chunk_bytes_target / std::max<size_t>(plane_bytes, (size_t)1);
+			  if( chunk_planes == 0 ) chunk_planes = 1;
+			  if( chunk_planes > (size_t)nx ) chunk_planes = (size_t)nx;
+			  std::vector<T> buf( chunk_planes * plane_cells );
+			  int i_start = 0;
+			  while( i_start < nx ){
+			    const int n_this = std::min( (int)chunk_planes, nx - i_start );
+			    size_t left = (size_t)n_this * plane_bytes;
+			    off_t off = header_bytes + (off_t)i_start * (off_t)plane_bytes;
+			    char* dst = reinterpret_cast<char*>(&buf[0]);
+			    while( left > 0 ){
+			      ssize_t r = ::pread( fd, dst, left, off );
+			      if( r < 0 ){
+			        if( errno == EINTR ) continue;
+			        LOGERR("White noise file '%s' pread failed (errno=%d)", fname, errno);
+			        ::close(fd);
+			        throw std::runtime_error("Wnoise pread failed");
+			      }
+			      if( r == 0 ){
+			        LOGERR("White noise file '%s' short read at i_start=%d", fname, i_start);
+			        ::close(fd);
+			        throw std::runtime_error("Wnoise short read");
+			      }
+			      dst += r; off += r; left -= (size_t)r;
+			    }
+                            #pragma omp parallel for collapse(2)
+			    for( int di = 0; di < n_this; ++di ){
+			      for( int j = 0; j < ny; ++j ){
+			        const T* row = &buf[(size_t)di * plane_cells + (size_t)j * nz];
+			        const int i_abs = i_start + di;
+			        for( int k = 0; k < nz; ++k )
+			          A(i_abs, j, k) = row[k];
+			      }
+			    }
+			    i_start += n_this;
+			  }
+			  ::close(fd);
 			}
 		}
 		else

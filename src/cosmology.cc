@@ -765,3 +765,218 @@ void compute_2LPT_source( config_file& cf_, const grid_hierarchy& u, grid_hierar
 #undef SQR
 #undef ACC
 
+// ---------------------------------------------------------------------------
+// Task #155: memory-first distributed twin of compute_2LPT_source.
+//
+// Reproduces the three stages of compute_2LPT_source — (1) per-level FD source
+// stencil, (2) cross-level fine->coarse restrict, (3) global-mean subtraction —
+// but each stage runs collectively across ranks operating on the per-box
+// MeshvarBnd hierarchy, so the rank-0 union mesh never has to hold the whole
+// 2LPT source. All ranks MUST call this OUTSIDE phase_scope (the bridges and
+// the parent-consolidation primitives are SPMD/collective).
+//
+// Bit-identical to compute_2LPT_source for the single-box-per-level case
+// (zoom / unigrid), where each per-box mesh IS the union mesh including its
+// ghost perimeter. At np<=1 it delegates straight to the serial function.
+void compute_2LPT_source_distributed( config_file& cf_, const grid_hierarchy& u, grid_hierarchy& fnew, unsigned order )
+{
+#ifdef USE_MPI
+	if( MUSIC::mpi::size() <= 1 ){
+		compute_2LPT_source( cf_, u, fnew, order );
+		return;
+	}
+
+	const double t_lpt2_start = omp_get_wtime();
+	MPI_Comm world = MUSIC::mpi::world();
+	#define L2T(...) do{}while(0)
+
+	// Match the serial seed: fnew = u; fnew.zero(). The copy-assign deep-copies
+	// the per-box structure (owner meshes only), so workers get the per-box
+	// layout they need for the bridges below.
+	fnew = u;
+	fnew.zero();
+
+	// Loop bounds MUST be byte-identical on every rank: the slab bridges and the
+	// parent-consolidation primitives below are collective on `world`, so any
+	// divergence in the level range deadlocks. Worker hierarchies may carry an
+	// empty union m_pgrids (levelmax() == m_pgrids.size()-1 underflows to
+	// UINT_MAX), so broadcast the authoritative structure from rank 0 (the
+	// levelmin box-0 owner under b%nproc) and drive ALL loops from it.
+	unsigned lmin_b = 0, lmax_b = 0;
+	if( MUSIC::mpi::rank()==0 ){ lmin_b = u.levelmin(); lmax_b = u.levelmax(); }
+	MPI_Bcast( &lmin_b, 1, MPI_UNSIGNED, 0, world );
+	MPI_Bcast( &lmax_b, 1, MPI_UNSIGNED, 0, world );
+	std::vector<unsigned long long> nbox( (size_t)lmax_b+1, 1ULL );
+	if( MUSIC::mpi::rank()==0 )
+		for( unsigned L=lmin_b; L<=lmax_b; ++L )
+			nbox[L] = (unsigned long long)u.num_boxes(L);
+	MPI_Bcast( nbox.data(), (int)((size_t)lmax_b+1), MPI_UNSIGNED_LONG_LONG, 0, world );
+
+	// Storage convention (IDENTICAL to twoGrid_multibox_spmd / mg_solver):
+	//   level L is "multi-box" iff num_boxes(L) > 1 -> operate on per-box meshes
+	//   get_grid(L,b); otherwise operate on the single union mesh get_grid(L).
+	// For the zoom / unigrid (single-box-per-level) case this reduces to pure
+	// union, so stages 1-3 below are the SAME data flow as the serial function
+	// with only the FD and restrict COMPUTE distributed across the slab bridges
+	// -> trivially bit-identical.
+
+	// === Stage 1: per-level FD source via the lpt2_fd_meshvarbnd z-slab bridge ===
+	for( unsigned ilevel=lmin_b; ilevel<=lmax_b; ++ilevel )
+	{
+		const double h = pow(2.0,ilevel);
+		const bool   multi = ( nbox[ilevel] > 1ULL );
+		const size_t nb    = multi ? (size_t)nbox[ilevel] : 1;
+		for( size_t b=0; b<nb; ++b )
+		{
+			const int  owner = multi ? u.owner_of_box(ilevel,b)
+			                         : u.owner_of_box(ilevel,0);
+			const bool mine  = ( MUSIC::mpi::rank()==owner );
+			const MeshvarBnd<real_t>* ub = !mine ? (const MeshvarBnd<real_t>*)NULL
+				: ( multi ? u.get_grid(ilevel,b) : u.get_grid(ilevel) );
+			MeshvarBnd<real_t>* fb = !mine ? (MeshvarBnd<real_t>*)NULL
+				: ( multi ? fnew.get_grid(ilevel,b) : fnew.get_grid(ilevel) );
+			L2T("S1 enter ilevel=%u b=%zu owner=%d multi=%d", ilevel, b, owner, (int)multi);
+			const bool did = MUSIC::zoom_slab::lpt2_fd_meshvarbnd(
+				owner, ub, fb, h, order, world );
+			L2T("S1 done  ilevel=%u b=%zu", ilevel, b);
+			if( !did ){
+				// sub_size==1 is impossible here (world size>1); a false return
+				// signals a real geometry violation, not a benign fallback.
+				LOGERR("compute_2LPT_source_distributed: lpt2_fd_meshvarbnd "
+				       "returned false at ilevel=%u box=%zu (np=%d)",
+				       ilevel, b, MUSIC::mpi::size());
+				throw std::runtime_error(
+					"compute_2LPT_source_distributed: FD bridge failed");
+			}
+		}
+	}
+
+	// === Stage 2: restrict fine source into parents (mirrors mg_straight().
+	// restrict over the whole hierarchy). Dual parent-storage convention,
+	// IDENTICAL to twoGrid_multibox_spmd:
+	//   - multi-box parent : restrict into the per-box parent (local OR replica
+	//     from broadcast_parents_to_child_owners), then ship disjoint footprints
+	//     to the parent box owner with overwrite_children_to_parents (OVERWRITE).
+	//   - single-box parent: restrict into the child OWNER's local copy of the
+	//     UNION mesh (get_grid(L-1)); consolidate_child_writes_to_parent_owner
+	//     (P2P, world-collective-neutral) gathers footprints onto parent_owner's
+	//     union. The next (coarser) iteration's restrict reads get_grid(ci-1)
+	//     ONLY on its owner, and for single-box levels that owner is always
+	//     parent_owner==rank 0 (owner_of_box(L,0) = 0 under b%nproc), which
+	//     consolidate already left current -> NO broadcast_union_mesh_from_owner.
+	//     (That primitive early-returns on workers whose union m_pgrids is empty,
+	//     so calling it here would issue 2 Bcasts on rank 0 against 0 on workers
+	//     -> a world-collective desync that corrupts the next solve's op stream.)
+	for( int i=(int)lmax_b; i>(int)lmin_b; --i )
+	{
+		const unsigned ci = (unsigned)i;
+		const bool fine_multi   = ( nbox[ci]   > 1ULL );
+		const bool parent_multi = ( nbox[ci-1] > 1ULL );
+
+		L2T("S2 iter ci=%u fine_multi=%d parent_multi=%d", ci, (int)fine_multi, (int)parent_multi);
+		if( parent_multi )
+			fnew.broadcast_parents_to_child_owners( ci );
+		else
+			fnew.acquire_parent_union_scratch( ci );
+		L2T("S2 post-acquire ci=%u", ci);
+
+		const size_t nb = fine_multi ? (size_t)nbox[ci] : 1;
+		for( size_t b=0; b<nb; ++b )
+		{
+			const int owner = fine_multi ? fnew.owner_of_box( ci, b )
+			                             : fnew.owner_of_box( ci, 0 );
+			const bool mine = ( MUSIC::mpi::rank()==owner );
+			MeshvarBnd<real_t>* vf = !mine ? (MeshvarBnd<real_t>*)NULL
+				: ( fine_multi ? fnew.get_grid( ci, b ) : fnew.get_grid( ci ) );
+			MeshvarBnd<real_t>* Vc = NULL;
+			if( mine )
+				Vc = parent_multi ? fnew.parent_for_box( ci, b )
+				                  : fnew.get_grid( ci-1 );   // UNION mesh
+			// restrict_meshvarbnd is collective-symmetric (1 hdr Bcast then a
+			// deterministic verdict on every rank). When it returns false (odd
+			// dims or nzf not divisible by 2*np), the distributed path is
+			// geometrically ineligible: the OWNER must perform the restrict
+			// locally to honour the documented contract. mg_straight().restrict
+			// is the SAME operator the serial compute_2LPT_source uses (line
+			// 730), so the fallback is bit-identical.
+			L2T("S2 restrict ci=%u b=%zu owner=%d mine=%d", ci, b, owner, (int)mine);
+			const bool rdid = MUSIC::zoom_slab::restrict_meshvarbnd( owner, vf, Vc, world );
+			if( !rdid && mine )
+				mg_straight().restrict( *vf, *Vc );
+			L2T("S2 restrict done ci=%u b=%zu rdid=%d", ci, b, (int)rdid);
+		}
+
+		L2T("S2 consolidate ci=%u", ci);
+		if( parent_multi )
+			fnew.overwrite_children_to_parents( ci );
+		else {
+			fnew.consolidate_child_writes_to_parent_owner( ci );
+			fnew.release_parent_union_scratch( ci );
+		}
+		L2T("S2 iter-done ci=%u", ci);
+	}
+
+	// === Stage 3: deterministic global mean over levelmin, subtract everywhere ===
+	const unsigned lmin = lmin_b;
+	const bool lmin_multi = ( nbox[lmin] > 1ULL );
+	long double local_sum = 0.0L;
+	size_t      local_cnt = 0;
+	{
+		const size_t nb = lmin_multi ? (size_t)nbox[lmin] : 1;
+		for( size_t b=0; b<nb; ++b )
+		{
+			const int owner = lmin_multi ? fnew.owner_of_box( lmin, b )
+			                             : fnew.owner_of_box( lmin, 0 );
+			if( MUSIC::mpi::rank() != owner ) continue;
+			MeshvarBnd<real_t>* m = lmin_multi ? fnew.get_grid( lmin, b )
+			                                   : fnew.get_grid( lmin );
+			if( !m ) continue;
+			const int nx=(int)m->size(0), ny=(int)m->size(1), nz=(int)m->size(2);
+			for( int ix=0; ix<nx; ++ix )
+				for( int iy=0; iy<ny; ++iy )
+					for( int iz=0; iz<nz; ++iz )
+						local_sum += (*m)(ix,iy,iz);
+			local_cnt += (size_t)nx*(size_t)ny*(size_t)nz;
+		}
+	}
+	long double global_sum = 0.0L;
+	unsigned long long local_cnt_ull = (unsigned long long)local_cnt, global_cnt_ull = 0;
+	MPI_Allreduce( &local_sum, &global_sum, 1, MPI_LONG_DOUBLE, MPI_SUM, world );
+	MPI_Allreduce( &local_cnt_ull, &global_cnt_ull, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, world );
+
+	long double mean = ( global_cnt_ull > 0 )
+		? ( global_sum / (long double)((double)(size_t)global_cnt_ull) )
+		: 0.0L;
+
+	for( unsigned il=lmin_b; il<=lmax_b; ++il )
+	{
+		const bool   il_multi = ( nbox[il] > 1ULL );
+		const size_t nb = il_multi ? (size_t)nbox[il] : 1;
+		for( size_t b=0; b<nb; ++b )
+		{
+			const int owner = il_multi ? fnew.owner_of_box( il, b )
+			                           : fnew.owner_of_box( il, 0 );
+			if( MUSIC::mpi::rank() != owner ) continue;
+			MeshvarBnd<real_t>* m = il_multi ? fnew.get_grid( il, b )
+			                                 : fnew.get_grid( il );
+			if( !m ) continue;
+			const int nx=(int)m->size(0), ny=(int)m->size(1), nz=(int)m->size(2);
+			#pragma omp parallel for
+			for( int ix=0; ix<nx; ++ix )
+				for( int iy=0; iy<ny; ++iy )
+					for( int iz=0; iz<nz; ++iz )
+						(*m)(ix,iy,iz) -= mean;
+		}
+	}
+
+	const double t_lpt2_total = omp_get_wtime() - t_lpt2_start;
+	LOGINFO("lpt2-profile compute_2LPT_source_distributed levels=%u..%u  "
+	        "wall=%.3fs  np=%d  mean=%.6Le",
+	        lmin_b, lmax_b, t_lpt2_total, MUSIC::mpi::size(),
+	        mean);
+	#undef L2T
+#else
+	compute_2LPT_source( cf_, u, fnew, order );
+#endif
+}
+

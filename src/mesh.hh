@@ -754,6 +754,17 @@ public:
     std::vector< std::map<size_t, MeshvarBnd<T>*> > m_parent_replicas_;
     //---------------------------------------------------------------------
 
+    //-------- transient single-box-parent union scratch (Task #135 Opt B) --
+    //! During a single-box-parent restrict in compute_2LPT_source_distributed,
+    //! worker child-owners (which carry a size-0 union m_pgrids for this
+    //! hierarchy) need a full-union-geometry target to restrict into and then
+    //! consolidate to the parent owner. acquire_parent_union_scratch installs
+    //! a zeroed scratch into m_pgrids[L] keyed by parent level L; release
+    //! restores m_pgrids to its prior size (recorded in _prevsz_).
+    std::map<unsigned, MeshvarBnd<T>*> m_union_scratch_;
+    std::map<unsigned, size_t>         m_union_scratch_prevsz_;
+    //---------------------------------------------------------------------
+
 public:
     //! Phase E.1: ownership policy. Returns the rank that should hold the
     //! per-box mesh for level L, box b given a total of nboxes at that level
@@ -908,6 +919,11 @@ public:
 	//! free all memory occupied by the grid hierarchy
 	void deallocate()
 	{
+		// Task #135 Option B: free any lingering single-box-parent union
+		// scratch first; it NULLs its m_pgrids slot so the loop below cannot
+		// double-free it.
+		release_all_parent_union_scratch();
+
 		// Phase E.2.0: if a slab level has an active rank-0 tenant the
 		// pointer in m_pgrids holds the tenant; the underlying slab is in
 		// m_level_slab_backup_. Free both to avoid leaking the slab.
@@ -1140,6 +1156,10 @@ public:
 	    {
 	        if( L >= m_pgrids.size() || m_pgrids[L] == NULL ) continue;
 	        if( m_pgrids_per_box_[L].empty() ) continue;
+	        // H.4 C.3: slab levels go through sync_per_box_from_union_slab
+	        // (collective); the windowed-from-full copy below assumes a
+	        // rank-0 full union at m_pgrids[L].
+	        if( is_level_slab((unsigned)L) ) continue;
 
 	        MeshvarBnd<T> * um = m_pgrids[L];
 	        int u_oax = m_xoffabs[L];
@@ -1194,6 +1214,201 @@ public:
 	                multi_log);
 	}
 
+	//! H.4 C.3: SPMD slab-aware counterpart of sync_per_box_from_union for a
+	//! single level. Each rank packs cells out of its slab strip at m_pgrids[L]
+	//! for every per-box mesh that intersects its strip, sends to the box's
+	//! owner. Owners receive (and read their own strip locally) into the per-
+	//! box mesh, zero-filling halo cells outside the union. After this call
+	//! every owner has a fully populated per-box mesh; rank 0 does NOT need
+	//! the full union to be present (the slab on every rank IS the data).
+	//!
+	//! Preconditions:
+	//!   - is_level_slab(L) == true on every rank.
+	//!   - populate_per_box_meshes(...) has been called so m_pbox_owner_ and
+	//!     m_pgrids_per_box_[L] are sized for level L on every rank.
+	//!   - This is collective. Must run OUTSIDE phase_scope.
+	void sync_per_box_from_union_slab( unsigned ilevel )
+	{
+#ifdef USE_MPI
+	    const int nproc = MUSIC::mpi::size();
+	    if( nproc <= 1 ) {
+	        // Serial degenerate: slab == full union. Fall through to the
+	        // existing rank-0 windowed copy by temporarily flipping the slab
+	        // flag, calling sync_per_box_from_union, then restoring.
+	        if( ilevel >= m_level_is_slab_.size() ) return;
+	        if( ilevel >= m_pgrids_per_box_.size() ) return;
+	        if( m_pgrids_per_box_[ilevel].empty() ) return;
+	        if( ilevel >= m_pgrids.size() || m_pgrids[ilevel] == NULL ) return;
+	        // At nproc==1 a slab equals its full-union mesh; the per-box
+	        // windowed copy in sync_per_box_from_union reads m_pgrids[L]
+	        // through MeshvarBnd::operator()(i,j,k) which is geometry-agnostic.
+	        // No real flip needed — just iterate over the same body inline.
+	        MeshvarBnd<T> * um = m_pgrids[ilevel];
+	        int u_oax = m_xoffabs[ilevel];
+	        int u_oay = m_yoffabs[ilevel];
+	        int u_oaz = m_zoffabs[ilevel];
+	        int unx = (int)um->size(0);
+	        int uny = (int)um->size(1);
+	        int unz = (int)um->size(2);
+	        int unbnd = um->m_nbnd;
+	        for( size_t b=0; b<m_pgrids_per_box_[ilevel].size(); ++b ){
+	            MeshvarBnd<T> * bm = m_pgrids_per_box_[ilevel][b];
+	            if( !bm ) continue;
+	            int b_oax = m_xoffabs_per_box_[ilevel][b];
+	            int b_oay = m_yoffabs_per_box_[ilevel][b];
+	            int b_oaz = m_zoffabs_per_box_[ilevel][b];
+	            int bnx = (int)bm->size(0);
+	            int bny = (int)bm->size(1);
+	            int bnz = (int)bm->size(2);
+	            int bnbnd = bm->m_nbnd;
+	            int dx = b_oax - u_oax;
+	            int dy = b_oay - u_oay;
+	            int dz = b_oaz - u_oaz;
+	            for( int i=-bnbnd; i<bnx+bnbnd; ++i ){
+	                int ui = i + dx;
+	                for( int j=-bnbnd; j<bny+bnbnd; ++j ){
+	                    int uj = j + dy;
+	                    for( int k=-bnbnd; k<bnz+bnbnd; ++k ){
+	                        int uk = k + dz;
+	                        if( ui<-unbnd || ui>=unx+unbnd ||
+	                            uj<-unbnd || uj>=uny+unbnd ||
+	                            uk<-unbnd || uk>=unz+unbnd )
+	                            (*bm)(i,j,k) = T(0);
+	                        else
+	                            (*bm)(i,j,k) = (*um)(ui,uj,uk);
+	                    }
+	                }
+	            }
+	        }
+	        return;
+	    }
+	    if( ilevel >= m_pgrids_per_box_.size() ) return;
+	    if( m_pgrids_per_box_[ilevel].empty() ) return;
+	    if( !is_level_slab(ilevel) ) {
+	        LOGERR("sync_per_box_from_union_slab: L=%u is not a slab", ilevel);
+	        throw std::runtime_error("sync_per_box_from_union_slab: not a slab");
+	    }
+
+	    const int rk = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+	    // tag = tag_base + sender_rank; each box exchange is fully drained
+	    // before the next box begins, so a single tag-per-sender suffices.
+	    const int tag_base = 2700; // distinct from 1100/1300/1500/1700/2100/2300/2500
+
+	    MeshvarBnd<T> * slab = m_pgrids[ilevel];
+	    const long long my_lx = slab ? (long long)slab->local_x_start() : 0;
+	    const long long my_nx = slab ? (long long)slab->local_nx()      : 0;
+	    const long long gnx   = (long long)m_level_gnx_[ilevel];
+	    const long long gny   = (long long)m_level_gny_[ilevel];
+	    const long long gnz   = (long long)m_level_gnz_[ilevel];
+
+	    // gather everyone's slab strip metadata
+	    long long my_loc[2] = { my_lx, my_nx };
+	    std::vector<long long> all_loc(2*nproc, 0);
+	    MPI_Allgather(my_loc, 2, MPI_LONG_LONG, all_loc.data(), 2, MPI_LONG_LONG,
+	                  MUSIC::mpi::world());
+
+	    for( size_t b=0; b<m_pgrids_per_box_[ilevel].size(); ++b ){
+	        const int owner = m_pbox_owner_[ilevel][b];
+	        const int b_oax = m_xoffabs_per_box_[ilevel][b];
+	        const int b_oay = m_yoffabs_per_box_[ilevel][b];
+	        const int b_oaz = m_zoffabs_per_box_[ilevel][b];
+	        const int bnx   = (int)m_nx_per_box_[ilevel][b];
+	        const int bny   = (int)m_ny_per_box_[ilevel][b];
+	        const int bnz   = (int)m_nz_per_box_[ilevel][b];
+	        const int bnbnd = (int)m_nbnd;
+
+	        // box absolute coord range (inclusive lo, exclusive hi)
+	        const long long bx_lo_abs = (long long)b_oax - bnbnd;
+	        const long long bx_hi_abs = (long long)b_oax + bnx + bnbnd;
+	        const long long by_lo_abs = (long long)b_oay - bnbnd;
+	        const long long by_hi_abs = (long long)b_oay + bny + bnbnd;
+	        const long long bz_lo_abs = (long long)b_oaz - bnbnd;
+	        const long long bz_hi_abs = (long long)b_oaz + bnz + bnbnd;
+
+	        // intersect with union [0, gn{x,y,z})
+	        const long long iy_lo = std::max((long long)0, by_lo_abs);
+	        const long long iy_hi = std::min(gny, by_hi_abs);
+	        const long long iz_lo = std::max((long long)0, bz_lo_abs);
+	        const long long iz_hi = std::min(gnz, bz_hi_abs);
+	        const bool any_yz = (iy_hi > iy_lo) && (iz_hi > iz_lo);
+
+	        if( rk == owner ){
+	            MeshvarBnd<T> * bm = m_pgrids_per_box_[ilevel][b];
+	            if( !bm ){
+	                LOGERR("sync_per_box_from_union_slab: owner missing per-box mesh L=%u b=%zu",
+	                       ilevel, b);
+	                throw std::runtime_error("sync_per_box_from_union_slab: owner mesh NULL");
+	            }
+	            // zero-fill first (covers cells outside union and any slab gaps)
+	            bm->zero();
+	            if( !any_yz ) continue;
+
+	            for( int r=0; r<nproc; ++r ){
+	                const long long s_lx = all_loc[2*r+0];
+	                const long long s_nx = all_loc[2*r+1];
+	                const long long s_hi = s_lx + s_nx;
+	                const long long ix_lo = std::max(s_lx, std::max((long long)0, bx_lo_abs));
+	                const long long ix_hi = std::min(s_hi, std::min(gnx, bx_hi_abs));
+	                if( ix_hi <= ix_lo ) continue;
+
+	                const long long nx_chunk = ix_hi - ix_lo;
+	                const long long ny_chunk = iy_hi - iy_lo;
+	                const long long nz_chunk = iz_hi - iz_lo;
+	                const size_t cnt = (size_t)nx_chunk * (size_t)ny_chunk * (size_t)nz_chunk;
+
+	                std::vector<T> buf(cnt);
+	                if( r == rk ){
+	                    // copy from own slab
+	                    for( long long i=0; i<nx_chunk; ++i )
+	                        for( long long j=0; j<ny_chunk; ++j )
+	                            for( long long k=0; k<nz_chunk; ++k )
+	                                buf[(size_t)((i*ny_chunk+j)*nz_chunk+k)]
+	                                    = (*slab)((int)(ix_lo+i - my_lx),
+	                                              (int)(iy_lo+j),
+	                                              (int)(iz_lo+k));
+	                } else {
+	                    MPI_Recv(buf.data(), (int)cnt, dtype, r, tag_base+r,
+	                             MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+	                }
+	                // unpack into per-box mesh
+	                for( long long i=0; i<nx_chunk; ++i )
+	                    for( long long j=0; j<ny_chunk; ++j )
+	                        for( long long k=0; k<nz_chunk; ++k ){
+	                            int bi = (int)(ix_lo+i) - b_oax;
+	                            int bj = (int)(iy_lo+j) - b_oay;
+	                            int bk = (int)(iz_lo+k) - b_oaz;
+	                            (*bm)(bi,bj,bk) = buf[(size_t)((i*ny_chunk+j)*nz_chunk+k)];
+	                        }
+	            }
+	        } else {
+	            // non-owner: ship overlap (if any) to owner
+	            if( !any_yz ) continue;
+	            const long long ix_lo = std::max(my_lx, std::max((long long)0, bx_lo_abs));
+	            const long long ix_hi = std::min(my_lx + my_nx, std::min(gnx, bx_hi_abs));
+	            if( ix_hi <= ix_lo ) continue;
+
+	            const long long nx_chunk = ix_hi - ix_lo;
+	            const long long ny_chunk = iy_hi - iy_lo;
+	            const long long nz_chunk = iz_hi - iz_lo;
+	            const size_t cnt = (size_t)nx_chunk * (size_t)ny_chunk * (size_t)nz_chunk;
+	            std::vector<T> buf(cnt);
+	            for( long long i=0; i<nx_chunk; ++i )
+	                for( long long j=0; j<ny_chunk; ++j )
+	                    for( long long k=0; k<nz_chunk; ++k )
+	                        buf[(size_t)((i*ny_chunk+j)*nz_chunk+k)]
+	                            = (*slab)((int)(ix_lo+i - my_lx),
+	                                      (int)(iy_lo+j),
+	                                      (int)(iz_lo+k));
+	            MPI_Send(buf.data(), (int)cnt, dtype, owner, tag_base+rk,
+	                     MUSIC::mpi::world());
+	        }
+	    }
+#else
+	    (void)ilevel;
+#endif
+	}
+
 	//! Phase E.1b: rank-0-only. Allocate tenant MeshvarBnd<T> for every per-box
 	//! slot where the owner is not rank 0, zero-initialised. Caller fills the
 	//! tenants from a rank-0-resident source (e.g., sync_per_box_from_union)
@@ -1208,6 +1423,10 @@ public:
 	    if( m_pgrids_per_box_.empty() ) return;
 	    if( MUSIC::mpi::rank() != 0 ) return;
 	    for( size_t L=0; L<m_pgrids_per_box_.size(); ++L ){
+	        // H.4 C.3: slab levels are populated directly into owner-side
+	        // per-box meshes by sync_per_box_from_union_slab; no rank-0
+	        // tenant needed (and rank-0 has no full union anyway).
+	        if( is_level_slab((unsigned)L) ) continue;
 	        for( size_t b=0; b<m_pgrids_per_box_[L].size(); ++b ){
 	            if( m_pbox_owner_[L][b] == 0 ) continue;
 	            if( m_pgrids_per_box_[L][b] != NULL ) continue;
@@ -1785,7 +2004,12 @@ public:
 #ifdef USE_MPI
 	    if( MUSIC::mpi::size() <= 1 ) return;
 	    if( child_level == 0 ) return;
-	    if( child_level >= m_pgrids.size() ) return;
+	    // Guard the PARENT union (the only mesh this function touches). Workers
+	    // in the 2LPT path carry m_pgrids sized exactly to child_level after
+	    // acquire_parent_union_scratch installs the parent scratch at
+	    // child_level-1; guarding on child_level would early-return the child
+	    // owner and deadlock the parent owner's Recv.
+	    if( (size_t)(child_level - 1) >= m_pgrids.size() ) return;
 
 	    const size_t nb = num_boxes(child_level);
 	    if( nb == 0 ) return;
@@ -1836,6 +2060,236 @@ public:
 	                            buf[((size_t)ix * syc + iy) * szc + iz];
 	        }
 	    }
+#else
+	    (void)child_level;
+#endif
+	}
+
+	//! Task #135 Option B: install a transient zeroed full-union scratch into
+	//! m_pgrids[child_level-1] on worker child-owners so the single-box-parent
+	//! restrict in compute_2LPT_source_distributed has a valid target. The
+	//! restrict writes V(ox+i,...) with ox = vf.offset(0) into the union, then
+	//! consolidate_child_writes_to_parent_owner ships those footprints to the
+	//! parent owner. Workers carry a size-0 union m_pgrids for the 2LPT
+	//! hierarchy, so we grow m_pgrids to child_level (filling NULL) and record
+	//! the prior size for exact restore in release_parent_union_scratch.
+	//!
+	//! Collective: parent_owner broadcasts the union geometry to all ranks.
+	//! No-ops when np<=1, child_level==0, or parent is multi-box (which uses
+	//! the broadcast_parents_to_child_owners replica machinery instead).
+	//! Must be called OUTSIDE phase_scope (all ranks call).
+	void acquire_parent_union_scratch( unsigned child_level )
+	{
+#ifdef USE_MPI
+	    if( MUSIC::mpi::size() <= 1 ) return;
+	    if( child_level == 0 ) return;
+	    const unsigned Lp = child_level - 1;
+	    if( num_boxes( Lp ) != 1 ) return;
+
+	    const int parent_owner = owner_of_box( Lp, 0 );
+	    const int my_rank = MUSIC::mpi::rank();
+
+	    int hdr[7];
+	    if( my_rank == parent_owner ){
+	        if( Lp >= m_pgrids.size() || m_pgrids[Lp] == NULL ){
+	            LOGERR("acquire_parent_union_scratch: parent_owner rk=%d missing union L=%u",
+	                   my_rank, Lp);
+	            throw std::runtime_error("acquire_parent_union_scratch: parent union NULL on owner");
+	        }
+	        MeshvarBnd<T>* um = m_pgrids[Lp];
+	        hdr[0] = um->m_nbnd;
+	        hdr[1] = (int)um->size(0);
+	        hdr[2] = (int)um->size(1);
+	        hdr[3] = (int)um->size(2);
+	        hdr[4] = um->offset(0);
+	        hdr[5] = um->offset(1);
+	        hdr[6] = um->offset(2);
+	    }
+	    MPI_Bcast( hdr, 7, MPI_INT, parent_owner, MUSIC::mpi::world() );
+
+	    if( my_rank != parent_owner &&
+	        m_union_scratch_.find( Lp ) == m_union_scratch_.end() ){
+	        const size_t prevsz = m_pgrids.size();
+	        if( m_pgrids.size() <= (size_t)Lp )
+	            m_pgrids.resize( Lp + 1, (MeshvarBnd<T>*)NULL );
+	        if( m_pgrids[Lp] == NULL ){
+	            MeshvarBnd<T>* scratch = new MeshvarBnd<T>(
+	                hdr[0], (size_t)hdr[1], (size_t)hdr[2], (size_t)hdr[3] );
+	            scratch->offset(0) = hdr[4];
+	            scratch->offset(1) = hdr[5];
+	            scratch->offset(2) = hdr[6];
+	            scratch->zero();
+	            m_pgrids[Lp] = scratch;
+	            m_union_scratch_[Lp] = scratch;
+	            m_union_scratch_prevsz_[Lp] = prevsz;
+	        }
+	    }
+#else
+	    (void)child_level;
+#endif
+	}
+
+	//! Task #135 Option B: free a scratch installed by acquire_parent_union_scratch
+	//! and restore m_pgrids to its prior size on the worker. No-op when no
+	//! scratch is installed at child_level-1 (e.g. on the parent owner).
+	void release_parent_union_scratch( unsigned child_level )
+	{
+#ifdef USE_MPI
+	    if( child_level == 0 ) return;
+	    const unsigned Lp = child_level - 1;
+	    auto it = m_union_scratch_.find( Lp );
+	    if( it == m_union_scratch_.end() ) return;
+	    MeshvarBnd<T>* scratch = it->second;
+	    if( (size_t)Lp < m_pgrids.size() && m_pgrids[Lp] == scratch )
+	        m_pgrids[Lp] = NULL;
+	    delete scratch;
+	    m_union_scratch_.erase( it );
+	    auto sit = m_union_scratch_prevsz_.find( Lp );
+	    if( sit != m_union_scratch_prevsz_.end() ){
+	        const size_t prevsz = sit->second;
+	        if( m_pgrids.size() > prevsz )
+	            m_pgrids.resize( prevsz, (MeshvarBnd<T>*)NULL );
+	        m_union_scratch_prevsz_.erase( sit );
+	    }
+#else
+	    (void)child_level;
+#endif
+	}
+
+	//! Free any lingering union scratch (exception-safety drain for deallocate).
+	//! NULLs the m_pgrids slot first so the deallocate m_pgrids loop never
+	//! double-frees the scratch pointer.
+	void release_all_parent_union_scratch()
+	{
+	    for( auto & kv : m_union_scratch_ ){
+	        const unsigned Lp = kv.first;
+	        if( (size_t)Lp < m_pgrids.size() && m_pgrids[Lp] == kv.second )
+	            m_pgrids[Lp] = NULL;
+	        delete kv.second;
+	    }
+	    m_union_scratch_.clear();
+	    m_union_scratch_prevsz_.clear();
+	}
+
+	//! Task #135: OVERWRITE-semantics consolidation of per-child restrict writes
+	//! into a MULTI-box parent. The overwrite analog of
+	//! accumulate_children_to_parents (which does dst += src on the full replica)
+	//! and the multi-box analog of consolidate_child_writes_to_parent_owner
+	//! (which targets the single-box union mesh).
+	//!
+	//! Context: distributed compute_2LPT_source restricts each fine source box
+	//! into its parent with mg_straight::restrict semantics — an OVERWRITE (=),
+	//! not an ADD. Each child owner has written the restricted 8-cell averages
+	//! into its parent REPLICA (m_parent_replicas_[child_level][p]) at the
+	//! child's parent-relative offset. This primitive ships only that disjoint
+	//! coarse footprint to the parent box owner, which OVERWRITES the matching
+	//! cells of m_pgrids_per_box_[child_level-1][p]. Child footprints are
+	//! disjoint by D.1 construction, so OVERWRITE is correct and the parent's
+	//! own (non-covered) cells keep their stage-1 FD values.
+	//!
+	//! Must be paired with a prior broadcast_parents_to_child_owners(child_level)
+	//! (so replicas exist) and the per-box restrict into parent_for_box. Frees
+	//! the replicas on exit (like accumulate_children_to_parents).
+	//!
+	//! No-ops when:
+	//!   - MUSIC::mpi::size() <= 1
+	//!   - child_level == 0
+	//!   - num_boxes(child_level-1) <= 1 (single-box parent → use
+	//!     consolidate_child_writes_to_parent_owner instead)
+	//!   - owner_of_box(child_level, b) == parent box owner (local parent was
+	//!     written directly by restrict; nothing to ship)
+	//!
+	//! Must be called OUTSIDE phase_scope (all ranks call). SPMD.
+	void overwrite_children_to_parents( unsigned child_level )
+	{
+#ifdef USE_MPI
+	    if( MUSIC::mpi::size() <= 1 ){ release_parent_replicas( child_level ); return; }
+	    if( child_level == 0 ) return;
+	    if( child_level >= m_pgrids_per_box_.size() ) return;
+	    const unsigned Lp = child_level - 1;
+	    if( Lp >= m_pgrids_per_box_.size() ) return;
+	    if( num_boxes( Lp ) <= 1 ) return;        // single-box parent: use consolidate
+
+	    const size_t nb = num_boxes( child_level );
+	    if( nb == 0 ) return;
+	    const int my_rank = MUSIC::mpi::rank();
+	    MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+
+	    std::vector< std::vector<T> > send_bufs;   // keep alive across Waitall
+	    send_bufs.reserve( 32 );
+	    std::vector<MPI_Request> reqs;
+	    reqs.reserve( 32 );
+	    struct RecvSlot { size_t parent_idx; int oxc, oyc, ozc, sxc, syc, szc;
+	                      size_t cnt, buf_idx; };
+	    std::vector<RecvSlot> recv_slots;
+	    std::vector< std::vector<T> > recv_bufs;
+	    recv_slots.reserve( 32 );
+	    recv_bufs.reserve( 32 );
+
+	    for( size_t b = 0; b < nb; ++b ){
+	        const size_t p = m_parent_idx_per_box_[child_level][b];
+	        if( p >= m_pgrids_per_box_[Lp].size() ) continue;
+	        const int owner_b = m_pbox_owner_[child_level][b];
+	        const int parent_owner = m_pbox_owner_[Lp][p];
+	        if( owner_b == parent_owner ) continue;   // local parent already written
+
+	        const int oxc = m_oxrel_per_box_[child_level][b];
+	        const int oyc = m_oyrel_per_box_[child_level][b];
+	        const int ozc = m_ozrel_per_box_[child_level][b];
+	        const int sxc = (int)m_nx_per_box_[child_level][b] / 2;
+	        const int syc = (int)m_ny_per_box_[child_level][b] / 2;
+	        const int szc = (int)m_nz_per_box_[child_level][b] / 2;
+	        if( sxc <= 0 || syc <= 0 || szc <= 0 ) continue;
+	        const size_t cnt = (size_t)sxc * (size_t)syc * (size_t)szc;
+	        const int tag = 17500 + (int)(b & 0x7FFF);
+
+	        if( my_rank == owner_b ){
+	            auto it = m_parent_replicas_[child_level].find( p );
+	            if( it == m_parent_replicas_[child_level].end() || it->second == NULL ){
+	                LOGERR("overwrite_children_to_parents: rk=%d missing replica L=%u p=%zu",
+	                       my_rank, child_level, p);
+	                throw std::runtime_error("overwrite_children_to_parents: replica NULL");
+	            }
+	            MeshvarBnd<T>* rep = it->second;
+	            send_bufs.emplace_back( cnt );
+	            std::vector<T> & buf = send_bufs.back();
+	            for( int ix = 0; ix < sxc; ++ix )
+	                for( int iy = 0; iy < syc; ++iy )
+	                    for( int iz = 0; iz < szc; ++iz )
+	                        buf[((size_t)ix * syc + iy) * szc + iz] =
+	                            (*rep)(oxc + ix, oyc + iy, ozc + iz);
+	            reqs.emplace_back();
+	            MPI_Isend( buf.data(), (int)cnt, dtype, parent_owner, tag,
+	                       MUSIC::mpi::world(), &reqs.back() );
+	        } else if( my_rank == parent_owner ){
+	            recv_bufs.emplace_back( cnt );
+	            recv_slots.push_back( RecvSlot{ p, oxc, oyc, ozc, sxc, syc, szc,
+	                                            cnt, recv_bufs.size()-1 } );
+	            reqs.emplace_back();
+	            MPI_Irecv( recv_bufs.back().data(), (int)cnt, dtype, owner_b, tag,
+	                       MUSIC::mpi::world(), &reqs.back() );
+	        }
+	    }
+
+	    if( !reqs.empty() )
+	        MPI_Waitall( (int)reqs.size(), reqs.data(), MPI_STATUSES_IGNORE );
+
+	    for( const auto & s : recv_slots ){
+	        MeshvarBnd<T>* parent = m_pgrids_per_box_[Lp][s.parent_idx];
+	        if( !parent ){
+	            LOGERR("overwrite_children_to_parents: parent rk=%d L=%u p=%zu NULL",
+	                   my_rank, Lp, s.parent_idx);
+	            throw std::runtime_error("overwrite_children_to_parents: parent NULL");
+	        }
+	        const T * src = recv_bufs[s.buf_idx].data();
+	        for( int ix = 0; ix < s.sxc; ++ix )
+	            for( int iy = 0; iy < s.syc; ++iy )
+	                for( int iz = 0; iz < s.szc; ++iz )
+	                    (*parent)(s.oxc + ix, s.oyc + iy, s.ozc + iz) =
+	                        src[((size_t)ix * s.syc + iy) * s.szc + iz];
+	    }
+
+	    release_parent_replicas( child_level );
 #else
 	    (void)child_level;
 #endif
@@ -2550,9 +3004,6 @@ public:
 	            (size_t)slab->offset(0), (size_t)slab->offset(1), (size_t)slab->offset(2) );
 	        tenant->zero();
 
-	        const size_t ten_ny = (size_t)tenant->m_ny;
-	        const size_t ten_nz = (size_t)tenant->m_nz;
-
 	        // copy rank-0's own slab interior into tenant interior
 	        {
 	            const long long lx_start = all_loc[0];
@@ -2584,7 +3035,6 @@ public:
 	        m_level_slab_backup_[ilevel] = slab;   // save slab pointer
 	        m_pgrids[ilevel]             = tenant; // swap to tenant
 	        m_level_tenant_[ilevel]      = true;
-	        (void)ten_ny; (void)ten_nz;
 	    } else {
 	        // workers: pack and send slab interior to rank 0
 	        const long long lx_nx = my_loc[1];
@@ -3119,10 +3569,15 @@ public:
 	//! Postconditions:
 	//!   - rank 0: m_pgrids[L] is a full MeshvarBnd<T> with extent (gnx,gny,gnz)
 	//!     (taken from m_level_gnx_/gny_/gnz_); is_level_slab(L) == false.
-	//!   - workers: m_pgrids[L] == NULL; is_level_slab(L) == false.
+	//!   - workers (keep_workers_full=false): m_pgrids[L] == NULL.
+	//!   - workers (keep_workers_full=true): m_pgrids[L] is a zero-filled full
+	//!     MeshvarBnd<T> with extent (gnx,gny,gnz) matching rank 0. Used by
+	//!     the H.4 path when spmd_mg_skel is on so broadcast_union_mesh_from_owner
+	//!     and friends do not NULL-deref at single-box-parent recurse sites.
+	//!     is_level_slab(L) == false in both cases.
 	//!
 	//! Must run OUTSIDE phase_scope. On serial builds: flips metadata only.
-	void convert_level_slab_to_full( unsigned ilevel )
+	void convert_level_slab_to_full( unsigned ilevel, bool keep_workers_full = false )
 	{
 #ifdef USE_MPI
 	    const int nproc = MUSIC::mpi::size();
@@ -3200,7 +3655,20 @@ public:
 	                     MUSIC::mpi::world());
 	        }
 	        delete slab;
-	        m_pgrids[ilevel] = NULL;
+	        if( keep_workers_full ) {
+	            // H.4 + spmd_mg_skel: workers keep a zero-filled full union mesh
+	            // at this level so SPMD-MG primitives (broadcast_union_mesh_from_owner,
+	            // single-box-parent recurse) can read m_pgrids[ilevel] without
+	            // NULL deref. The data is irrelevant — those primitives overwrite
+	            // it via Bcast/Send. Matches the non-H.4 create_base_hierarchy path
+	            // where workers also hold zero-filled union meshes under spmd_mg_skel.
+	            MeshvarBnd<T> * full = new MeshvarBnd<T>(
+	                m_nbnd, gnx, gny, gnz, 0, 0, 0 );
+	            full->zero();
+	            m_pgrids[ilevel] = full;
+	        } else {
+	            m_pgrids[ilevel] = NULL;
+	        }
 	        m_level_is_slab_[ilevel] = false;
 	        m_level_gnx_[ilevel] = 0;
 	        m_level_gny_[ilevel] = 0;
@@ -3208,7 +3676,9 @@ public:
 	        // Phase E.2.1b: workers had size==0 pre-flip; restore so levelmax()
 	        // underflows to UINT_MAX again and downstream code (which only sees
 	        // workers' GridHierarchy as an empty shell) is unchanged.
-	        if( m_pgrids.size() == (size_t)ilevel + 1 ) {
+	        // Skip the shrink when keep_workers_full populated the slot — the
+	        // SPMD-MG caller wants the slot live.
+	        if( !keep_workers_full && m_pgrids.size() == (size_t)ilevel + 1 ) {
 	            bool all_null_below = true;
 	            for( unsigned k = 0; k < ilevel; ++k )
 	                if( m_pgrids[k] != NULL ) { all_null_below = false; break; }
@@ -3223,6 +3693,189 @@ public:
 #else
 	    (void)ilevel;
 #endif
+	}
+	//---------------------------------------------------------------------
+
+	//! H.4 C.4: Collective. Gathers a sub-region of the slab parent at level
+	//! `ilevel` into out_buf on rank-0, with periodic wrap on each axis.
+	//! Replaces gather_union_to_root + coarse pack in fft_interpolate_dist —
+	//! avoids materializing the full nbase^3 union just to read a nxc^3
+	//! window. Workers pass NULL for out_buf.
+	//!
+	//! out_buf layout (rank-0): FFTW-padded last dim — out_buf[(i*nyc+j)*nzcp+k]
+	//! where nzcp = nzc + 2, for i ∈ [0,nxc), j ∈ [0,nyc), k ∈ [0,nzc).
+	//!
+	//! Cell semantics: out_buf[(i*nyc+j)*nzcp+k] = V_full_union[
+	//!     wrap(oxf+i, gnx), wrap(oyf+j, gny), wrap(ozf+k, gnz) ]
+	//! where V_full_union is what gather_union_to_root would have produced.
+	//!
+	//! Must run OUTSIDE phase_scope.
+	void gather_subregion_with_wrap( unsigned ilevel,
+	                                  int oxf, int oyf, int ozf,
+	                                  size_t nxc_, size_t nyc_, size_t nzc_,
+	                                  T* out_buf )
+	{
+#ifdef USE_MPI
+		const int nproc = MUSIC::mpi::size();
+		const int rk    = MUSIC::mpi::rank();
+		const int nxc = (int)nxc_, nyc = (int)nyc_, nzc = (int)nzc_;
+		const size_t nzcp = (size_t)nzc + 2;
+
+		auto wrap = [](int x, size_t N) {
+			int n = (int)N;
+			x %= n;
+			if( x < 0 ) x += n;
+			return (size_t)x;
+		};
+
+		if( nproc <= 1 ) {
+			// serial: just read from the level's MeshvarBnd directly
+			MeshvarBnd<T>* V = m_pgrids[ilevel];
+			const size_t gnx = (size_t)V->size(0);
+			const size_t gny = (size_t)V->size(1);
+			const size_t gnz = (size_t)V->size(2);
+#pragma omp parallel for
+			for( int i = 0; i < nxc; ++i )
+				for( int j = 0; j < nyc; ++j )
+					for( int k = 0; k < nzc; ++k ) {
+						size_t q = ((size_t)i * (size_t)nyc + (size_t)j) * nzcp + (size_t)k;
+						out_buf[q] = (*V)( (int)wrap(oxf+i, gnx),
+						                   (int)wrap(oyf+j, gny),
+						                   (int)wrap(ozf+k, gnz) );
+					}
+			return;
+		}
+
+		if( !is_level_slab(ilevel) )
+			throw std::runtime_error("gather_subregion_with_wrap: level is not slab");
+
+		MeshvarBnd<T>* slab = m_pgrids[ilevel];
+		const size_t gnx = m_level_gnx_[ilevel];
+		const size_t gny = m_level_gny_[ilevel];
+		const size_t gnz = m_level_gnz_[ilevel];
+		MPI_Datatype dtype = (sizeof(T) == sizeof(float)) ? MPI_FLOAT : MPI_DOUBLE;
+		const int tag_n   = 2800;
+		const int tag_idx = 2801;
+		const int tag_buf = 2802;
+
+		// All ranks share slab x-ownership
+		long long my_loc[2] = { slab ? (long long)slab->local_x_start() : 0,
+		                        slab ? (long long)slab->local_nx()      : 0 };
+		std::vector<long long> all_loc(2*nproc, 0);
+		MPI_Allgather(my_loc, 2, MPI_LONG_LONG,
+		              all_loc.data(), 2, MPI_LONG_LONG, MUSIC::mpi::world());
+
+		auto owner_of_x = [&](long long ix_wrap) -> int {
+			for( int r = 0; r < nproc; ++r ) {
+				long long s = all_loc[2*r+0];
+				long long n = all_loc[2*r+1];
+				if( ix_wrap >= s && ix_wrap < s + n ) return r;
+			}
+			return -1;
+		};
+
+		// Collect the i's I own from the [oxf, oxf+nxc) walk
+		std::vector<int> my_is;
+		my_is.reserve(nxc);
+		for( int i = 0; i < nxc; ++i ) {
+			long long ix_wrap = ((long long)(oxf + i) % (long long)gnx
+			                     + (long long)gnx) % (long long)gnx;
+			if( owner_of_x(ix_wrap) == rk ) my_is.push_back(i);
+		}
+		const size_t plane_size = (size_t)nyc * nzcp;
+
+		if( rk == 0 ) {
+			// Pack own i's directly into out_buf
+#pragma omp parallel for
+			for( int m = 0; m < (int)my_is.size(); ++m ) {
+				int i = my_is[m];
+				long long ix_wrap = ((long long)(oxf + i) % (long long)gnx
+				                     + (long long)gnx) % (long long)gnx;
+				long long ix_local = ix_wrap - all_loc[0];
+				for( int j = 0; j < nyc; ++j )
+					for( int k = 0; k < nzc; ++k ) {
+						size_t q = ((size_t)i * (size_t)nyc + (size_t)j) * nzcp + (size_t)k;
+						out_buf[q] = (*slab)( (int)ix_local,
+						                      (int)wrap(oyf+j, gny),
+						                      (int)wrap(ozf+k, gnz) );
+					}
+			}
+			// Receive from each worker
+			for( int r = 1; r < nproc; ++r ) {
+				int n_my = 0;
+				MPI_Recv(&n_my, 1, MPI_INT, r, tag_n, MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+				if( n_my == 0 ) continue;
+				std::vector<int> i_list(n_my);
+				MPI_Recv(i_list.data(), n_my, MPI_INT, r, tag_idx,
+				         MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+				std::vector<T> rbuf((size_t)n_my * plane_size);
+				MPI_Recv(rbuf.data(), (int)((size_t)n_my * plane_size),
+				         dtype, r, tag_buf, MUSIC::mpi::world(), MPI_STATUS_IGNORE);
+#pragma omp parallel for
+				for( int m = 0; m < n_my; ++m ) {
+					int i = i_list[m];
+					const T* src = rbuf.data() + (size_t)m * plane_size;
+					for( int j = 0; j < nyc; ++j )
+						for( int k = 0; k < nzc; ++k ) {
+							size_t q = ((size_t)i * (size_t)nyc + (size_t)j) * nzcp + (size_t)k;
+							out_buf[q] = src[(size_t)j * nzcp + (size_t)k];
+						}
+				}
+			}
+		} else {
+			int n_my = (int)my_is.size();
+			MPI_Send(&n_my, 1, MPI_INT, 0, tag_n, MUSIC::mpi::world());
+			if( n_my > 0 ) {
+				MPI_Send(my_is.data(), n_my, MPI_INT, 0, tag_idx, MUSIC::mpi::world());
+				std::vector<T> sbuf((size_t)n_my * plane_size, T(0));
+#pragma omp parallel for
+				for( int m = 0; m < n_my; ++m ) {
+					int i = my_is[m];
+					long long ix_wrap = ((long long)(oxf + i) % (long long)gnx
+					                     + (long long)gnx) % (long long)gnx;
+					long long ix_local = ix_wrap - my_loc[0];
+					T* dst = sbuf.data() + (size_t)m * plane_size;
+					for( int j = 0; j < nyc; ++j )
+						for( int k = 0; k < nzc; ++k ) {
+							dst[(size_t)j * nzcp + (size_t)k] =
+							    (*slab)( (int)ix_local,
+							             (int)wrap(oyf+j, gny),
+							             (int)wrap(ozf+k, gnz) );
+						}
+				}
+				MPI_Send(sbuf.data(), (int)((size_t)n_my * plane_size),
+				         dtype, 0, tag_buf, MUSIC::mpi::world());
+			}
+		}
+#else
+		(void)ilevel; (void)oxf; (void)oyf; (void)ozf;
+		(void)nxc_; (void)nyc_; (void)nzc_; (void)out_buf;
+#endif
+	}
+	//---------------------------------------------------------------------
+
+	//! H.4 C.3 worker cleanup: free the phantom 0..ilevel-1 meshes (allocated
+	//! by create_base_hierarchy_slab) plus the now-NULL slot at ilevel, and
+	//! resize m_pgrids/m_xoffabs/m_yoffabs/m_zoffabs to 0 so the worker's
+	//! GridHierarchy matches the empty-shell state produced by C.2-alt's
+	//! delta.deallocate(). Per-box meshes (m_pgrids_per_box_) are untouched.
+	//!
+	//! Required after C.3's convert_level_slab_to_full because the standard
+	//! shed logic inside that function only fires when all_null_below is true,
+	//! and phantoms left in 0..levelmin-1 prevent that.
+	void shed_levelmin_union_skeleton( unsigned ilevel )
+	{
+		for( size_t i = 0; i < m_pgrids.size() && i <= (size_t)ilevel; ++i ) {
+			if( m_pgrids[i] != NULL ) {
+				delete m_pgrids[i];
+				m_pgrids[i] = NULL;
+			}
+		}
+		m_pgrids.resize(0);
+		m_xoffabs.resize(0);
+		m_yoffabs.resize(0);
+		m_zoffabs.resize(0);
+		if( ilevel < m_level_is_slab_.size() ) m_level_is_slab_[ilevel] = false;
 	}
 	//---------------------------------------------------------------------
 

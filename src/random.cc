@@ -792,14 +792,11 @@ random_numbers<T>::random_numbers(random_numbers<T> &rc, unsigned cubesize, long
 		t_alloc = MPI_Wtime() - t_alloc;
 
 		double t_copy_fine = MPI_Wtime();
-#pragma omp parallel for
-		for (int i = 0; i < (int)nx; i++)
-			for (int j = 0; j < (int)ny; j++)
-				for (int k = 0; k < (int)nz; k++)
-				{
-					size_t q = ((size_t)i * (size_t)ny + (size_t)j) * (size_t)(nz + 2) + (size_t)k;
-					rfine[q] = (*this)(x0[0] + i, x0[1] + j, x0[2] + k);
-				}
+		// R.1: cube-iter pack — amortizes per-cell cubemap_.find. Same layout
+		// as the original loop: rfine[(i*ny + j)*(nz+2) + k].
+		this->pack_subvolume_to_buffer(x0[0], x0[1], x0[2],
+		                               (int)nx, (int)ny, (int)nz,
+		                               rfine, (size_t)ny, (size_t)(nz + 2));
 		t_copy_fine = MPI_Wtime() - t_copy_fine;
 		//this->free_all_mem();	// temporarily free memory, allocate again later
 
@@ -1043,14 +1040,10 @@ random_numbers<T>::random_numbers(random_numbers<T> &rc, unsigned cubesize, long
 		t_fft_inv = MPI_Wtime() - t_fft_inv;
 
 		double t_writeback = MPI_Wtime();
-#pragma omp parallel for
-		for (int i = 0; i < (int)nx; i++)
-			for (int j = 0; j < (int)ny; j++)
-				for (int k = 0; k < (int)nz; k++)
-				{
-					size_t q = ((size_t)i * ny + (size_t)j) * (nz + 2) + (size_t)k;
-					(*this)(x0[0] + i, x0[1] + j, x0[2] + k, false) = rfine[q];
-				}
+		// R.1: cube-iter unpack — amortizes per-cell cubemap_.find.
+		this->unpack_subvolume_from_buffer(x0[0], x0[1], x0[2],
+		                                   (int)nx, (int)ny, (int)nz,
+		                                   rfine, (size_t)ny, (size_t)(nz + 2));
 		t_writeback = MPI_Wtime() - t_writeback;
 
 		double t_free = MPI_Wtime();
@@ -1424,6 +1417,130 @@ double random_numbers<T>::fill_subvolume_x_slab(int *i0, int *n,
 	}
 
 	return (cells > 0) ? (mean / (double)cells) : 0.0;
+}
+
+namespace {
+// Build a list of (cube_index, in_cube_start, count, dst_offset) blocks
+// that tile the absolute range [abs_x0, abs_x0+l) using the same wrap
+// convention as random_numbers::operator() (works for abs_x0 >= -cubesize*ncubes).
+struct CubeBlock { int ic, is_start, cnt, dst_off; };
+static void build_cube_blocks(int abs_x0, int l, unsigned cubesize, unsigned ncubes,
+                              std::vector<CubeBlock> &out)
+{
+	const int cs = (int)cubesize;
+	const int nc = (int)ncubes;
+	int pos = 0;
+	while (pos < l) {
+		const int i_abs = abs_x0 + pos;
+		// Match operator(): ic = (int)((double)i/cs + nc) % nc.
+		const int ic = (int)((double)i_abs / cs + nc) % nc;
+		const int is_start = ((i_abs - ic * cs) % cs + cs) % cs;
+		const int cnt = std::min(cs - is_start, l - pos);
+		CubeBlock cb; cb.ic = ic; cb.is_start = is_start; cb.cnt = cnt; cb.dst_off = pos;
+		out.push_back(cb);
+		pos += cnt;
+	}
+}
+} // anonymous namespace
+
+template <typename T>
+template <typename B>
+void random_numbers<T>::pack_subvolume_to_buffer(
+    int abs_x0, int abs_y0, int abs_z0,
+    int lx, int ly, int lz,
+    B *dst, size_t y_pitch, size_t z_pitch)
+{
+	if (ncubes_ == 0)
+		throw std::runtime_error("pack_subvolume_to_buffer: random_numbers not initialized");
+	std::vector<CubeBlock> bx, by, bz;
+	build_cube_blocks(abs_x0, lx, cubesize_, ncubes_, bx);
+	build_cube_blocks(abs_y0, ly, cubesize_, ncubes_, by);
+	build_cube_blocks(abs_z0, lz, cubesize_, ncubes_, bz);
+
+	const int nbx = (int)bx.size();
+	const int nby = (int)by.size();
+	const int nbz = (int)bz.size();
+
+	#pragma omp parallel for collapse(2) schedule(static)
+	for (int bi = 0; bi < nbx; ++bi) {
+		for (int bj = 0; bj < nby; ++bj) {
+			const CubeBlock &cbx = bx[bi];
+			const CubeBlock &cby = by[bj];
+			for (int bk = 0; bk < nbz; ++bk) {
+				const CubeBlock &cbz = bz[bk];
+				const size_t icube = ((size_t)cbx.ic * ncubes_ + (size_t)cby.ic) * ncubes_ + (size_t)cbz.ic;
+				cubemap_iterator it = cubemap_.find(icube);
+				if (it == cubemap_.end()) {
+					LOGERR("pack_subvolume_to_buffer: missing cube %d,%d,%d", cbx.ic, cby.ic, cbz.ic);
+					throw std::runtime_error("pack_subvolume_to_buffer: missing cube");
+				}
+				Meshvar<T> *cube = rnums_[it->second];
+				if (cube == NULL) {
+					LOGERR("pack_subvolume_to_buffer: null cube %d,%d,%d", cbx.ic, cby.ic, cbz.ic);
+					throw std::runtime_error("pack_subvolume_to_buffer: null cube");
+				}
+				for (int ii = 0; ii < cbx.cnt; ++ii) {
+					const int ds_i = cbx.dst_off + ii;
+					for (int jj = 0; jj < cby.cnt; ++jj) {
+						const int ds_j = cby.dst_off + jj;
+						B *dst_row = dst + ((size_t)ds_i * y_pitch + (size_t)ds_j) * z_pitch + (size_t)cbz.dst_off;
+						for (int kk = 0; kk < cbz.cnt; ++kk)
+							dst_row[kk] = (B)(*cube)(cbx.is_start + ii, cby.is_start + jj, cbz.is_start + kk);
+					}
+				}
+			}
+		}
+	}
+}
+
+template <typename T>
+template <typename B>
+void random_numbers<T>::unpack_subvolume_from_buffer(
+    int abs_x0, int abs_y0, int abs_z0,
+    int lx, int ly, int lz,
+    const B *src, size_t y_pitch, size_t z_pitch)
+{
+	if (ncubes_ == 0)
+		throw std::runtime_error("unpack_subvolume_from_buffer: random_numbers not initialized");
+	std::vector<CubeBlock> bx, by, bz;
+	build_cube_blocks(abs_x0, lx, cubesize_, ncubes_, bx);
+	build_cube_blocks(abs_y0, ly, cubesize_, ncubes_, by);
+	build_cube_blocks(abs_z0, lz, cubesize_, ncubes_, bz);
+
+	const int nbx = (int)bx.size();
+	const int nby = (int)by.size();
+	const int nbz = (int)bz.size();
+
+	#pragma omp parallel for collapse(2) schedule(static)
+	for (int bi = 0; bi < nbx; ++bi) {
+		for (int bj = 0; bj < nby; ++bj) {
+			const CubeBlock &cbx = bx[bi];
+			const CubeBlock &cby = by[bj];
+			for (int bk = 0; bk < nbz; ++bk) {
+				const CubeBlock &cbz = bz[bk];
+				const size_t icube = ((size_t)cbx.ic * ncubes_ + (size_t)cby.ic) * ncubes_ + (size_t)cbz.ic;
+				cubemap_iterator it = cubemap_.find(icube);
+				if (it == cubemap_.end()) {
+					LOGERR("unpack_subvolume_from_buffer: missing cube %d,%d,%d", cbx.ic, cby.ic, cbz.ic);
+					throw std::runtime_error("unpack_subvolume_from_buffer: missing cube");
+				}
+				Meshvar<T> *cube = rnums_[it->second];
+				if (cube == NULL) {
+					LOGERR("unpack_subvolume_from_buffer: null cube %d,%d,%d", cbx.ic, cby.ic, cbz.ic);
+					throw std::runtime_error("unpack_subvolume_from_buffer: null cube");
+				}
+				for (int ii = 0; ii < cbx.cnt; ++ii) {
+					const int ds_i = cbx.dst_off + ii;
+					for (int jj = 0; jj < cby.cnt; ++jj) {
+						const int ds_j = cby.dst_off + jj;
+						const B *src_row = src + ((size_t)ds_i * y_pitch + (size_t)ds_j) * z_pitch + (size_t)cbz.dst_off;
+						for (int kk = 0; kk < cbz.cnt; ++kk)
+							(*cube)(cbx.is_start + ii, cby.is_start + jj, cbz.is_start + kk) = (T)src_row[kk];
+					}
+				}
+			}
+		}
+	}
 }
 
 template <typename T>
@@ -2308,74 +2425,71 @@ void random_number_generator<rng, T>::store_rnd(int ilevel, rng *prng)
 
 	if (disk_cached_)
 	{
-		std::vector<T> data;
+		int nx, ny, nz, i0, j0, k0;
 		if (ilevel == levelmin_)
 		{
 			int N = 1 << levelmin_;
-			int i0, j0, k0;
-
+			nx = ny = nz = N;
 			i0 = -lfac * shift[0];
 			j0 = -lfac * shift[1];
 			k0 = -lfac * shift[2];
-
-			char fname[128];
-			sprintf(fname, "wnoise_%04d.bin", ilevel);
-
-			LOGUSER("Storing white noise field in file \'%s\'...", fname);
-
-			std::ofstream ofs(fname, std::ios::binary | std::ios::trunc);
-
-			ofs.write(reinterpret_cast<char *>(&N), sizeof(unsigned));
-			ofs.write(reinterpret_cast<char *>(&N), sizeof(unsigned));
-			ofs.write(reinterpret_cast<char *>(&N), sizeof(unsigned));
-
-			data.assign(N * N, 0.0);
-			for (int i = 0; i < N; ++i)
-			{
-#pragma omp parallel for
-				for (int j = 0; j < N; ++j)
-					for (int k = 0; k < N; ++k)
-						data[j * N + k] = (*prng)(i + i0, j + j0, k + k0);
-
-				ofs.write(reinterpret_cast<char *>(&data[0]), N * N * sizeof(T));
-			}
-			ofs.close();
 		}
 		else
 		{
-			int nx, ny, nz;
-			int i0, j0, k0;
-
 			nx = 2 * prefh_->size(ilevel, 0);
 			ny = 2 * prefh_->size(ilevel, 1);
 			nz = 2 * prefh_->size(ilevel, 2);
 			i0 = prefh_->offset_abs(ilevel, 0) - lfac * shift[0] - nx / 4;
-			j0 = prefh_->offset_abs(ilevel, 1) - lfac * shift[1] - ny / 4; // was nx/4
-			k0 = prefh_->offset_abs(ilevel, 2) - lfac * shift[2] - nz / 4; // was nx/4
-
-			char fname[128];
-			sprintf(fname, "wnoise_%04d.bin", ilevel);
-
-			LOGUSER("Storing white noise field in file \'%s\'...", fname);
-
-			std::ofstream ofs(fname, std::ios::binary | std::ios::trunc);
-
-			ofs.write(reinterpret_cast<char *>(&nx), sizeof(unsigned));
-			ofs.write(reinterpret_cast<char *>(&ny), sizeof(unsigned));
-			ofs.write(reinterpret_cast<char *>(&nz), sizeof(unsigned));
-
-			data.assign(ny * nz, 0.0);
-			for (int i = 0; i < nx; ++i)
-			{
-#pragma omp parallel for
-				for (int j = 0; j < ny; ++j)
-					for (int k = 0; k < nz; ++k)
-						data[j * nz + k] = (*prng)(i + i0, j + j0, k + k0);
-
-				ofs.write(reinterpret_cast<char *>(&data[0]), ny * nz * sizeof(T));
-			}
-			ofs.close();
+			j0 = prefh_->offset_abs(ilevel, 1) - lfac * shift[1] - ny / 4;
+			k0 = prefh_->offset_abs(ilevel, 2) - lfac * shift[2] - nz / 4;
 		}
+
+		char fname[128];
+		sprintf(fname, "wnoise_%04d.bin", ilevel);
+		LOGUSER("Storing white noise field in file \'%s\'...", fname);
+
+		// R.2: open with low-level fd, batch pack via R.1 pack_subvolume_to_buffer,
+		// then pwrite chunks of (chunk_planes * ny * nz * sizeof(T)) bytes. Caps
+		// per-chunk memory at ~256 MiB so multi-plane batching amortizes the
+		// per-plane ostream::write overhead without ballooning RSS.
+		int fd = ::open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd < 0) {
+			LOGERR("store_rnd: open('%s') failed: %s", fname, std::strerror(errno));
+			throw std::runtime_error("store_rnd: failed to open wnoise file");
+		}
+		const unsigned hdr[3] = {(unsigned)nx, (unsigned)ny, (unsigned)nz};
+		{
+			size_t done = 0;
+			while (done < sizeof(hdr)) {
+				ssize_t r = ::pwrite(fd, (const char*)hdr + done, sizeof(hdr) - done, (off_t)done);
+				if (r < 0) { if (errno == EINTR) continue; ::close(fd); throw std::runtime_error("store_rnd: header pwrite failed"); }
+				if (r == 0) { ::close(fd); throw std::runtime_error("store_rnd: header pwrite returned 0"); }
+				done += (size_t)r;
+			}
+		}
+		const size_t plane_bytes = (size_t)ny * (size_t)nz * sizeof(T);
+		const size_t target_chunk = (size_t)256 * 1024 * 1024;
+		int chunk_planes = (int)std::max((size_t)1, target_chunk / std::max((size_t)1, plane_bytes));
+		if (chunk_planes > nx) chunk_planes = nx;
+		std::vector<T> buf((size_t)chunk_planes * (size_t)ny * (size_t)nz);
+
+		for (int i_start = 0; i_start < nx; i_start += chunk_planes) {
+			const int n_this = std::min(chunk_planes, nx - i_start);
+			prng->pack_subvolume_to_buffer(
+			    i0 + i_start, j0, k0,
+			    n_this, ny, nz,
+			    buf.data(), (size_t)ny, (size_t)nz);
+			const size_t bytes = (size_t)n_this * plane_bytes;
+			const off_t off = (off_t)sizeof(hdr) + (off_t)i_start * (off_t)plane_bytes;
+			size_t done = 0;
+			while (done < bytes) {
+				ssize_t r = ::pwrite(fd, (const char*)buf.data() + done, bytes - done, off + (off_t)done);
+				if (r < 0) { if (errno == EINTR) continue; ::close(fd); throw std::runtime_error("store_rnd: pwrite failed"); }
+				if (r == 0) { ::close(fd); throw std::runtime_error("store_rnd: pwrite returned 0"); }
+				done += (size_t)r;
+			}
+		}
+		::close(fd);
 	}
 	else
 	{
@@ -4828,3 +4942,14 @@ template class random_numbers<float>;
 template class random_numbers<double>;
 template class random_number_generator<random_numbers<float>, float>;
 template class random_number_generator<random_numbers<double>, double>;
+
+// R.1: explicit instantiations of pack/unpack helpers for the (T,B) buffer
+// types actually used by the call sites (T = field precision, B = fftw_real).
+template void random_numbers<float>::pack_subvolume_to_buffer<float>(int, int, int, int, int, int, float*, size_t, size_t);
+template void random_numbers<float>::pack_subvolume_to_buffer<double>(int, int, int, int, int, int, double*, size_t, size_t);
+template void random_numbers<double>::pack_subvolume_to_buffer<float>(int, int, int, int, int, int, float*, size_t, size_t);
+template void random_numbers<double>::pack_subvolume_to_buffer<double>(int, int, int, int, int, int, double*, size_t, size_t);
+template void random_numbers<float>::unpack_subvolume_from_buffer<float>(int, int, int, int, int, int, const float*, size_t, size_t);
+template void random_numbers<float>::unpack_subvolume_from_buffer<double>(int, int, int, int, int, int, const double*, size_t, size_t);
+template void random_numbers<double>::unpack_subvolume_from_buffer<float>(int, int, int, int, int, int, const float*, size_t, size_t);
+template void random_numbers<double>::unpack_subvolume_from_buffer<double>(int, int, int, int, int, int, const double*, size_t, size_t);

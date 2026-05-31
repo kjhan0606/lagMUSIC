@@ -76,6 +76,15 @@ struct phase_scope {
 	~phase_scope();
 };
 
+// True on rank-0 between phase_scope ctor and dtor (i.e. while workers are
+// parked in worker_pump expecting META_LEN-int op dispatches). Callees that
+// would otherwise issue their own MPI_Bcast must consult this and fall back
+// to a rank-0-serial branch when it returns true — workers cannot answer
+// collective calls from inside the pump without a matching OP code.
+// Always false on workers (they don't run the rank-0 lambda body).
+// Always false in single-rank or non-MPI builds.
+bool phase_scope_active();
+
 // Rank-0 entry points used by fft_poisson_plugin. Each broadcasts the
 // matching OP code + grid dims to workers, then performs the collective FFT
 // in-place on root_buf (rank 0's padded real buffer of size gnx*gny*2*(gnz/2+1)).

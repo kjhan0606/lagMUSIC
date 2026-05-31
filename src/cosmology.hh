@@ -217,6 +217,15 @@ void compute_LLA_density( const grid_hierarchy& u, grid_hierarchy& fnew, unsigne
 //! computes the source term for the 2nd order perturbations in the displacements
 void compute_2LPT_source( config_file& cf_, const grid_hierarchy& u, grid_hierarchy& fnew, unsigned order=4 );
 
+//! Task #155: memory-first distributed twin of compute_2LPT_source. All ranks
+//! call collectively (OUTSIDE phase_scope). Stage 1 runs the per-level FD
+//! stencil per-box via the lpt2_fd_meshvarbnd z-slab bridge; stage 2 restricts
+//! each fine source box into its parent via restrict_meshvarbnd + cross-rank
+//! parent consolidation; stage 3 subtracts the deterministic global mean over
+//! levelmin. Bit-identical to compute_2LPT_source for the single-box-per-level
+//! (zoom/unigrid) case. At np<=1 it delegates straight to compute_2LPT_source.
+void compute_2LPT_source_distributed( config_file& cf_, const grid_hierarchy& u, grid_hierarchy& fnew, unsigned order=4 );
+
 void compute_2LPT_source_FFT( config_file& cf_, const grid_hierarchy& u, grid_hierarchy& fnew );
 
 

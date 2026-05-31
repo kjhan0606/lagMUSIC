@@ -176,7 +176,18 @@ double multigrid_poisson_plugin::solve( grid_hierarchy& f, grid_hierarchy& u )
 		if( ksu )
 			LOGINFO("G.2b B.5.4.b: zoom_slab_keep_slab_urestrict=yes (pre-smooth → u-restrict shares padded-cluster slab; saves 1 gather+scatter per box per V-cycle)");
 	}
-	
+
+	// Phase G.2b B.5.4.c: opt-in toggle for fused keep-in-slab prolong_add
+	// (fuses the post-coarse prolong_add with the post-smooth into one
+	// scatter/gather via prolong_add_then_smooth_n_meshvarbnd). Requires
+	// B.5.4.a to also be on.
+	{
+		bool ksp = cf_.getValueSafe<bool>("setup", "zoom_slab_keep_slab_prolong", false);
+		MUSIC::zoom_slab::set_keep_slab_prolong_enabled(ksp);
+		if( ksp )
+			LOGINFO("G.2b B.5.4.c: zoom_slab_keep_slab_prolong=yes (post-coarse prolong_add → post-smooth fused; saves 1 scatter+gather per box per V-cycle)");
+	}
+
 	multigrid::opt::smtype ps_smtype = multigrid::opt::sm_gauss_seidel;
 	
 	if ( ps_smoother_name == std::string("gs") )

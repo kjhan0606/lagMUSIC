@@ -43,6 +43,8 @@
 #include "convolution_kernel.hh"
 #include "cosmology.hh"
 #include "transfer_function.hh"
+
+namespace convolution { int run_h2b_avg_smoke(size_t Nfine); }
 #include "mpi_helper.hh"
 #include "mesh_distributed.hh"
 #include "mpi_fft.hh"
@@ -767,7 +769,7 @@ int main (int argc, const char * argv[])
 	// forward-multiply-inverse pipeline with Tk == 1. All ranks must
 	// participate, so these are dispatched after FFTW MPI init but before
 	// the non-root early-return.
-	enum { SMOKE_NONE, SMOKE_FFT, SMOKE_CONV, SMOKE_PERFORM_DIST, SMOKE_B2B1_REPLICA, SMOKE_B2B221A_BROADCAST, SMOKE_H3A_COARSEN, SMOKE_H4_BASE_SLAB } smoke_kind = SMOKE_NONE;
+	enum { SMOKE_NONE, SMOKE_FFT, SMOKE_CONV, SMOKE_PERFORM_DIST, SMOKE_B2B1_REPLICA, SMOKE_B2B221A_BROADCAST, SMOKE_H3A_COARSEN, SMOKE_H4_BASE_SLAB, SMOKE_H2B_AVG } smoke_kind = SMOKE_NONE;
 	bool   smoke_mode = false;
 	size_t smoke_N    = 0;
 	const char* smoke_cfg = NULL;
@@ -780,6 +782,7 @@ int main (int argc, const char * argv[])
 		else if( a1 == "--b2b221a-broadcast-smoke" ) smoke_kind = SMOKE_B2B221A_BROADCAST;
 		else if( a1 == "--h3a-coarsen-smoke" )      smoke_kind = SMOKE_H3A_COARSEN;
 		else if( a1 == "--h4-base-slab-smoke" )     smoke_kind = SMOKE_H4_BASE_SLAB;
+		else if( a1 == "--h2b-avg-smoke" )          smoke_kind = SMOKE_H2B_AVG;
 		smoke_mode = (smoke_kind != SMOKE_NONE);
 	}
 	if( smoke_mode ){
@@ -923,6 +926,12 @@ int main (int argc, const char * argv[])
 			extern int run_h4_base_slab_smoke(size_t lmax);
 			rc = run_h4_base_slab_smoke(smoke_N);
 		}
+		else if( smoke_kind == SMOKE_H2B_AVG ){
+			// Phase H.2b.1 standalone smoke. Compares serial 8-pt fine->coarse
+			// averaging vs the x-slab distributed average_fine_slab_to_coarse
+			// on a Nfine³ deterministic pattern. Bit-identical expected.
+			rc = convolution::run_h2b_avg_smoke(smoke_N);
+		}
 		else
 			rc = run_mpi_fft_smoke(smoke_N);
 #ifdef USE_MPI
@@ -1061,6 +1070,21 @@ int main (int argc, const char * argv[])
 	    if( !ok ) {
 	        LOGERR("Phase G.4 lpt2 smoke test FAILED");
 	        throw std::runtime_error("zoom_slab lpt2 smoke test failed");
+	    }
+	}
+
+	// Task #135: 2LPT-FD MeshvarBnd bridge smoke test (opt-in). Runs the
+	// lpt2_fd_meshvarbnd slab bridge twice — once distributed over the world
+	// sub_comm (real z-split), once on MPI_COMM_SELF (single slab) — and checks
+	// the two are bit-identical, proving the per-box source is split-invariant.
+	if( MUSIC::mpi::size() > 0
+	    && cf.getValueSafe<bool>("setup", "test_zoom_slab_lpt2_meshvarbnd", false) )
+	{
+	    const unsigned order = cf.getValueSafe<unsigned>("setup", "test_zoom_slab_lpt2_order", 2);
+	    const bool ok = MUSIC::zoom_slab::smoke_test_lpt2_meshvarbnd(order);
+	    if( !ok ) {
+	        LOGERR("Task #135 lpt2_meshvarbnd smoke test FAILED");
+	        throw std::runtime_error("zoom_slab lpt2_meshvarbnd smoke test failed");
 	    }
 	}
 
@@ -2112,6 +2136,29 @@ int main (int argc, const char * argv[])
 
 			f2LPT = u1;        // SPMD: gives workers per-box f2LPT layout
 
+			// #155: opt-in memory-first distributed 2LPT-FD source. Runs
+			// collectively OUTSIDE with_pbox_distributed (its slab bridges +
+			// parent-consolidation primitives are SPMD on world, so they must
+			// NOT be trapped in the rank-0 wpd lambda). FD path only; the FFT
+			// variant keeps its existing rank-0/slab route. Default-off keeps
+			// the shipped baseline bit-identical.
+			//
+			// #135 Option B: genuine multibox is now supported. At a
+			// multi-box-child -> single-box-parent restrict (stage 2), the
+			// non-rank-0 fine-box owners install a transient full-union scratch
+			// (acquire_parent_union_scratch) to restrict into, then ship the
+			// footprints to the parent owner (consolidate_child_writes_to_parent_owner).
+			// FD path only; the FFT variant keeps its existing rank-0/slab route.
+			const bool dist_2lpt_src =
+				cf.getValueSafe<bool>("setup","dist_2lpt_source",false)
+				&& (MUSIC::mpi::size() > 1) && !kspace2LPT;
+
+			if( dist_2lpt_src )
+			{
+				LOGINFO("Computing 2LPT term (distributed FD, #155)....");
+				compute_2LPT_source_distributed(cf, u1, f2LPT, grad_order);
+			}
+			else
 			// === D.7 Part 1: compute_2LPT_source (rank-0 internals) ===
 			MUSIC::poisson::with_pbox_distributed([&]{
 				LOGINFO("Computing 2LPT term....");
@@ -2133,6 +2180,20 @@ int main (int argc, const char * argv[])
 			// === D.7 Part 2: 2LPT Poisson solve (SPMD-eligible) ===
 			LOGINFO("Solving 2LPT Poisson equation");
 			u2LPT = u1; u2LPT.zero();   // SPMD seed for per-box layout
+			// #78(a): unigrid kspace slab-solve path, mirroring the 1LPT sites.
+			// Uses the non-keep slab_solve_unigrid variant: it restores both
+			// u2LPT and f2LPT to full form (+periodic BC) so Part-3a arithmetic
+			// (u1 += u2LPT) and Part-3b (reads f2LPT) are unaffected. Default-off
+			// keeps the with_pbox_distributed_maybe_spmd baseline bit-identical.
+			const bool use_slab_solve_2lpt = kspace && (lbase==lmax)
+				&& cf.getValueSafe<bool>("setup", "slab_solve_unigrid", false)
+				&& MUSIC::mpi::size() > 1;
+			if( use_slab_solve_2lpt ){
+				const size_t ng2 = (size_t)1 << lmax;
+				MUSIC::poisson::slab_solve_unigrid( f2LPT, u2LPT, lmax, ng2, ng2, ng2 );
+				err = 0.0;
+			}
+			else
 			MUSIC::poisson::with_pbox_distributed_maybe_spmd(cf, [&]{
 				err = the_poisson_solver->solve(f2LPT, u2LPT);
 			}, f2LPT, u2LPT);
@@ -2143,14 +2204,19 @@ int main (int argc, const char * argv[])
 				{
 					f2LPT*=6.0/7.0/vfac2lpt;
 					f+=f2LPT;
-
-					if( !dm_only )
-						f2LPT.deallocate();
 				}
 
 				u2LPT *= 6.0/7.0/vfac2lpt;
 				u1 += u2LPT;
 			}, f, u1, f2LPT, u2LPT);
+
+			// Task #88 rule: f2LPT is in the wpd scatter list above, so it must
+			// NOT be deallocated inside the rank-0-only body — that leaves rank
+			// 0 with an empty hierarchy at scatter time (early return) while
+			// workers still wait to receive their boxes → deadlock under np>1
+			// multibox. Deallocate SPMD (all ranks) here instead.
+			if( bdefd && !dm_only )
+				f2LPT.deallocate();
 
 			// === D.7 Part 3b: per-icoord — slab path (H.1.5b site 6) or original ===
 			{
@@ -2216,8 +2282,11 @@ int main (int argc, const char * argv[])
 						the_output_plugin->write_gas_velocity(icoord, data_forIO);
 					}
 				}
-				data_forIO.deallocate();
-			}, f, u1); // end Part 3b wpd — 2LPT vcdm/total post-density (fallback)
+			}, f, u1, data_forIO); // end Part 3b wpd — data_forIO gathered so its
+			                       // per-box meshes are full on rank 0 (else
+			                       // gradient_add_O2 derefs NULL non-owned boxes
+			                       // at multi-box levels under np>1).
+			data_forIO.deallocate();
 			}
 			}
 			// Task #88: u1.deallocate must be SPMD so wpd's scatter doesn't try
@@ -2250,7 +2319,10 @@ int main (int argc, const char * argv[])
 				u1 = f;	u1.zero();
 
 				if(bdefd)
+				{
+					f2LPT.deallocate();
 					f2LPT=f;
+				}
 
 				//... compute 1LPT term
 				err = the_poisson_solver->solve(f, u1);
@@ -2259,6 +2331,7 @@ int main (int argc, const char * argv[])
 				the_output_plugin->write_gas_potential(u1);
 
 				//... compute 2LPT term
+				u2LPT.deallocate();
 				u2LPT = f; u2LPT.zero();
 
 				if( !kspace2LPT )
@@ -2338,8 +2411,11 @@ int main (int argc, const char * argv[])
 					LOGUSER("Writing baryon velocities");
 					the_output_plugin->write_gas_velocity(icoord, data_forIO);
 				}
+				}, f, u1, data_forIO); // end wpd — data_forIO gathered so its
+				                       // per-box meshes are full on rank 0 (else
+				                       // gradient_add_O2 derefs NULL non-owned boxes
+				                       // at multi-box levels under np>1).
 				data_forIO.deallocate();
-				}, f, u1); // end wpd — 2LPT vbaryon post-density (fallback)
 				}
 				}
 				u1.deallocate();  // SPMD
@@ -2377,12 +2453,16 @@ int main (int argc, const char * argv[])
 				u1 = f;	u1.zero();
 
 				if(bdefd)
+				{
+					f2LPT.deallocate();
 					f2LPT=f;
+				}
 
 				//... compute 1LPT term
 				err = the_poisson_solver->solve(f, u1);
 
 				//... compute 2LPT term
+				u2LPT.deallocate();
 				u2LPT = f; u2LPT.zero();
 
 				if( !kspace2LPT )
@@ -2478,9 +2558,11 @@ int main (int argc, const char * argv[])
 				LOGUSER("Writing CDM displacements");
 				the_output_plugin->write_dm_position(icoord, data_forIO );
 			}
-
+			}, f, u1, data_forIO); // end wpd — data_forIO gathered so its
+			                       // per-box meshes are full on rank 0 (else
+			                       // gradient_add_O2 derefs NULL non-owned boxes
+			                       // at multi-box levels under np>1).
 			data_forIO.deallocate();
-			}, f, u1); // end with_pbox_distributed — 2LPT DM displacements
 			}
 			}
 			u1.deallocate();  // SPMD: workers also drop u1 post-scatter
@@ -2513,6 +2595,7 @@ int main (int argc, const char * argv[])
 					err = the_poisson_solver->solve(f, u1);
 
 					//... compute 2LPT term
+					u2LPT.deallocate();
 					u2LPT = f; u2LPT.zero();
 
 					if( !kspace2LPT )
@@ -2553,12 +2636,16 @@ int main (int argc, const char * argv[])
 				the_output_plugin->write_gas_density(f);
 
 				if(bdefd)
+				{
+					f2LPT.deallocate();
 					f2LPT=f;
+				}
 
 				//... compute 1LPT term
 				err = the_poisson_solver->solve(f, u1);
 
 				//... compute 2LPT term
+				u2LPT.deallocate();
 				u2LPT = f; u2LPT.zero();
 
 				if( !kspace2LPT )
@@ -2627,8 +2714,11 @@ int main (int argc, const char * argv[])
 					LOGUSER("Writing baryon displacements");
 					the_output_plugin->write_gas_position(icoord, data_forIO );
 				}
+				}, f, u1, data_forIO); // end wpd — data_forIO gathered so its
+				                       // per-box meshes are full on rank 0 (else
+				                       // gradient_add_O2 derefs NULL non-owned boxes
+				                       // at multi-box levels under np>1).
 				data_forIO.deallocate();
-				}, f, u1); // end wpd — 2LPT gas displacements (bsph) (fallback)
 				}
 				}
 				u1.deallocate();

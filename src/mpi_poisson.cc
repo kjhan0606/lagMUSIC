@@ -627,6 +627,23 @@ void broadcast_done()
 #endif
 }
 
+// Rank-0 depth counter. Incremented in phase_scope ctor on rank-0, decremented
+// in dtor. Read by phase_scope_active() so callees (coarsen_density,
+// normalize_density, ...) can detect "I'm inside wpd → can't issue my own
+// collective" and route to a serial fallback.
+static int g_phase_scope_depth = 0;
+
+bool phase_scope_active()
+{
+#ifdef USE_MPI
+	if( MUSIC::mpi::size() <= 1 ) return false;
+	if( !MUSIC::mpi::is_root() ) return false;
+	return g_phase_scope_depth > 0;
+#else
+	return false;
+#endif
+}
+
 phase_scope::phase_scope()
 {
 #ifdef USE_MPI
@@ -635,6 +652,7 @@ phase_scope::phase_scope()
 		worker_pump();
 	} else if( MUSIC::mpi::size() > 1 ){
 		TRACE_PHASE("phase_scope ctor (root → body)");
+		++g_phase_scope_depth;
 	}
 #endif
 }
@@ -644,6 +662,7 @@ phase_scope::~phase_scope()
 #ifdef USE_MPI
 	if( MUSIC::mpi::size() > 1 && MUSIC::mpi::is_root() ){
 		TRACE_PHASE("phase_scope dtor (root → bcast DONE)");
+		--g_phase_scope_depth;
 		broadcast_done();
 	} else if( MUSIC::mpi::size() > 1 ){
 		TRACE_PHASE("phase_scope dtor (worker noop)");

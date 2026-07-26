@@ -1274,6 +1274,13 @@ int main (int argc, const char * argv[])
 	cosmo.pnorm	= ccalc.ComputePNorm( 2.0*M_PI/boxlength );
 	cosmo.dplus	= ccalc.CalcGrowthFactor( cosmo.astart )/ccalc.CalcGrowthFactor( 1.0 );
 	cosmo.vfact = ccalc.CalcVFact( cosmo.astart );
+	const double vfact_scale =
+		cf.getValueSafe<double>("setup", "vfact_scale", 1.0);
+	if( !std::isfinite(vfact_scale) || vfact_scale <= 0.0 )
+		throw std::runtime_error("setup.vfact_scale must be finite and positive");
+	cosmo.vfact *= vfact_scale;
+	std::cout << " - DMO velocity growth-factor scale=" << vfact_scale
+	          << std::endl;
 	
 	if( !the_transfer_function_plugin->tf_has_total0() )
 	        cosmo.pnorm *= cosmo.dplus*cosmo.dplus;

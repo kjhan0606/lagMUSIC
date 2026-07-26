@@ -57,6 +57,12 @@ as a simple argument, e.g. from within the build directory:
   ./MUSIC ../ics_example.conf
 ```
 
+For DMO initial conditions whose displacement uses a model-specific density
+transfer, the optional `[setup]` key `vfact_scale` multiplies MUSIC's
+background velocity growth factor without changing the density or particle
+positions. Its default is `1.0`; the value should be derived from the same
+linear solver and epoch as the density transfer.
+
 
 ## Disclaimer
 

@@ -2070,6 +2070,23 @@ int main (int argc, const char * argv[])
 			bool dm_only = !do_baryons;
 			if( !do_baryons || !the_transfer_function_plugin->tf_has_velocities() )
 				my_tf_type = total;
+			const std::string dmo_velocity_source =
+				cf.getValueSafe<std::string>(
+					"setup", "dmo_velocity_source", "transfer");
+			if( dmo_velocity_source != "transfer"
+			    && dmo_velocity_source != "density_2lpt" )
+				throw std::runtime_error(
+					"setup.dmo_velocity_source must be transfer or density_2lpt");
+			const bool dmo_velocity_transfer =
+				dm_only && dmo_velocity_source == "transfer";
+			if( dmo_velocity_transfer && !the_transfer_function_plugin->tf_has_velocities() )
+				throw std::runtime_error(
+					"setup.dmo_velocity_source=transfer requires a transfer plugin with velocities");
+			if( dmo_velocity_transfer && bdefd )
+				throw std::runtime_error(
+					"setup.dmo_velocity_source=transfer currently requires a uniform FFT grid");
+			if( dm_only )
+				LOGINFO("DMO velocity source: %s", dmo_velocity_source.c_str());
 			
 			std::cout << "=============================================================\n";
 			if( my_tf_type == total )
@@ -2225,9 +2242,42 @@ int main (int argc, const char * argv[])
 			if( bdefd && !dm_only )
 				f2LPT.deallocate();
 
+			// A scale-dependent growth history cannot be represented by one
+			// vfact_scale.  For uniform DMO production ICs, optionally build a
+			// separate first-order velocity potential directly from the CAMB
+			// plugin's mass-weighted vtotal field.  The ordinary density
+			// potential u1 is kept untouched for the subsequent 2LPT particle
+			// displacements.
+			grid_hierarchy f_velocity(nbnd), u_velocity(nbnd);
+			if( dmo_velocity_transfer )
+			{
+				LOGINFO("Generating scale-dependent DMO velocity perturbations...");
+				GenerateDensityHierarchy(cf, the_transfer_function_plugin, vtotal,
+				                         rh_TF, rand, f_velocity, false, false);
+				coarsen_density(rh_Poisson, f_velocity, bspectral_sampling);
+				if( MUSIC::mpi::is_root() )
+					f_velocity.add_refinement_mask(rh_Poisson.get_coord_shift());
+				normalize_density(f_velocity);
+				u_velocity = f_velocity;
+				u_velocity.zero();
+				MUSIC::poisson::with_pbox_distributed_maybe_spmd(cf, [&]{
+					err = the_poisson_solver->solve(f_velocity, u_velocity);
+				}, f_velocity, u_velocity);
+				f_velocity.deallocate();
+				// Retain MUSIC's existing high-redshift 2LPT velocity term.
+				// It is subdominant at the production zstart and is added only
+				// after the exact scale-dependent linear velocity solve.
+				MUSIC::poisson::with_pbox_distributed([&]{
+					u_velocity += u2LPT;
+				}, u_velocity, u2LPT);
+				LOGINFO("Scale-dependent DMO velocity transfer active");
+			}
+
 			// === D.7 Part 3b: per-icoord — slab path (H.1.5b site 6) or original ===
 			{
-			grid_hierarchy data_forIO(u1);
+			grid_hierarchy& velocity_potential =
+				dmo_velocity_transfer ? u_velocity : u1;
+			grid_hierarchy data_forIO(velocity_potential);
 			const bool use_slab_hybrid_2lpt_v = bdefd
 			    && (data_forIO.levelmin()==data_forIO.levelmax())
 			    && cf.getValueSafe<bool>("setup", "slab_hybrid_unigrid", false)
@@ -2244,7 +2294,7 @@ int main (int argc, const char * argv[])
 			                                              data_forIO.levelmax(), hng, hng, hng );
 			        MUSIC::poisson::with_pbox_distributed([&]{
 			            *data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
-			            the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+			            the_poisson_solver->gradient_add(icoord, velocity_potential, data_forIO );
 			            data_forIO *= cosmo.vfact;
 			            double sigv = compute_finest_sigma( data_forIO );
 			            std::cerr << " - velocity component " << icoord << " : sigma = " << sigv << std::endl;
@@ -2269,10 +2319,10 @@ int main (int argc, const char * argv[])
 						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
 							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
 						*data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
-						the_poisson_solver->gradient_add(icoord, u1, data_forIO );
+						the_poisson_solver->gradient_add(icoord, velocity_potential, data_forIO );
 					}
 					else
-						the_poisson_solver->gradient(icoord, u1, data_forIO );
+						the_poisson_solver->gradient(icoord, velocity_potential, data_forIO );
 
 					data_forIO *= cosmo.vfact;
 
@@ -2289,12 +2339,14 @@ int main (int argc, const char * argv[])
 						the_output_plugin->write_gas_velocity(icoord, data_forIO);
 					}
 				}
-			}, f, u1, data_forIO); // end Part 3b wpd — data_forIO gathered so its
+			}, f, velocity_potential, data_forIO); // end Part 3b wpd — data_forIO gathered so its
 			                       // per-box meshes are full on rank 0 (else
 			                       // gradient_add_O2 derefs NULL non-owned boxes
 			                       // at multi-box levels under np>1).
 			data_forIO.deallocate();
 			}
+			if( dmo_velocity_transfer )
+				u_velocity.deallocate();
 			}
 			// Task #88: u1.deallocate must be SPMD so wpd's scatter doesn't try
 			// to send from a rank-0-empty hierarchy. Workers also need to drop

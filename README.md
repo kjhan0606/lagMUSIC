@@ -63,6 +63,20 @@ background velocity growth factor without changing the density or particle
 positions. Its default is `1.0`; the value should be derived from the same
 linear solver and epoch as the density transfer.
 
+For DMO 2LPT initial conditions, `[setup] dmo_velocity_source` selects the
+velocity source:
+
+- `transfer` (default) constructs the first-order velocity potential directly
+  from the input plugin's mass-weighted `vtotal` transfer and then adds MUSIC's
+  high-redshift 2LPT velocity term.
+- `density_2lpt` retains the legacy path in which both the first- and
+  second-order velocities are derived from the density-transfer potential.
+
+The `transfer` mode retains the density-transfer potential for particle
+displacements, requires a plugin with velocity columns, should use
+`vfact_scale = 1`, and is currently restricted to uniform ICs. MUSIC stops
+with an explicit error if the selected input transfer has no velocity field.
+
 
 ## Disclaimer
 

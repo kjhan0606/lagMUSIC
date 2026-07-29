@@ -74,8 +74,11 @@ velocity source:
 
 The `transfer` mode retains the density-transfer potential for particle
 displacements, requires a plugin with velocity columns, should use
-`vfact_scale = 1`, and is currently restricted to uniform ICs. MUSIC stops
-with an explicit error if the selected input transfer has no velocity field.
+`vfact_scale = 1`, and supports both uniform and nested-grid ICs. MUSIC stops
+with an explicit error if `transfer` is selected for an input with no velocity
+field. For backward compatibility, an old configuration that omits the key
+and uses a plugin without velocities defaults to `density_2lpt` with a
+warning; velocity-capable inputs default to `transfer`.
 
 
 ## Disclaimer

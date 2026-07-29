@@ -2070,9 +2070,13 @@ int main (int argc, const char * argv[])
 			bool dm_only = !do_baryons;
 			if( !do_baryons || !the_transfer_function_plugin->tf_has_velocities() )
 				my_tf_type = total;
+			const bool dmo_velocity_source_explicit =
+				cf.containsKey("setup", "dmo_velocity_source");
 			const std::string dmo_velocity_source =
 				cf.getValueSafe<std::string>(
-					"setup", "dmo_velocity_source", "transfer");
+					"setup", "dmo_velocity_source",
+					the_transfer_function_plugin->tf_has_velocities()
+						? "transfer" : "density_2lpt");
 			if( dmo_velocity_source != "transfer"
 			    && dmo_velocity_source != "density_2lpt" )
 				throw std::runtime_error(
@@ -2082,9 +2086,9 @@ int main (int argc, const char * argv[])
 			if( dmo_velocity_transfer && !the_transfer_function_plugin->tf_has_velocities() )
 				throw std::runtime_error(
 					"setup.dmo_velocity_source=transfer requires a transfer plugin with velocities");
-			if( dmo_velocity_transfer && bdefd )
-				throw std::runtime_error(
-					"setup.dmo_velocity_source=transfer currently requires a uniform FFT grid");
+			if( dm_only && !dmo_velocity_source_explicit
+			    && dmo_velocity_source == "density_2lpt" )
+				LOGWARN("Input transfer has no velocity field; defaulting DMO velocity source to density_2lpt");
 			if( dm_only )
 				LOGINFO("DMO velocity source: %s", dmo_velocity_source.c_str());
 			
@@ -2251,7 +2255,7 @@ int main (int argc, const char * argv[])
 			grid_hierarchy f_velocity(nbnd), u_velocity(nbnd);
 			if( dmo_velocity_transfer )
 			{
-				LOGINFO("Generating scale-dependent DMO velocity perturbations...");
+				LOGINFO("Generating DMO velocity perturbations from input vtotal...");
 				GenerateDensityHierarchy(cf, the_transfer_function_plugin, vtotal,
 				                         rh_TF, rand, f_velocity, false, false);
 				coarsen_density(rh_Poisson, f_velocity, bspectral_sampling);
@@ -2263,20 +2267,23 @@ int main (int argc, const char * argv[])
 				MUSIC::poisson::with_pbox_distributed_maybe_spmd(cf, [&]{
 					err = the_poisson_solver->solve(f_velocity, u_velocity);
 				}, f_velocity, u_velocity);
-				f_velocity.deallocate();
 				// Retain MUSIC's existing high-redshift 2LPT velocity term.
 				// It is subdominant at the production zstart and is added only
 				// after the exact scale-dependent linear velocity solve.
 				MUSIC::poisson::with_pbox_distributed([&]{
 					u_velocity += u2LPT;
-				}, u_velocity, u2LPT);
-				LOGINFO("Scale-dependent DMO velocity transfer active");
+					if( bdefd )
+						f_velocity += f2LPT;
+				}, f_velocity, u_velocity, f2LPT, u2LPT);
+				LOGINFO("Input-transfer DMO velocity active");
 			}
 
 			// === D.7 Part 3b: per-icoord — slab path (H.1.5b site 6) or original ===
 			{
 			grid_hierarchy& velocity_potential =
 				dmo_velocity_transfer ? u_velocity : u1;
+			grid_hierarchy& velocity_source =
+				dmo_velocity_transfer ? f_velocity : f;
 			grid_hierarchy data_forIO(velocity_potential);
 			const bool use_slab_hybrid_2lpt_v = bdefd
 			    && (data_forIO.levelmin()==data_forIO.levelmax())
@@ -2287,13 +2294,13 @@ int main (int argc, const char * argv[])
 			    for( int icoord = 0; icoord < 3; ++icoord ){
 			        MUSIC::poisson::with_pbox_distributed([&]{
 			            data_forIO.zero();
-			            *data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
-			        }, f, data_forIO);
+			            *data_forIO.get_grid(data_forIO.levelmax()) = *velocity_source.get_grid(velocity_source.levelmax());
+			        }, velocity_source, data_forIO);
 			        MUSIC::poisson::slab_poisson_hybrid( data_forIO, icoord, grad_order,
 			                                              /*periodic=*/true, decic_DM,
 			                                              data_forIO.levelmax(), hng, hng, hng );
 			        MUSIC::poisson::with_pbox_distributed([&]{
-			            *data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
+			            *data_forIO.get_grid(data_forIO.levelmax()) /= (1<<velocity_source.levelmax());
 			            the_poisson_solver->gradient_add(icoord, velocity_potential, data_forIO );
 			            data_forIO *= cosmo.vfact;
 			            double sigv = compute_finest_sigma( data_forIO );
@@ -2305,7 +2312,7 @@ int main (int argc, const char * argv[])
 			                LOGUSER("Writing baryon velocities");
 			                the_output_plugin->write_gas_velocity(icoord, data_forIO);
 			            }
-			        }, u1, data_forIO);
+			        }, velocity_potential, data_forIO);
 			    }
 			    data_forIO.deallocate();
 			} else {
@@ -2315,10 +2322,12 @@ int main (int argc, const char * argv[])
 					if(bdefd)
 					{
 						data_forIO.zero();
-						*data_forIO.get_grid(data_forIO.levelmax()) = *f.get_grid(f.levelmax());
+						*data_forIO.get_grid(data_forIO.levelmax()) =
+							*velocity_source.get_grid(velocity_source.levelmax());
 						poisson_hybrid(*data_forIO.get_grid(data_forIO.levelmax()), icoord, grad_order,
 							       data_forIO.levelmin()==data_forIO.levelmax(), decic_DM );
-						*data_forIO.get_grid(data_forIO.levelmax()) /= (1<<f.levelmax());
+						*data_forIO.get_grid(data_forIO.levelmax()) /=
+							(1<<velocity_source.levelmax());
 						the_poisson_solver->gradient_add(icoord, velocity_potential, data_forIO );
 					}
 					else
@@ -2339,14 +2348,17 @@ int main (int argc, const char * argv[])
 						the_output_plugin->write_gas_velocity(icoord, data_forIO);
 					}
 				}
-			}, f, velocity_potential, data_forIO); // end Part 3b wpd — data_forIO gathered so its
+			}, velocity_source, velocity_potential, data_forIO); // end Part 3b wpd — data_forIO gathered so its
 			                       // per-box meshes are full on rank 0 (else
 			                       // gradient_add_O2 derefs NULL non-owned boxes
 			                       // at multi-box levels under np>1).
 			data_forIO.deallocate();
 			}
 			if( dmo_velocity_transfer )
+			{
 				u_velocity.deallocate();
+				f_velocity.deallocate();
+			}
 			}
 			// Task #88: u1.deallocate must be SPMD so wpd's scatter doesn't try
 			// to send from a rank-0-empty hierarchy. Workers also need to drop

@@ -1776,11 +1776,15 @@ random_number_generator<rng, T>::random_number_generator(config_file &cf, refine
 			// under the [constraints] section; presence of [0] suffices to detect any.
 			const bool has_constraints = pcf_->containsKey(std::string("constraints"),
 			                                               std::string("constraint[0].type"));
+			// A filename is an explicit phase anchor.  The distributed slab
+			// generator only supports numeric seeds; treating rngseeds_ == -1 as
+			// a seed here silently replaces the requested realization.
+			const bool has_file_seed = !rngfnames_[levelmin_].empty();
 			const bool grid_aligned = (N % (nproc * ran_cube_size_) == 0);
 			const bool shift_aligned = (i0_x_mod % ran_cube_size_ == 0);
 			const bool ncubes_per_rank_nowrap = (((N / nproc) / ran_cube_size_) <= (N / ran_cube_size_));
 			slab_eligible = grid_aligned && shift_aligned && !has_constraints
-			              && ncubes_per_rank_nowrap;
+			              && !has_file_seed && ncubes_per_rank_nowrap;
 			if (slab_mode == std::string("yes") && !slab_eligible)
 			{
 				LOGERR("setup.slab_rng=yes but alignment guard failed "
@@ -1800,6 +1804,10 @@ random_number_generator<rng, T>::random_number_generator(config_file &cf, refine
 				        "falling back to rank-0 compute_random_numbers "
 				        "(constraints.apply has no SPMD path; F.2b/F.3 still SPMD)",
 				        (unsigned)1);
+			if (has_file_seed && grid_aligned && shift_aligned
+			    && ncubes_per_rank_nowrap && MUSIC::mpi::is_root())
+				LOGINFO("F.1a disabled: white-noise filename is an explicit phase anchor — "
+				        "using the compact/legacy file reader");
 		}
 
 		// F.2b: SPMD refinement-level wnoise. Decide eligibility BEFORE

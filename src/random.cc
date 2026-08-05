@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <cstdio>
 
@@ -319,6 +320,61 @@ random_numbers<T>::random_numbers(unsigned res, std::string randfname, bool rand
 
 	float sign4 = -1.0f;
 	double sign8 = -1.0;
+
+	// MUSIC's memory-first writer stores reusable white noise as a compact
+	// native cube: three unsigned dimensions followed by x-major T values.
+	// Keep accepting the legacy Grafic/Fortran-record format below, but detect
+	// this internal format first.  The compact file contains MUSIC values, not
+	// Grafic values, so it must not receive the legacy sign flip.
+	ifs.seekg(0, std::ios::end);
+	const std::streamoff file_bytes = ifs.tellg();
+	ifs.seekg(0);
+	unsigned raw_dims[3] = {0, 0, 0};
+	ifs.read(reinterpret_cast<char *>(raw_dims), sizeof(raw_dims));
+	const std::uint64_t raw_cells = (std::uint64_t)res_ * res_ * res_;
+	const std::uint64_t raw_header_bytes = sizeof(raw_dims);
+	const bool raw_dims_match = raw_dims[0] == res_ && raw_dims[1] == res_ && raw_dims[2] == res_;
+	const bool raw_float = raw_dims_match && file_bytes >= 0 &&
+		(std::uint64_t)file_bytes == raw_header_bytes + raw_cells * sizeof(float);
+	const bool raw_double = raw_dims_match && file_bytes >= 0 &&
+		(std::uint64_t)file_bytes == raw_header_bytes + raw_cells * sizeof(double);
+	if (raw_float || raw_double)
+	{
+		LOGINFO("Reading compact MUSIC white noise file '%s' (%u**3, %s precision)",
+		        randfname.c_str(), res_, raw_float ? "single" : "double");
+		const size_t plane_cells = (size_t)res_ * (size_t)res_;
+		if (raw_float)
+		{
+			std::vector<float> plane(plane_cells);
+			for (unsigned i = 0; i < res_; ++i)
+			{
+				ifs.read(reinterpret_cast<char *>(plane.data()), plane_cells * sizeof(float));
+				if (!ifs)
+					throw std::runtime_error("short compact random number file");
+#pragma omp parallel for
+				for (int j = 0; j < (int)res_; ++j)
+					for (unsigned k = 0; k < res_; ++k)
+						(*rnums_[0])(i, (unsigned)j, k) = (T)plane[(size_t)j * res_ + k];
+			}
+		}
+		else
+		{
+			std::vector<double> plane(plane_cells);
+			for (unsigned i = 0; i < res_; ++i)
+			{
+				ifs.read(reinterpret_cast<char *>(plane.data()), plane_cells * sizeof(double));
+				if (!ifs)
+					throw std::runtime_error("short compact random number file");
+#pragma omp parallel for
+				for (int j = 0; j < (int)res_; ++j)
+					for (unsigned k = 0; k < res_; ++k)
+						(*rnums_[0])(i, (unsigned)j, k) = (T)plane[(size_t)j * res_ + k];
+			}
+		}
+		return;
+	}
+	ifs.clear();
+	ifs.seekg(0);
 
 	int addrtype = 32;
 

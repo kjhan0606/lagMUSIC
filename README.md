@@ -80,6 +80,23 @@ field. For backward compatibility, an old configuration that omits the key
 and uses a plugin without velocities defaults to `density_2lpt` with a
 warning; velocity-capable inputs default to `transfer`.
 
+The CAMB reader consumes the standard first 13 transfer columns and ignores
+additional trailing columns. With nonzero `Omega_b`, its `vtotal` is the
+mass-weighted combination of the CAMB `v_cdm` and `v_baryon` columns. With
+`Omega_b = 0`, it uses `v_cdm` directly; it never substitutes a density
+transfer for a velocity. In lagCAMB's `TransientGDM` model, `v_cdm` is defined
+as the mass-weighted total-DM velocity, so this convention supplies the
+appropriate one-species DMO velocity. The density displacement uses the
+seventh CAMB column: normally `delta_tot`, or a preprocessed particle-density
+transfer as described below.
+
+If massive neutrinos are evolved separately, the particle table should place
+the `delta_nonu` (baryons plus all DM) transfer in the standard seventh CAMB
+column consumed by this reader, and the MUSIC `Omega_m` should be the particle
+`Omega_cb`. The neutrino density must not be assigned again to the DMO particle
+mass. The neutrino response and expansion history remain responsibilities of
+the downstream simulation setup.
+
 
 ## Disclaimer
 

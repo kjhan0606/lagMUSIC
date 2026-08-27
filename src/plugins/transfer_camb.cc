@@ -90,7 +90,11 @@ private:
                                    m_filename_Tk + "\'");
         }
 
-	if( m_Omega_b < 1e-6 ) Tkvtot = Tktot;
+	// A baryon-free one-species load must use the CDM velocity column.  The
+	// previous fallback used the total-density transfer as a velocity, which
+	// is dimensionally and physically incorrect.  Model-aware CAMB variants
+	// may define v_cdm as the mass-weighted velocity of all DM subcomponents.
+	if( m_Omega_b < 1e-6 ) Tkvtot = Tkvc;
 	else Tkvtot=((m_Omega_m-m_Omega_b)*Tkvc+m_Omega_b*Tkvb)/m_Omega_m; //MvD
 
         m_linbaryoninterp |= Tkb < 0.0 || Tkvb < 0.0;

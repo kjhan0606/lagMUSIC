@@ -97,6 +97,12 @@ column consumed by this reader, and the MUSIC `Omega_m` should be the particle
 mass. The neutrino response and expansion history remain responsibilities of
 the downstream simulation setup.
 
+The `gadget2_2c` output writes the two fine collisionless loads as Gadget
+types 1 and 2. It accepts `H0` in km s^-1 Mpc^-1, like the other MUSIC
+outputs, and stores Gadget's dimensionless `HubbleParam = H0/100` in the file
+header. A downstream DMO reader must treat both types as collisionless and
+retain their separate header masses.
+
 
 ## Disclaimer
 

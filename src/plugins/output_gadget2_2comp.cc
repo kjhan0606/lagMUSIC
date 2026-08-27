@@ -814,7 +814,9 @@ public:
                 omegac_ = omegam_ - omegab_;
         
 		header_.OmegaLambda = cf.getValue<double>("cosmology","Omega_L");
-		header_.HubbleParam = cf.getValue<double>("cosmology","H0");
+		// Gadget stores the dimensionless little-h parameter, whereas MUSIC's
+		// H0 configuration value is given in km s^-1 Mpc^-1.
+		header_.HubbleParam = cf.getValue<double>("cosmology","H0")/100.0;
 		
 		header_.flag_stellarage = 0;
 		header_.flag_metals = 0;

@@ -821,11 +821,7 @@ public:
 		
 	        	
 		header_.flag_entropy_instead_u = 0;
-#ifdef SINGLE_PRECISION
-                header_.flag_doubleprecision = 0;
-#else
-                header_.flag_doubleprecision = 1; 
-#endif
+                header_.flag_doubleprecision = sizeof(T_store) == sizeof(double) ? 1 : 0;
                 std::cout << "header_.flag_doubleprecision " << header_.flag_doubleprecision << "\n";
                 header_.flag_ic_info = 0;
 		
@@ -1686,4 +1682,3 @@ namespace{
 	output_plugin_creator_concrete< gadget2_2comp_output_plugin<double> > creator2("gadget2_2c_double");
 #endif
 }
-

@@ -1598,7 +1598,14 @@ void kernel_real_cached<real_t>::precompute_kernel(transfer_function *ptf, tf_ty
 		LOGUSER("Averaging fine kernel to coarse kernel...");
 
 //... copy averaged and convolved fine kernel to coarse kernel
-#pragma omp parallel for
+		// ACC_RC wraps each destination index periodically. If the fine
+		// window exceeds twice a coarse axis, the two mapped ends overlap:
+		// different ix iterations then overwrite/add to the same cells.
+		// Retain the reference last-write/add ordering for that geometry;
+		// ordinary non-overlapping windows keep their OpenMP parallelism.
+		const bool unique_coarse_cells = nx <= 2*nxc && ny <= 2*nyc
+		                             && nz <= 2*nzc;
+#pragma omp parallel for if(unique_coarse_cells)
 		for (int ix = 0; ix < nx; ix += 2)
 			for (int iy = 0; iy < ny; iy += 2)
 				for (int iz = 0; iz < nz; iz += 2)

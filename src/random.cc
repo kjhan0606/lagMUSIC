@@ -1290,9 +1290,11 @@ double random_numbers<T>::fill_subvolume(int *i0, int *n)
 	i0cube[1] = (int)((double)(res_ + i0[1]) / cubesize_);
 	i0cube[2] = (int)((double)(res_ + i0[2]) / cubesize_);
 
-	ncube[0] = (int)(n[0] / cubesize_) + 2;
-	ncube[1] = (int)(n[1] / cubesize_) + 2;
-	ncube[2] = (int)(n[2] / cubesize_) + 2;
+	// Visit each periodic cube at most once. Repeated wrapped x-cubes in
+	// the OpenMP loop otherwise race on allocation and filling of rnums_.
+	ncube[0] = std::min((int)(n[0] / cubesize_) + 2, (int)ncubes_);
+	ncube[1] = std::min((int)(n[1] / cubesize_) + 2, (int)ncubes_);
+	ncube[2] = std::min((int)(n[2] / cubesize_) + 2, (int)ncubes_);
 
 #ifdef DEBUG
 	LOGDEBUG("random numbers needed for region %d,%d,%d ..+ %d,%d,%d", i0[0], i0[1], i0[2], n[0], n[1], n[2]);
@@ -1567,7 +1569,14 @@ void random_numbers<T>::unpack_subvolume_from_buffer(
 	const int nby = (int)by.size();
 	const int nbz = (int)bz.size();
 
-	#pragma omp parallel for collapse(2) schedule(static)
+	// An extended FFT volume may exceed the periodic PRNG domain. In that
+	// case different blocks write the same cube cells. Preserve the serial
+	// last-write ordering rather than racing (even identical seeds do not
+	// make the post-FFT values of these periodic aliases identical).
+	const size_t period = (size_t)cubesize_ * (size_t)ncubes_;
+	const bool unique_cells = (size_t)lx <= period && (size_t)ly <= period
+	                       && (size_t)lz <= period;
+	#pragma omp parallel for collapse(2) schedule(static) if(unique_cells)
 	for (int bi = 0; bi < nbx; ++bi) {
 		for (int bj = 0; bj < nby; ++bj) {
 			const CubeBlock &cbx = bx[bi];
@@ -3069,6 +3078,19 @@ bool random_number_generator<rng, T>::refinement_pass_slab_eligible(void) const
 	for (int ilevel = (int)levelmin_ + 1; ilevel <= (int)levelmax_; ++ilevel) {
 		int nx, ny, nz, i0x, i0y, i0z;
 		level_geom(ilevel, nx, ny, nz, i0x, i0y, i0z);
+		// The slab builder exports the extended FFT field directly, whereas
+		// the reference constructor writes it back into periodic PRNG cubes
+		// first. They agree only when each periodic cell is visited once.
+		// Boundary crossing alone is safe; extent beyond a full period is not.
+		const unsigned prng_period = 1u << (unsigned)ilevel;
+		if ((unsigned)nx > prng_period || (unsigned)ny > prng_period
+		    || (unsigned)nz > prng_period) {
+			if (diag) LOGINFO("F.2b: L=%d ineligible (periodic writeback alias: "
+			                  "extent=%d,%d,%d PRNG period=%u) "
+			                  "— falling back to rank-0 refinement",
+			                  ilevel, nx, ny, nz, prng_period);
+			return false;
+		}
 		int pnx, pny, pnz, pi0x, pi0y, pi0z;
 		level_geom(ilevel - 1, pnx, pny, pnz, pi0x, pi0y, pi0z);
 		// Match rank-0 ref random.cc:828 `rc(x0[0]/2 + i, ...)`: child cell

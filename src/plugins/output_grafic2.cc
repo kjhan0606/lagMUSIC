@@ -28,9 +28,11 @@ protected:
 		int n1, n2, n3;
 		float dxini0;
 		float xoff10,xoff20,xoff30;
-		float astart0,omega_m0,omega_l0,h00;
+		float astart0,omega_m0,omega_l0,h00,omega_b0;
 		
 	}header;
+	static_assert(sizeof(header) == 48,
+		"The extended RAMSES GRAFIC header must contain 48 payload bytes");
 	
 	bool bhavehydro_;
   //float metal_floor_;
@@ -47,7 +49,8 @@ protected:
 			zstart		= cf_.getValue<double>("setup","zstart"),
 			astart		= 1.0/(1.0+zstart),
 			omegam		= cf_.getValue<double>("cosmology","Omega_m"),
-			omegaL		= cf_.getValue<double>("cosmology","Omega_L");
+			omegaL		= cf_.getValue<double>("cosmology","Omega_L"),
+			omegab		= cf_.getValue<double>("cosmology","Omega_b");
 		
 		loc_head.n1 = gh.get_grid(ilevel)->size(0);
 		loc_head.n2 = gh.get_grid(ilevel)->size(1);
@@ -63,6 +66,7 @@ protected:
 		loc_head.omega_m0 = omegam;
 		loc_head.omega_l0 = omegaL;
 		loc_head.h00 = H0;
+		loc_head.omega_b0 = omegab;
 		
 		
 		int blksz = sizeof(header);
@@ -83,8 +87,6 @@ protected:
 		
 		for( unsigned i=0; i<n3; ++i )
 		{
-			
-			data.clear();
 			
 			for( unsigned j=0; j<n2; ++j )
 				for( unsigned k=0; k<n1; ++k )
@@ -325,6 +327,15 @@ protected:
 			ofst << std::string(ff);
 		}
 		ofst << "/\n\n";
+
+		// Preserve the physical baryon density even for a one-fluid DMO load.
+		// RAMSES uses it as IC provenance; hydro=false keeps the particle mass
+		// equal to the full matter density.
+		ofst << "&COSMO_PARAMS\n"
+		     << "omega_b="
+		     << std::setprecision(16)
+		     << cf_.getValue<double>("cosmology","Omega_b") << "\n"
+		     << "/\n\n";
 		
 		
         unsigned naddref = 8; // initialize with settings for 10 additional levels of refinement
@@ -600,4 +611,3 @@ public:
 namespace{
 	output_plugin_creator_concrete<grafic2_output_plugin> creator("grafic2");
 }
-
